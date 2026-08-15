@@ -76,6 +76,13 @@ export interface SweepUndistributedResponse {
   transactionHash: string;
 }
 
+export interface AccruedCreditsResponse {
+  bondId: number;
+  holder: string;
+  carbon: number;
+  biodiversity: number;
+}
+
 export interface CreateProjectDto {
   name: string;
   methodology: string;

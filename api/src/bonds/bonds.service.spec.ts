@@ -144,6 +144,57 @@ describe('BondsService', () => {
     });
   });
 
+  describe('getAccruedCredits', () => {
+    it('reads carbon and biodiversity accrued credits per credit type', async () => {
+      const contractService = {
+        simulateCall: jest.fn(({ args }) =>
+          Promise.resolve(
+            nativeToScVal(
+              BigInt(scValToNative(args[2]) === 0 ? 120 : 30),
+              { type: 'i128' },
+            ),
+          ),
+        ),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      const holder =
+        'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+      const result = await svc.getAccruedCredits(4, holder);
+
+      expect(contractService.simulateCall).toHaveBeenCalledTimes(2);
+      const calls = contractService.simulateCall.mock.calls.map((c) => c[0]);
+
+      expect(calls[0].contractAddress).toBe('');
+      expect(calls[0].method).toBe('accrued_credits_by_type');
+      expect(scValToNative(calls[0].args[0])).toBe(BigInt(4));
+      expect(scValToNative(calls[0].args[1])).toBe(holder);
+      expect(scValToNative(calls[0].args[2])).toBe(0); // CreditType::Carbon
+
+      expect(calls[1].method).toBe('accrued_credits_by_type');
+      expect(scValToNative(calls[1].args[2])).toBe(1); // CreditType::Biodiversity
+
+      expect(result).toEqual({
+        bondId: 4,
+        holder,
+        carbon: 120,
+        biodiversity: 30,
+      });
+    });
+  });
+
   describe('sweepUndistributed arg encoding', () => {
     it('invokes sweep_undistributed as the admin and returns swept total', async () => {
       const contractService = {

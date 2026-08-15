@@ -8,6 +8,7 @@ import { SubscribeDto } from './dto/subscribe.dto';
 import { DistributeCouponDto } from './dto/distribute-coupon.dto';
 import { ClaimCreditsDto } from './dto/claim-credits.dto';
 import { TransferBondDto } from './dto/transfer-bond.dto';
+import { AccruedCreditsQueryDto } from './dto/accrued-credits-query.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
@@ -20,6 +21,7 @@ import {
   TransferResponse,
   UndistributedTotalResponse,
   SweepUndistributedResponse,
+  AccruedCreditsResponse,
 } from './interfaces/bond.interface';
 
 @Controller('bonds')
@@ -56,6 +58,14 @@ export class BondsController {
     @Param('id', ParseIntPipe) id: number,
   ): Promise<HolderListResponse> {
     return this.bondsService.getHolders(id);
+  }
+
+  @Get(':id/accrued')
+  async getAccruedCredits(
+    @Param('id', ParseIntPipe) id: number,
+    @Query() query: AccruedCreditsQueryDto,
+  ): Promise<AccruedCreditsResponse> {
+    return this.bondsService.getAccruedCredits(id, query.holder);
   }
 
   @Post(':id/coupon')

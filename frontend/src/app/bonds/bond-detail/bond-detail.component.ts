@@ -6,7 +6,7 @@ import { ApiService } from '../../shared/services/api.service';
 import { WalletService } from '../../auth/wallet.service';
 import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
 import { LoadingSpinnerComponent } from '../../shared/components/loading-spinner/loading-spinner.component';
-import { Bond } from '../../shared/interfaces/bond.interface';
+import { Bond, AccruedCreditsResponse } from '../../shared/interfaces/bond.interface';
 import { environment } from '../../../environments/environment';
 
 @Component({
@@ -129,12 +129,32 @@ import { environment } from '../../../environments/environment';
 
             <div class="claim-section">
               <h3 class="section-title">Claim Credits</h3>
+              @if (accruedCredits(); as acc) {
+                <div class="accrued-summary">
+                  <div class="accrued-row">
+                    <span class="accrued-label">Carbon</span>
+                    <span class="accrued-value">{{ acc.carbon | number }}</span>
+                  </div>
+                  <div class="accrued-row">
+                    <span class="accrued-label">Biodiversity</span>
+                    <span class="accrued-value">{{ acc.biodiversity | number }}</span>
+                  </div>
+                  <div class="accrued-row accrued-total">
+                    <span class="accrued-label">Claimable</span>
+                    <span class="accrued-value">{{ claimableTotal() | number }}</span>
+                  </div>
+                </div>
+              } @else if (accruedLoading()) {
+                <p class="status-notice">Loading accrued credits...</p>
+              } @else if (accruedError()) {
+                <div class="error-msg">{{ accruedError() }}</div>
+              }
               <button
                 class="btn btn-primary claim-btn"
-                [disabled]="claimSubmitting()"
+                [disabled]="claimDisabled()"
                 (click)="onClaim()"
               >
-                {{ claimSubmitting() ? 'Claiming...' : 'Claim Accrued Credits' }}
+                {{ claimLabel() }}
               </button>
               @if (claimSuccess()) {
                 <div class="success-msg">
@@ -275,6 +295,12 @@ import { environment } from '../../../environments/environment';
     .marketplace-link { margin-top: 20px; }
     .claim-section { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb; }
     .claim-btn, .transfer-btn, .sweep-btn { width: 100%; }
+    .accrued-summary { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+    .accrued-row { display: flex; justify-content: space-between; padding: 6px 10px; background: #f9fafb; border-radius: 6px; font-size: 0.8125rem; }
+    .accrued-label { color: #6b7280; }
+    .accrued-value { font-weight: 600; color: #1a1a2e; }
+    .accrued-total { background: #ecfdf5; }
+    .accrued-total .accrued-value { color: #15803d; }
     .transfer-section { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb; }
     .admin-section { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb; }
     .admin-note { font-size: 0.8125rem; color: #6b7280; padding: 8px 0; }
@@ -300,6 +326,9 @@ export class BondDetailComponent implements OnInit, OnDestroy {
   readonly claimCredits = signal(0);
   readonly claimTx = signal('');
   readonly claimError = signal('');
+  readonly accruedCredits = signal<AccruedCreditsResponse | null>(null);
+  readonly accruedLoading = signal(false);
+  readonly accruedError = signal('');
   readonly transferSubmitting = signal(false);
   readonly transferSuccess = signal(false);
   readonly transferTx = signal('');
@@ -325,6 +354,17 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     const b = this.bond();
     if (!b || this.maturityReached()) return '';
     return this.formatCountdown(b.maturityDate * 1000 - this.now());
+  });
+
+  readonly claimableTotal = computed(() => {
+    const acc = this.accruedCredits();
+    if (!acc) return 0;
+    return acc.carbon + acc.biodiversity;
+  });
+
+  readonly claimDisabled = computed(() => {
+    if (this.claimSubmitting()) return true;
+    return this.accruedCredits() !== null && this.claimableTotal() <= 0;
   });
 
   private maturityTimer?: ReturnType<typeof setInterval>;
@@ -371,6 +411,14 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     return parts.join(' ');
   }
 
+  claimLabel(): string {
+    if (this.claimSubmitting()) return 'Claiming...';
+    if (this.accruedCredits() !== null) {
+      return `Claim ${this.claimableTotal()} credits`;
+    }
+    return 'Claim Accrued Credits';
+  }
+
   ngOnInit(): void {
     const id = Number(this.route.snapshot.paramMap.get('id'));
     if (!id) {
@@ -383,10 +431,30 @@ export class BondDetailComponent implements OnInit, OnDestroy {
       next: (bond) => {
         this.bond.set(bond);
         this.loading.set(false);
+        this.loadAccruedCredits();
       },
       error: (err) => {
         this.error.set(err.status === 404 ? 'Bond not found' : 'Failed to load bond');
         this.loading.set(false);
+      },
+    });
+  }
+
+  private loadAccruedCredits(): void {
+    const b = this.bond();
+    const holder = this.walletService.address();
+    if (!b || !holder) return;
+
+    this.accruedLoading.set(true);
+    this.accruedError.set('');
+    this.apiService.getAccruedCredits(b.id, holder).subscribe({
+      next: (accrued) => {
+        this.accruedCredits.set(accrued);
+        this.accruedLoading.set(false);
+      },
+      error: () => {
+        this.accruedError.set('Failed to load accrued credits');
+        this.accruedLoading.set(false);
       },
     });
   }
@@ -433,6 +501,7 @@ export class BondDetailComponent implements OnInit, OnDestroy {
         this.claimCredits.set(res.credits);
         this.claimTx.set(res.transactionHash);
         this.claimSubmitting.set(false);
+        this.loadAccruedCredits();
       },
       error: (err) => {
         this.claimError.set(err.error?.detail || err.message || 'Claim failed');

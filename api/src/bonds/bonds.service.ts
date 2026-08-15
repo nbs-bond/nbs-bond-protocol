@@ -18,6 +18,7 @@ import {
   TransferResponse,
   UndistributedTotalResponse,
   SweepUndistributedResponse,
+  AccruedCreditsResponse,
   BondStatusEnum,
   BondMaturityStatusEnum,
   CreditTypeEnum,
@@ -25,6 +26,13 @@ import {
 
 const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
 const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
+
+// Soroban `CreditType` unit enum variants are encoded as their u32 discriminant
+// (see contracts/shared/src/types.rs).
+const CREDIT_TYPE_DISCRIMINANT = {
+  Carbon: 0,
+  Biodiversity: 1,
+} as const;
 
 const BOND_ERROR_CODE = {
   NotInitialized: 1,
@@ -150,6 +158,36 @@ export class BondsService {
     }
 
     return { bondId: id, holders, total: holders.length };
+  }
+
+  async getAccruedCredits(id: number, holder: string): Promise<AccruedCreditsResponse> {
+    const [carbonScVal, biodiversityScVal] = await Promise.all([
+      this.contractService.simulateCall({
+        contractAddress: COUPON_ENGINE(),
+        method: 'accrued_credits_by_type',
+        args: [
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          Address.fromString(holder).toScVal(),
+          nativeToScVal(CREDIT_TYPE_DISCRIMINANT.Carbon, { type: 'u32' }),
+        ],
+      }),
+      this.contractService.simulateCall({
+        contractAddress: COUPON_ENGINE(),
+        method: 'accrued_credits_by_type',
+        args: [
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          Address.fromString(holder).toScVal(),
+          nativeToScVal(CREDIT_TYPE_DISCRIMINANT.Biodiversity, { type: 'u32' }),
+        ],
+      }),
+    ]);
+
+    return {
+      bondId: id,
+      holder,
+      carbon: Number(scValToNative(carbonScVal)),
+      biodiversity: Number(scValToNative(biodiversityScVal)),
+    };
   }
 
   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {

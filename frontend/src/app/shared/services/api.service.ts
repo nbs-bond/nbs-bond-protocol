@@ -8,6 +8,7 @@ import {
   SubscriptionResponse, CreateProjectDto, ListBondDto, BuyBondDto,
   ClaimCreditsResponse, TransferResponse,
   UndistributedTotalResponse, SweepUndistributedResponse,
+  AccruedCreditsResponse,
   QuoteBalanceResponse, QuoteTransactionResponse,
   QuoteAsset, DepositQuoteDto, WithdrawQuoteDto,
 } from '../interfaces/bond.interface';
@@ -60,6 +61,13 @@ export class ApiService {
       `/api/bonds/${id}/claim`,
       { investorAddress },
       { headers: this.headers() },
+    );
+  }
+
+  getAccruedCredits(id: number, holder: string): Observable<AccruedCreditsResponse> {
+    return this.http.get<AccruedCreditsResponse>(
+      `/api/bonds/${id}/accrued`,
+      { params: { holder }, headers: this.headers() },
     );
   }
 

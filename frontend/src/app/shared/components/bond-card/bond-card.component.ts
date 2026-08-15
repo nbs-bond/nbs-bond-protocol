@@ -38,6 +38,16 @@ import { StatusBadgeComponent } from '../status-badge/status-badge.component';
           <span class="label">Coupons</span>
           <span class="value">{{ bond().couponSchedule.length }} payments</span>
         </div>
+        @if (accruedCredits(); as acc) {
+          <div class="bond-field">
+            <span class="label">Accrued Carbon</span>
+            <span class="value">{{ acc.carbon | number }}</span>
+          </div>
+          <div class="bond-field">
+            <span class="label">Accrued Biodiversity</span>
+            <span class="value">{{ acc.biodiversity | number }}</span>
+          </div>
+        }
       </div>
       <button *ngIf="bond().status === 'Active'" class="subscribe-btn" (click)="subscribe.emit(String(bond().id))">
         Subscribe
@@ -61,6 +71,7 @@ import { StatusBadgeComponent } from '../status-badge/status-badge.component';
 })
 export class BondCardComponent {
   readonly bond = input.required<Bond>();
+  readonly accruedCredits = input<{ carbon: number; biodiversity: number } | null>(null);
   readonly subscribe = output<string>();
 
   String(value: number): string {
