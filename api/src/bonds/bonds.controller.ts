@@ -20,6 +20,7 @@ import {
   ClaimCreditsResponse,
   TransferResponse,
   UndistributedTotalResponse,
+  AccruedCreditsResponse,
   SweepUndistributedResponse,
   AccruedCreditsResponse,
 } from './interfaces/bond.interface';
@@ -91,6 +92,14 @@ export class BondsController {
     @Param('id', ParseIntPipe) id: number,
   ): Promise<UndistributedTotalResponse> {
     return this.bondsService.getUndistributedTotal(id);
+  }
+
+  @Get(':id/accrued')
+  async getAccruedCredits(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('holder') holder: string,
+  ): Promise<AccruedCreditsResponse> {
+    return this.bondsService.getAccruedCredits(id, holder);
   }
 
   @Post(':id/sweep-undistributed')

@@ -6,7 +6,8 @@ import { ApiService } from '../../shared/services/api.service';
 import { WalletService } from '../../auth/wallet.service';
 import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
 import { LoadingSpinnerComponent } from '../../shared/components/loading-spinner/loading-spinner.component';
-import { Bond, AccruedCreditsResponse } from '../../shared/interfaces/bond.interface';
+import { Bond } from '../../shared/interfaces/bond.interface';
+import { AccruedCreditsResponse } from '../../shared/interfaces/bond.interface';
 import { environment } from '../../../environments/environment';
 
 @Component({
@@ -129,33 +130,34 @@ import { environment } from '../../../environments/environment';
 
             <div class="claim-section">
               <h3 class="section-title">Claim Credits</h3>
-              @if (accruedCredits(); as acc) {
-                <div class="accrued-summary">
-                  <div class="accrued-row">
-                    <span class="accrued-label">Carbon</span>
-                    <span class="accrued-value">{{ acc.carbon | number }}</span>
-                  </div>
-                  <div class="accrued-row">
-                    <span class="accrued-label">Biodiversity</span>
-                    <span class="accrued-value">{{ acc.biodiversity | number }}</span>
-                  </div>
-                  <div class="accrued-row accrued-total">
-                    <span class="accrued-label">Claimable</span>
-                    <span class="accrued-value">{{ claimableTotal() | number }}</span>
-                  </div>
-                </div>
-              } @else if (accruedLoading()) {
-                <p class="status-notice">Loading accrued credits...</p>
+              @if (accrued(); as accruedRes) {
+                <p class="accrued-summary">
+                  Accrued credits: <strong>{{ accruedRes.total }}</strong>
+                  @for (entry of accruedRes.perCreditType; track entry.creditType) {
+                    <span class="accrued-type">{{ entry.creditType }}: {{ entry.amount }}</span>
+                  }
+                </p>
               } @else if (accruedError()) {
-                <div class="error-msg">{{ accruedError() }}</div>
+                <p class="error-msg">{{ accruedError() }}</p>
               }
               <button
                 class="btn btn-primary claim-btn"
-                [disabled]="claimDisabled()"
+                [disabled]="claimSubmitting() || !canClaim()"
                 (click)="onClaim()"
               >
-                {{ claimLabel() }}
+                @if (claimSubmitting()) {
+                  Claiming...
+                } @else {
+                  @if (accrued(); as accruedRes) {
+                    Claim {{ accruedRes.total }} Accrued Credits
+                  } @else {
+                    Claim Accrued Credits
+                  }
+                }
               </button>
+              @if (accrued() && !canClaim()) {
+                <p class="claim-hint">No credits accrued yet — nothing to claim.</p>
+              }
               @if (claimSuccess()) {
                 <div class="success-msg">
                   Claimed {{ claimCredits() }} credits! Tx: {{ claimTx() }}
@@ -335,6 +337,8 @@ export class BondDetailComponent implements OnInit, OnDestroy {
   readonly transferError = signal('');
   readonly undistributed = signal<number | null>(null);
   readonly undistributedError = signal('');
+  readonly accrued = signal<AccruedCreditsResponse | null>(null);
+  readonly accruedError = signal('');
   readonly sweepSubmitting = signal(false);
   readonly sweepSuccess = signal(false);
   readonly sweepSwept = signal(0);
@@ -384,6 +388,41 @@ export class BondDetailComponent implements OnInit, OnDestroy {
       });
     }
   }, { allowSignalWrites: true });
+
+  private accruedLoadedFor: { bondId: number; holder: string } | null = null;
+
+  private readonly loadAccruedEffect = effect(() => {
+    const b = this.bond();
+    const holder = this.walletService.address();
+    if (!b || !holder) return;
+    if (
+      this.accruedLoadedFor &&
+      this.accruedLoadedFor.bondId === b.id &&
+      this.accruedLoadedFor.holder === holder
+    ) {
+      return;
+    }
+    this.accruedLoadedFor = { bondId: b.id, holder };
+    this.apiService.getAccruedCredits(b.id, holder).subscribe({
+      next: (res) => this.accrued.set(res),
+      error: (err) =>
+        this.accruedError.set(
+          err.error?.detail || err.message || 'Failed to load accrued credits',
+        ),
+    });
+  }, { allowSignalWrites: true });
+
+  readonly canClaim = computed(() => (this.accrued()?.total ?? 0) > 0);
+
+  private refreshAccrued(): void {
+    const b = this.bond();
+    const holder = this.walletService.address();
+    if (!b || !holder) return;
+    this.apiService.getAccruedCredits(b.id, holder).subscribe({
+      next: (res) => this.accrued.set(res),
+      error: () => this.accrued.set(null),
+    });
+  }
 
   subscribeAmount = 0;
   transferTo = '';
@@ -501,7 +540,8 @@ export class BondDetailComponent implements OnInit, OnDestroy {
         this.claimCredits.set(res.credits);
         this.claimTx.set(res.transactionHash);
         this.claimSubmitting.set(false);
-        this.loadAccruedCredits();
+        this.accruedLoadedFor = null;
+        this.refreshAccrued();
       },
       error: (err) => {
         this.claimError.set(err.error?.detail || err.message || 'Claim failed');

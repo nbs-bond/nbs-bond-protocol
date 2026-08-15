@@ -27,7 +27,7 @@ describe('BondsController guards', () => {
   });
 
   it('exposes GET /:id/accrued as a read-only public endpoint', () => {
-    const guards: unknown[] = Reflect.getMetadata(
+    const guards: unknown[] | undefined = Reflect.getMetadata(
       GUARDS_METADATA,
       BondsController.prototype.getAccruedCredits,
     );
@@ -37,5 +37,14 @@ describe('BondsController guards', () => {
   it('routes the accrued handler under the /bonds/:id/accrued path', () => {
     const path = Reflect.getMetadata('path', BondsController.prototype.getAccruedCredits);
     expect(path).toBe(':id/accrued');
+  });
+
+  it('delegates GET /:id/accrued to the service with the holder query param', async () => {
+    const accrued = { bondId: 1, holder: 'holder-key', total: 0, perCreditType: [] };
+    const service = { getAccruedCredits: jest.fn().mockResolvedValue(accrued) };
+    const controller = new BondsController(service as any);
+
+    await expect(controller.getAccruedCredits(1, 'holder-key')).resolves.toBe(accrued);
+    expect(service.getAccruedCredits).toHaveBeenCalledWith(1, 'holder-key');
   });
 });
