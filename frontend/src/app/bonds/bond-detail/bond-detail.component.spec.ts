@@ -39,7 +39,7 @@ describe('BondDetailComponent', () => {
   beforeEach(async () => {
     apiService = jasmine.createSpyObj('ApiService', [
       'getBond', 'subscribeToBond', 'claimCredits', 'transferBond',
-      'getUndistributedTotal', 'sweepUndistributed',
+      'getUndistributedTotal', 'sweepUndistributed', 'getAccruedCredits',
     ]);
     apiService.getBond.and.returnValue(of(bond));
     apiService.getUndistributedTotal.and.returnValue(
@@ -47,6 +47,17 @@ describe('BondDetailComponent', () => {
     );
     apiService.sweepUndistributed.and.returnValue(
       of({ bondId: 1, swept: 7, transactionHash: '0xabc' }),
+    );
+    apiService.getAccruedCredits.and.returnValue(
+      of({
+        bondId: 1,
+        holder: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        total: 150,
+        perCreditType: [
+          { creditType: 'Carbon', amount: 100 },
+          { creditType: 'Biodiversity', amount: 50 },
+        ],
+      }),
     );
 
     await TestBed.configureTestingModule({
@@ -190,4 +201,42 @@ describe('BondDetailComponent', () => {
     expect(component.formatCountdown(5 * 1000)).toBe('5s');
     expect(component.formatCountdown(0)).toBe('');
   });
+
+  it('loads accrued credits for the connected wallet and renders the claimable amount', fakeAsync(() => {
+    const holder = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+    walletService.address.set(holder);
+    createFixture();
+
+    expect(apiService.getAccruedCredits).toHaveBeenCalledWith(1, holder);
+    const claimSection = fixture.nativeElement.querySelector('.claim-section');
+    expect(claimSection?.textContent).toContain('150');
+    expect(claimSection?.textContent).toContain('Carbon: 100');
+    expect(claimSection?.textContent).toContain('Biodiversity: 50');
+    const claimBtn = claimSection?.querySelector('.claim-btn') as HTMLButtonElement;
+    expect(claimBtn.disabled).toBe(false);
+    expect(claimBtn.textContent).toContain('Claim 150 Accrued Credits');
+    discardPeriodicTasks();
+  }));
+
+  it('disables the claim button when nothing has accrued', fakeAsync(() => {
+    walletService.address.set(
+      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+    );
+    apiService.getAccruedCredits.and.returnValue(
+      of({
+        bondId: 1,
+        holder: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        total: 0,
+        perCreditType: [],
+      }),
+    );
+    createFixture();
+
+    const claimSection = fixture.nativeElement.querySelector('.claim-section');
+    expect(claimSection?.textContent).toContain('Accrued credits:');
+    const claimBtn = claimSection?.querySelector('.claim-btn') as HTMLButtonElement;
+    expect(claimBtn.disabled).toBe(true);
+    expect(claimSection?.textContent).toContain('No credits accrued yet');
+    discardPeriodicTasks();
+  }));
 });

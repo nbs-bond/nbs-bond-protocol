@@ -17,6 +17,8 @@ import {
   ClaimCreditsResponse,
   TransferResponse,
   UndistributedTotalResponse,
+  AccruedCreditsByType,
+  AccruedCreditsResponse,
   SweepUndistributedResponse,
   BondStatusEnum,
   BondMaturityStatusEnum,
@@ -236,6 +238,52 @@ export class BondsService {
     return {
       bondId: id,
       undistributedTotal: Number(scValToNative(resultScVal)),
+    };
+  }
+
+  /**
+   * Accrued (unclaimed) coupon credits for a holder, per CreditType.
+   * Reads CouponEngine.accrued_credits (total) plus accrued_credits_by_type
+   * for every credit type; Soroban enums encode as a vec of a single u32
+   * variant index, matching contracts/shared CreditType ordering.
+   */
+  async getAccruedCredits(id: number, holder: string): Promise<AccruedCreditsResponse> {
+    if (!/^G[A-Z2-7]{55}$/.test(holder)) {
+      throw new BadRequestException('holder must be a valid Stellar public key');
+    }
+
+    const holderScVal = Address.fromString(holder).toScVal();
+    const bondIdScVal = nativeToScVal(BigInt(id), { type: 'u64' });
+
+    const totalScVal = await this.contractService.simulateCall({
+      contractAddress: COUPON_ENGINE(), method: 'accrued_credits',
+      args: [bondIdScVal, holderScVal],
+    });
+
+    const creditTypeOrder: CreditTypeEnum[] = [
+      CreditTypeEnum.Carbon,
+      CreditTypeEnum.Biodiversity,
+      CreditTypeEnum.Basket,
+      CreditTypeEnum.BlueCarbon,
+    ];
+
+    const perCreditType: AccruedCreditsByType[] = [];
+    for (let variant = 0; variant < creditTypeOrder.length; variant++) {
+      const typeScVal = await this.contractService.simulateCall({
+        contractAddress: COUPON_ENGINE(), method: 'accrued_credits_by_type',
+        args: [bondIdScVal, holderScVal, xdr.ScVal.scvVec([xdr.ScVal.scvU32(variant)])],
+      });
+      const amount = Number(scValToNative(typeScVal));
+      if (amount > 0) {
+        perCreditType.push({ creditType: creditTypeOrder[variant], amount });
+      }
+    }
+
+    return {
+      bondId: id,
+      holder,
+      total: Number(scValToNative(totalScVal)),
+      perCreditType,
     };
   }
 

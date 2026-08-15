@@ -317,4 +317,66 @@ describe('BondsService', () => {
       expect(bond.status).toBe('Matured');
     });
   });
+
+  describe('getAccruedCredits', () => {
+    const HOLDER = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    const buildService = async (
+      simulateCall: (options: { method: string; args: any[] }) => Promise<any>,
+    ) => {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: { simulateCall: jest.fn(simulateCall) } },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+        ],
+      }).compile();
+      return moduleRef.get(BondsService);
+    };
+
+    it('returns total and non-zero per-type accruals from the CouponEngine', async () => {
+      // The service probes credit types in enum order (Carbon, Biodiversity, Basket, BlueCarbon).
+      const byTypeAmounts = [100, 50, 0, 0];
+      let byTypeCall = 0;
+      const svc = await buildService(async ({ method }) => {
+        if (method === 'accrued_credits') {
+          return nativeToScVal(BigInt(150), { type: 'i128' });
+        }
+        const amount = byTypeAmounts[byTypeCall++] ?? 0;
+        return nativeToScVal(BigInt(amount), { type: 'i128' });
+      });
+
+      const result = await svc.getAccruedCredits(1, HOLDER);
+
+      expect(result.bondId).toBe(1);
+      expect(result.holder).toBe(HOLDER);
+      expect(result.total).toBe(150);
+      expect(result.perCreditType).toEqual([
+        { creditType: 'Carbon', amount: 100 },
+        { creditType: 'Biodiversity', amount: 50 },
+      ]);
+    });
+
+    it('rejects an invalid holder address with 400', async () => {
+      const svc = await buildService(async () =>
+        nativeToScVal(BigInt(0), { type: 'i128' }),
+      );
+      await expect(svc.getAccruedCredits(1, 'not-a-key')).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('returns an empty per-type list when nothing has accrued', async () => {
+      const svc = await buildService(async () =>
+        nativeToScVal(BigInt(0), { type: 'i128' }),
+      );
+      const result = await svc.getAccruedCredits(1, HOLDER);
+      expect(result.total).toBe(0);
+      expect(result.perCreditType).toEqual([]);
+    });
+  });
 });

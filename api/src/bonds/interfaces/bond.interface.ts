@@ -70,6 +70,18 @@ export interface UndistributedTotalResponse {
   undistributedTotal: number;
 }
 
+export interface AccruedCreditsByType {
+  creditType: CreditTypeEnum;
+  amount: number;
+}
+
+export interface AccruedCreditsResponse {
+  bondId: number;
+  holder: string;
+  total: number;
+  perCreditType: AccruedCreditsByType[];
+}
+
 export interface SweepUndistributedResponse {
   bondId: number;
   swept: number;
