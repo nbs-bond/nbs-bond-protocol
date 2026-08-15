@@ -1,5 +1,4 @@
 import { Test } from '@nestjs/testing';
-import { xdr } from '@stellar/stellar-sdk';
 import { OracleService } from './oracle.service';
 import { ContractService } from '../stellar/contract.service';
 import { IpfsService } from '../projects/ipfs.service';
@@ -78,21 +77,6 @@ describe('OracleService', () => {
       ];
 
       expect((service as any).decodeReport(raw).status).toBe(expected);
-    });
-  });
-
-  describe('toBytes32', () => {
-    it('keeps a 64-char hex string as-is', () => {
-      const hex = 'ab'.repeat(32);
-      const scVal = (service as any).toBytes32(hex) as xdr.ScVal;
-      expect(scVal.bytes().length).toBe(32);
-    });
-
-    it('digests a CID into 32 bytes via sha256', () => {
-      const scVal = (service as any).toBytes32(
-        'QmYwAPJzv5CZsnAzt8auVZRnTb7F8Pz6ePzE9LbYp8Xy7F',
-      ) as xdr.ScVal;
-      expect(scVal.bytes().length).toBe(32);
     });
   });
 

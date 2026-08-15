@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
-import { createHash } from 'crypto';
 import { ContractService } from '../stellar/contract.service';
+import { toBytes32 } from '../stellar/bytes32';
 import { IpfsService } from '../projects/ipfs.service';
 import { NonceService } from '../common/services/nonce.service';
 import { SubmitReportDto } from './dto/submit-report.dto';
@@ -16,7 +16,7 @@ import {
   ReportStatus,
 } from './interfaces/oracle.interface';
 import { createClient, RedisClientType } from '@redis/client';
-import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
+import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { StellarService } from '../stellar/stellar.service';
 
 const ORACLE_CONSUMER = () => process.env.ORACLE_CONSUMER_ADDRESS || '';
@@ -54,12 +54,12 @@ export class OracleService {
       ORACLE_CONSUMER(), 'submit_report', adminSecret,
       [
         Address.fromString(providerAddress).toScVal(),
-        this.toBytes32(dto.projectId),
+        toBytes32(dto.projectId),
         nativeToScVal(BigInt(dto.periodStart), { type: 'u64' }),
         nativeToScVal(BigInt(dto.periodEnd), { type: 'u64' }),
         nativeToScVal(BigInt(dto.carbonSequestered), { type: 'i128' }),
         nativeToScVal(dto.methodology, { type: 'symbol' }),
-        this.toBytes32(ipfsResult.hash),
+        toBytes32(ipfsResult.hash),
       ],
       nonce,
     );
@@ -88,7 +88,7 @@ export class OracleService {
     const idsScVal = await this.contractService.simulateCall({
       contractAddress: ORACLE_CONSUMER(),
       method: 'get_project_reports',
-      args: [this.toBytes32(projectId)],
+      args: [toBytes32(projectId)],
     });
     const ids = scValToNative(idsScVal) as number[];
 
@@ -117,7 +117,7 @@ export class OracleService {
       [
         Address.fromString(challengerAddress).toScVal(),
         nativeToScVal(BigInt(reportId), { type: 'u64' }),
-        this.toBytes32(dto.counterEvidenceHash),
+        toBytes32(dto.counterEvidenceHash),
       ],
       nonce,
     );
@@ -322,12 +322,6 @@ export class OracleService {
         ReportStatus.Rejected,
       ][index] ?? ReportStatus.Pending
     );
-  }
-
-  private toBytes32(value: string): xdr.ScVal {
-    const hex = Buffer.from(value, 'hex');
-    const bytes = hex.length === 32 ? hex : createHash('sha256').update(value).digest();
-    return xdr.ScVal.scvBytes(bytes);
   }
 
   private getAdminSecret(): string {

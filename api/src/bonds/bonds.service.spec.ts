@@ -20,6 +20,7 @@ import { BondsService } from './bonds.service';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
+import { InvalidProjectIdError } from '../stellar/bytes32';
 
 describe('BondsService', () => {
   let service: BondsService;
@@ -61,6 +62,19 @@ describe('BondsService', () => {
       expect(raw[3]).toBe('Carbon');
       expect(raw[4]).toBe(BigInt(3000000));
       expect(raw[5]).toBe(BigInt(10000));
+    });
+
+    it('rejects a projectId that is not a valid 64-char hex or CIDv0', () => {
+      expect(() =>
+        (service as any).encodeBondConfig({
+          projectId: 'VCS-1234',
+          faceValue: 1000,
+          couponSchedule: [1000000],
+          creditType: 'Carbon',
+          maturityDate: 3000000,
+          totalSupply: 10000,
+        }),
+      ).toThrow(InvalidProjectIdError);
     });
   });
 

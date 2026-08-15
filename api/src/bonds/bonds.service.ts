@@ -2,6 +2,7 @@ import { Injectable, BadRequestException } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
+import { toBytes32 } from '../stellar/bytes32';
 import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { createClient, RedisClientType } from '@redis/client';
 import { CreateBondDto } from './dto/create-bond.dto';
@@ -329,7 +330,7 @@ export class BondsService {
 
   private encodeBondConfig(dto: CreateBondDto): xdr.ScVal {
     return xdr.ScVal.scvVec([
-      xdr.ScVal.scvBytes(Buffer.from(dto.projectId, 'hex')),
+      toBytes32(dto.projectId),
       nativeToScVal(BigInt(dto.faceValue), { type: 'i128' }),
       xdr.ScVal.scvVec(dto.couponSchedule.map((ts) => nativeToScVal(BigInt(ts), { type: 'u64' }))),
       nativeToScVal(dto.creditType, { type: 'symbol' }),
