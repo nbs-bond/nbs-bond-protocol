@@ -495,7 +495,7 @@ Maintains the canonical on-chain registry of all NbS projects eligible for bond 
 
 ### `CreditRetirement`
 
-Handles the permanent on-chain retirement of carbon and biodiversity credits. Retired credits are burned and a retirement certificate NFT is issued to the retiring wallet — usable for corporate net-zero disclosures.
+Handles the permanent on-chain retirement of carbon and biodiversity credits. Retired credits are burned and a retirement certificate is recorded for the retiring wallet, carrying the bond, project, oracle report and vintage year the credits originated from — usable for corporate net-zero disclosures. See [docs/retirement-certificates.md](docs/retirement-certificates.md).
 
 ---
 

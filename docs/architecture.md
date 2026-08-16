@@ -75,6 +75,10 @@ pub fn get_all_projects(...)
 // Public functions
 pub fn retire_credits(...)
 pub fn get_retirement_record(...)
+pub fn get_retirement_certificate(...)
+pub fn get_bond_retirements(...)
+pub fn get_bond_certificates(...)
+pub fn extend_retirement_ttl(...)
 pub fn get_retired_balance(...)
 ```
 
@@ -93,6 +97,10 @@ pub fn get_retired_balance(...)
 | DEXRouter | Order(order_id) | OrderData | Marketplace order |
 | DEXRouter | Balance(symbol, addr) | i128 | Escrowed quote-asset balance |
 | ProjectRegistry | Project(project_id) | ProjectInfo | Project record |
+| CreditRetirement | Retirement(id) | RetirementRecord | Retirement + certificate provenance (persistent) |
+| CreditRetirement | BondHolderRetirements(bond_id, holder) | Vec<u64> | Certificate index by bond and holder (persistent) |
+| CreditRetirement | HolderRetirements(holder) | Vec<u64> | All retirement ids for a holder (persistent) |
+| CreditRetirement | RetiredPerBond(bond_id, holder) | i128 | Credits already retired against a bond (persistent) |
 
 ## Cross-Contract Calls
 
@@ -101,7 +109,8 @@ ProjectRegistry ──► BondIssuer (verify project exists)
 BondIssuer ──► CouponEngine (distribute coupons)
 CouponEngine ──► OracleConsumer (read verified reports by report_id)
 DEXRouter ──► BondIssuer (settle purchase via transfer, debiting seller / crediting buyer)
-CreditRetirement ──► CouponEngine (verify credit ownership)
+CreditRetirement ──► CouponEngine (verify credit ownership, read PeriodInfo for the vintage window)
+CreditRetirement ──► BondIssuer (verify holding, validate the caller's project_id)
 ```
 
 ## Bond Maturity
@@ -123,6 +132,13 @@ CreditRetirement ──► CouponEngine (verify credit ownership)
 - The report's `project_id` must match the bond's registered project, otherwise distribution is rejected.
 - The verified report id is persisted in `PeriodInfo`, making every distribution auditable back to its evidence.
 - Integer-division remainder that cannot be allocated to holders is recorded as `undistributed` per period and aggregated in `UndistributedTotal`; the admin can recover it via `sweep_undistributed`, preventing value from being silently lost.
+
+## Retirement Certificates
+
+- `retire_credits` takes the `project_id` and `period_index` from the caller and validates both on-chain: the project against `BondIssuer.get_bond`, the period against `CouponEngine.get_period_info`.
+- The certificate caches `report_id`, `vintage_year`, and the monitoring window (`vintage_period_start` / `vintage_period_end`) at retirement time, so reads never re-derive the vintage from the oracle.
+- Certificates are keyed in persistent storage and indexed by `(bond_id, holder)`; `extend_retirement_ttl` is permissionless so any relying party can keep a certificate alive.
+- See [retirement-certificates.md](retirement-certificates.md) for the certificate schema, the design trade-offs, and the caller migration note.
 
 ## API Layer
 
