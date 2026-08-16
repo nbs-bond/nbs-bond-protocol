@@ -172,6 +172,8 @@ mod integration {
             let retirement_id = contracts.cr_client.retire_credits(
                 &bob,
                 &bond_id,
+                &project_id,
+                &0u32,
                 &accrued,
                 &CreditType::Carbon,
                 &credit_hash,
@@ -184,6 +186,20 @@ mod integration {
             assert_eq!(record.amount, accrued);
             assert_eq!(record.credit_type, CreditType::Carbon);
             assert_eq!(record.certificate_ipfs_hash, credit_hash);
+
+            // The certificate ties the retirement back to the project, the bond
+            // and the oracle report that measured the vintage period.
+            assert_eq!(record.bond_id, bond_id);
+            assert_eq!(record.project_id, project_id);
+            assert_eq!(record.period_index, 0);
+            assert_eq!(record.report_id, report_id);
+            assert_eq!(record.vintage_period_start, 1000);
+            assert_eq!(record.vintage_period_end, 2000);
+
+            let certificates = contracts.cr_client.get_bond_certificates(&bond_id, &bob);
+            assert_eq!(certificates.len(), 1);
+            assert_eq!(certificates.get(0).unwrap().record_id, retirement_id);
+            assert_eq!(certificates.get(0).unwrap().report_id, report_id);
 
             let total_retired = contracts.cr_client.get_total_retired(&bob);
             assert_eq!(total_retired, accrued);
@@ -384,6 +400,8 @@ mod integration {
             let retirement_id = contracts.cr_client.retire_credits(
                 &bob,
                 &bond_id,
+                &project_id,
+                &0u32,
                 &accrued,
                 &CreditType::BlueCarbon,
                 &credit_hash,
@@ -395,6 +413,8 @@ mod integration {
             assert_eq!(record.holder, bob);
             assert_eq!(record.amount, accrued);
             assert_eq!(record.credit_type, CreditType::BlueCarbon);
+            assert_eq!(record.project_id, project_id);
+            assert_eq!(record.report_id, report_id);
         }
     }
 

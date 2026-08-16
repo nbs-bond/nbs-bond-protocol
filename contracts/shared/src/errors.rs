@@ -70,6 +70,9 @@ pub enum CreditError {
     NotAHolder = 6,
     InvalidCertificate = 7,
     InvalidCreditType = 8,
+    ProjectMismatch = 9,
+    PeriodNotFound = 10,
+    PeriodNotDistributed = 11,
 }
 
 #[derive(Clone, Debug, PartialEq)]
