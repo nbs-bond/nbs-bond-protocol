@@ -8,6 +8,17 @@ on:
   workflow_dispatch:
 
 jobs:
+  scripts:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Test testnet deployment script
+        run: ./scripts/deploy-testnet.test.sh
+
   contracts:
     runs-on: ubuntu-latest
     steps:

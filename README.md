@@ -716,14 +716,14 @@ cd contracts && cargo build --release && cd ..
 
 ```bash
 # 1. Configure environment
-cp .env.example .env
-# Edit .env with your Stellar keys and API credentials
+cp .env.example api/.env
+# Edit api/.env with your Stellar keys and API credentials
 
 # 2. Deploy contracts to testnet
 ./scripts/deploy-testnet.sh
 
 # 3. Seed one bond, two oracle providers, and a verified report
-set -a && source .env && set +a
+set -a && source api/.env && set +a
 NODE_PATH=api/node_modules api/node_modules/.bin/ts-node --transpile-only scripts/seed-testnet.ts
 
 # 4. Start the API server
@@ -751,7 +751,7 @@ declined, distinct from the extension being absent.
 
 ## 🔧 Environment Variables
 
-Create `.env` from the provided template:
+Create `api/.env` from the provided template:
 
 ```env
 # ── Stellar Network ──────────────────────────────────────────────
@@ -1018,7 +1018,7 @@ ng e2e
 # Deploy all contracts to Stellar testnet
 ./scripts/deploy-testnet.sh
 
-# The script writes contract addresses into .env automatically
+# The script writes contract addresses into api/.env automatically
 # BOND_ISSUER_ADDRESS=C...
 # COUPON_ENGINE_ADDRESS=C...
 # etc.
