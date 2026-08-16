@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException, ConflictException, HttpException } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { toBytes32 } from '../stellar/bytes32';
 import { IpfsService } from '../projects/ipfs.service';
@@ -11,15 +11,26 @@ import {
   ChallengeResponse,
   ProviderResponse,
   ProviderStatsWithHistory,
+  ProviderHealthStatus,
+  ProviderStalenessMetric,
   SlashRecord,
   ChallengeRecord,
   ReportStatus,
+  OracleStalenessReport,
 } from './interfaces/oracle.interface';
 import { createClient, RedisClientType } from '@redis/client';
 import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { StellarService } from '../stellar/stellar.service';
 
 const ORACLE_CONSUMER = () => process.env.ORACLE_CONSUMER_ADDRESS || '';
+
+const ORACLE_ERROR_CODE = {
+  NotInitialized: 1,
+  Unauthorized: 2,
+  InvalidNonce: 3,
+  ProviderNotFound: 4,
+  ProviderAlreadyExists: 5,
+};
 
 @Injectable()
 export class OracleService {
@@ -133,27 +144,32 @@ export class OracleService {
   }
 
   async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
-    const adminSecret = this.getAdminSecret();
-    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
-    const nonce = await this.nonceService.next(ORACLE_CONSUMER(), adminAddress);
+    try {
+      const adminSecret = this.getAdminSecret();
+      const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+      const nonce = await this.nonceService.next(ORACLE_CONSUMER(), adminAddress);
 
-    await this.contractService.invokeContractMethod(
-      ORACLE_CONSUMER(), 'register_provider', adminSecret,
-      [
-        Address.fromString(adminAddress).toScVal(),
-        Address.fromString(dto.providerAddress).toScVal(),
-        nativeToScVal(dto.methodology, { type: 'symbol' }),
-      ],
-      nonce,
-    );
+      await this.contractService.invokeContractMethod(
+        ORACLE_CONSUMER(), 'register_provider', adminSecret,
+        [
+          Address.fromString(adminAddress).toScVal(),
+          Address.fromString(dto.providerAddress).toScVal(),
+          nativeToScVal(dto.methodology, { type: 'symbol' }),
+        ],
+        nonce,
+      );
 
-    return {
-      providerAddress: dto.providerAddress,
-      methodology: dto.methodology,
-      name: `Oracle ${dto.providerAddress.slice(0, 6)}`,
-      active: true,
-      registeredAt: new Date().toISOString(),
-    };
+      return {
+        providerAddress: dto.providerAddress,
+        methodology: dto.methodology,
+        name: `Oracle ${dto.providerAddress.slice(0, 6)}`,
+        active: true,
+        stake: 0,
+        registeredAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      throw this.mapProviderError(error);
+    }
   }
 
   async listProviders(): Promise<ProviderResponse[]> {
@@ -176,19 +192,29 @@ export class OracleService {
           method: 'get_provider',
           args: [Address.fromString(address).toScVal()],
         });
-        const data = scValToNative(providerScVal) as any[];
-        providers.push({
-          providerAddress: data[0] as string,
-          methodology: data[1] as string,
-          name: `Oracle ${(data[0] as string).slice(0, 6)}`,
-          active: data[3] as boolean,
-          registeredAt: new Date(Number(data[4]) * 1000).toISOString(),
-        });
+        providers.push(this.buildProviderResponse(scValToNative(providerScVal)));
       } catch {}
     }
 
     await this.redis.setEx(cacheKey, 120, JSON.stringify(providers));
     return providers;
+  }
+
+  mergeProviderHealth(
+    providers: ProviderResponse[],
+    staleness?: OracleStalenessReport,
+  ): ProviderResponse[] {
+    if (!staleness) return providers;
+
+    const healthByProvider = new Map<string, ProviderStalenessMetric>();
+    for (const metric of staleness.providers ?? []) {
+      healthByProvider.set(metric.providerAddress, metric);
+    }
+
+    return providers.map((provider) => ({
+      ...provider,
+      health: this.toProviderHealth(healthByProvider.get(provider.providerAddress)),
+    }));
   }
 
   async getProviderStats(providerAddress: string): Promise<ProviderStatsWithHistory> {
@@ -322,6 +348,52 @@ export class OracleService {
         ReportStatus.Rejected,
       ][index] ?? ReportStatus.Pending
     );
+  }
+
+  private buildProviderResponse(data: any): ProviderResponse {
+    const providerAddress = String(this.field(data, 'address', 0));
+    return {
+      providerAddress,
+      methodology: String(this.field(data, 'methodology', 1)),
+      name: `Oracle ${providerAddress.slice(0, 6)}`,
+      stake: Number(this.field(data, 'stake', 2)),
+      active: Boolean(this.field(data, 'active', 3)),
+      registeredAt: new Date(Number(this.field(data, 'registered_at', 4)) * 1000).toISOString(),
+    };
+  }
+
+  private toProviderHealth(metric?: ProviderStalenessMetric): ProviderHealthStatus {
+    if (!metric) {
+      return { status: 'unknown', projectIds: [] };
+    }
+    return {
+      status: metric.isStale ? 'stale' : 'healthy',
+      lastVerifiedAt: metric.lastVerifiedAt,
+      expectedNextReportAt: metric.expectedNextReportAt,
+      stalenessSeconds: metric.stalenessSeconds,
+      projectIds: metric.projectIds,
+    };
+  }
+
+  private mapProviderError(error: unknown): Error {
+    if (error instanceof ConflictException) {
+      return error;
+    }
+    if (error instanceof HttpException) {
+      if (this.contractErrorCode(error.message) === ORACLE_ERROR_CODE.ProviderAlreadyExists) {
+        return new ConflictException('Oracle provider is already registered');
+      }
+      return error;
+    }
+    if (error instanceof Error) {
+      return new BadRequestException(error.message);
+    }
+    return new BadRequestException('Failed to register oracle provider');
+  }
+
+  private contractErrorCode(message: string): number | undefined {
+    const match = message.match(/error code (\d+)/);
+    return match ? Number(match[1]) : undefined;
   }
 
   private getAdminSecret(): string {

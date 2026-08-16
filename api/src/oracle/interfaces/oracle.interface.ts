@@ -28,12 +28,24 @@ export interface ChallengeResponse {
   createdAt: string;
 }
 
+export type ProviderHealthState = 'healthy' | 'stale' | 'unknown';
+
+export interface ProviderHealthStatus {
+  status: ProviderHealthState;
+  lastVerifiedAt?: string;
+  expectedNextReportAt?: string;
+  stalenessSeconds?: number;
+  projectIds: string[];
+}
+
 export interface ProviderResponse {
   providerAddress: string;
   methodology: string;
   name: string;
   active: boolean;
   registeredAt: string;
+  stake?: number;
+  health?: ProviderHealthStatus;
 }
 
 export interface SlashRecord {

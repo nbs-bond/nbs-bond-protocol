@@ -959,6 +959,8 @@ nbs-bond-protocol/
 | `POST` | `/oracle/reports` | Submit a measurement report (providers only) |
 | `GET` | `/oracle/reports/:projectId` | Get oracle history for a project |
 | `POST` | `/oracle/challenge/:reportId` | Challenge a submitted report |
+| `GET` | `/oracle/providers` | List registered oracle providers with stake and health |
+| `POST` | `/oracle/providers` | Register a new oracle provider (admin only) |
 
 ---
 
