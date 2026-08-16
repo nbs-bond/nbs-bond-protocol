@@ -395,11 +395,15 @@ impl CouponEngine {
         let accrued: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &0i128);
 
+        let credit_type = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondCreditType(bond_id));
+
+        let mut carbon_amt: i128 = 0;
+        let mut bio_amt: i128 = 0;
+
         if accrued > 0 {
-            let credit_type = env
-                .storage()
-                .instance()
-                .get(&DataKey::BondCreditType(bond_id));
             match credit_type {
                 Some(CreditType::Carbon) | Some(CreditType::BlueCarbon) => {
                     clear_accrued(&env, bond_id, &caller, CreditType::Carbon);
@@ -408,6 +412,8 @@ impl CouponEngine {
                     clear_accrued(&env, bond_id, &caller, CreditType::Biodiversity);
                 }
                 Some(CreditType::Basket) => {
+                    carbon_amt = Self::accrued_credits_by_type(env.clone(), bond_id, caller.clone(), CreditType::Carbon);
+                    bio_amt = Self::accrued_credits_by_type(env.clone(), bond_id, caller.clone(), CreditType::Biodiversity);
                     clear_accrued(&env, bond_id, &caller, CreditType::Carbon);
                     clear_accrued(&env, bond_id, &caller, CreditType::Biodiversity);
                 }
@@ -415,10 +421,20 @@ impl CouponEngine {
             }
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "credits_claimed"),),
-            (bond_id, caller, accrued),
-        );
+        match credit_type {
+            Some(CreditType::Basket) => {
+                env.events().publish(
+                    (Symbol::new(&env, "credits_claimed"),),
+                    (bond_id, caller, carbon_amt, bio_amt),
+                );
+            }
+            _ => {
+                env.events().publish(
+                    (Symbol::new(&env, "credits_claimed"),),
+                    (bond_id, caller, accrued),
+                );
+            }
+        }
 
         Ok(accrued)
     }
@@ -1154,6 +1170,97 @@ mod test {
 
         let accrued = t.client.accrued_credits(&bond_id, &holder);
         assert_eq!(accrued, 0);
+    }
+
+    #[test]
+    fn test_claim_credits_single_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let t = deploy(env.clone(), admin);
+        
+        let project_id = create_project_id(&t._env, 1);
+        let holder = Address::generate(&t._env);
+        
+        let bond_id = issue_and_subscribe_with_type(
+            &t._env,
+            &t,
+            &project_id,
+            nbbs_shared::CreditType::Carbon,
+            &holder,
+            10_000,
+        );
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+        
+        let report_id = submit_verified_report(
+            &t._env,
+            &t,
+            &project_id,
+            100_000,
+            BiodiversityMetrics::Absent,
+            0,
+        );
+        let holders = vec![&t._env, holder.clone()];
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        
+        t.client.claim_credits(&holder, &bond_id, &0);
+        
+        let carbon_total = 100i128;
+        
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let expected_topics = vec![&env, Symbol::new(&env, "credits_claimed").into_val(&env)];
+        let expected_data = (bond_id, holder.clone(), carbon_total).into_val(&env);
+        
+        assert_eq!(last_event.1, expected_topics);
+        assert_eq!(last_event.2, expected_data);
+    }
+
+    #[test]
+    fn test_claim_credits_basket_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let t = deploy(env.clone(), admin);
+        
+        let project_id = create_project_id(&t._env, 3);
+        let holder = Address::generate(&t._env);
+        
+        let bond_id = issue_and_subscribe_with_type(
+            &t._env,
+            &t,
+            &project_id,
+            nbbs_shared::CreditType::Basket,
+            &holder,
+            10_000,
+        );
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+        
+        let report_id = submit_verified_report(
+            &t._env,
+            &t,
+            &project_id,
+            100_000,
+            BiodiversityMetrics::Present((500, 125, 1_000)),
+            0,
+        );
+        let holders = vec![&t._env, holder.clone()];
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        
+        t.client.claim_credits(&holder, &bond_id, &0);
+        
+        let bio_total = 500 + 125 * SPECIES_CREDIT_RATE / HABITAT_CREDIT_RATE + 1_000;
+        let carbon_total = 100i128;
+        
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        let expected_topics = vec![&env, Symbol::new(&env, "credits_claimed").into_val(&env)];
+        let expected_data = (bond_id, holder.clone(), carbon_total, bio_total).into_val(&env);
+        
+        assert_eq!(last_event.1, expected_topics);
+        assert_eq!(last_event.2, expected_data);
     }
 
     #[test]
