@@ -732,6 +732,17 @@ cd frontend && ng serve
 open http://localhost:4200
 ```
 
+### Wallet Requirement (Freighter)
+
+Signing in requires the [Freighter](https://www.freighter.app/) browser extension. If it is
+not installed, the app shows an install prompt linking to the listing for your browser
+(Chrome Web Store for Chrome, Brave and Edge; Firefox Add-ons for Firefox) rather than
+failing silently. Install the extension and use **I have installed it — retry** — no page
+reload needed, since Freighter injects itself as soon as its content script runs.
+
+Prompts you dismiss inside Freighter (connection or signature requests) are reported as
+declined, distinct from the extension being absent.
+
 ---
 
 ## 🔧 Environment Variables
