@@ -85,4 +85,5 @@ pub enum GovernanceError {
     TimelockNotElapsed = 8,
     NotQueued = 9,
     AlreadyExecuted = 10,
+    ProposalExpired = 11,
 }

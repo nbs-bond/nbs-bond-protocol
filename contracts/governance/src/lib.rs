@@ -4,6 +4,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, IntoV
 use nbbs_shared::GovernanceError;
 
 pub const DEFAULT_TIMELOCK_SECONDS: u64 = 172_800;
+pub const DEFAULT_PROPOSAL_TTL_SECONDS: u64 = 2_592_000;
 
 #[derive(Clone)]
 #[contracttype]
@@ -26,6 +27,7 @@ pub enum ProposalStatus {
     Executed,
     Rejected,
     Cancelled,
+    Expired,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +43,7 @@ pub struct Proposal {
     pub approval_count: u32,
     pub veto_count: u32,
     pub created_at: u64,
+    pub expires_at: u64,
     pub queued_at: u64,
     pub executed_at: u64,
     pub timelock_seconds: u64,
@@ -89,6 +92,10 @@ fn set_execution_nonce(env: &Env, target: &Address, nonce: u64) {
     env.storage()
         .instance()
         .set(&DataKey::ExecutionNonce(target.clone()), &nonce);
+}
+
+fn is_expired(env: &Env, proposal: &Proposal) -> bool {
+    env.ledger().timestamp() >= proposal.expires_at
 }
 
 #[contract]
@@ -162,6 +169,10 @@ impl Governance {
             approval_count: 0,
             veto_count: 0,
             created_at: env.ledger().timestamp(),
+            expires_at: env
+                .ledger()
+                .timestamp()
+                .saturating_add(DEFAULT_PROPOSAL_TTL_SECONDS),
             queued_at: 0,
             executed_at: 0,
             timelock_seconds,
@@ -325,6 +336,15 @@ impl Governance {
 
         if proposal.status != ProposalStatus::Queued {
             return Err(GovernanceError::NotQueued);
+        }
+
+        // Proposals carry a per-proposal expiry (frozen at creation). Once the
+        // ledger timestamp passes expires_at the proposal can never be executed,
+        // blocking governance replay of stale proposals. Soroban reverts all
+        // storage on error, so the terminal state is expressed via the
+        // ProposalStatus::Expired variant rather than a persisted transition.
+        if is_expired(&env, &proposal) {
+            return Err(GovernanceError::ProposalExpired);
         }
 
         let now = env.ledger().timestamp();
@@ -681,6 +701,63 @@ mod test {
             &1,
         );
         assert_eq!(result, Err(Ok(GovernanceError::InvalidNonce)));
+    }
+
+    #[test]
+    fn test_proposal_expires_at_creation() {
+        let (env, client, signers) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let target = make_target(&env);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(proposal.created_at, 1_000_000);
+        assert_eq!(proposal.expires_at, 1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS);
+    }
+
+    #[test]
+    fn test_execute_expired_proposal_rejected() {
+        let (env, client, signers) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let target = make_target(&env);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+        assert_eq!(client.get_proposal(&proposal_id).status, ProposalStatus::Queued);
+
+        // Advance past the per-proposal TTL frozen at creation (also past the timelock).
+        env.ledger().set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+
+        // Execution of an expired proposal is always rejected.
+        let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+
+        // The proposal stays queryable for audit purposes.
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Queued);
+        assert!(env.ledger().timestamp() > proposal.expires_at);
+
+        // Repeated execute attempts are equally rejected.
+        let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
     }
 
     #[test]
