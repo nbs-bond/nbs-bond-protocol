@@ -5,25 +5,85 @@ import { IpfsService } from '../projects/ipfs.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
 import { ReportStatus } from './interfaces/oracle.interface';
+import { BadRequestException, ForbiddenException, HttpStatus } from '@nestjs/common';
+import { Keypair } from '@stellar/stellar-sdk';
 
 describe('OracleService', () => {
   let service: OracleService;
+  const contractService = { invokeContractMethod: jest.fn() };
+  const nonceService = { next: jest.fn() };
+  const investorAddress = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+  const stellarService = {
+    getKeypairFromSecret: jest.fn(() => ({ publicKey: () => investorAddress })),
+  };
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
       providers: [
         OracleService,
-        { provide: ContractService, useValue: {} },
+        { provide: ContractService, useValue: contractService },
         { provide: IpfsService, useValue: {} },
-        { provide: StellarService, useValue: {} },
+        { provide: StellarService, useValue: stellarService },
         {
           provide: NonceService,
-          useValue: { next: jest.fn().mockResolvedValue(0) },
+          useValue: nonceService,
         },
       ],
     }).compile();
 
     service = moduleRef.get(OracleService);
+  });
+
+  beforeEach(() => {
+    process.env.INVESTOR_SECRET_KEY = 'test-investor-secret';
+    contractService.invokeContractMethod.mockReset().mockResolvedValue({});
+    nonceService.next.mockReset().mockResolvedValue(0);
+    (service as any).localChallengeAttempts.clear();
+  });
+
+  describe('challengeReport', () => {
+    const dto = {
+      counterEvidenceHash: 'QmYwAPJzv5CZsnAzt8auVZRnGi2C8Qp9G2YB3hM9oWZpDa',
+      reason: 'Independent evidence conflicts with this report',
+    };
+
+    it('signs with the configured investor key, never the admin key', async () => {
+      process.env.ADMIN_SECRET_KEY = 'admin-secret-must-not-be-used';
+
+      await service.challengeReport(7, dto, investorAddress);
+
+      expect(contractService.invokeContractMethod).toHaveBeenCalledWith(
+        expect.any(String),
+        'challenge_report',
+        'test-investor-secret',
+        expect.any(Array),
+        0,
+      );
+    });
+
+    it('rejects counter-evidence that is not CIDv0', async () => {
+      await expect(service.challengeReport(7, {
+        ...dto,
+        counterEvidenceHash: 'not-a-cid',
+      }, investorAddress)).rejects.toBeInstanceOf(BadRequestException);
+      expect(contractService.invokeContractMethod).not.toHaveBeenCalled();
+    });
+
+    it('rejects a JWT wallet that differs from the configured signer', async () => {
+      const otherAddress = Keypair.random().publicKey();
+      await expect(service.challengeReport(7, dto, otherAddress))
+        .rejects.toBeInstanceOf(ForbiddenException);
+    });
+
+    it('allows at most three challenges per wallet in 24 hours', async () => {
+      await service.challengeReport(1, dto, investorAddress);
+      await service.challengeReport(2, dto, investorAddress);
+      await service.challengeReport(3, dto, investorAddress);
+
+      await expect(service.challengeReport(4, dto, investorAddress))
+        .rejects.toMatchObject({ status: HttpStatus.TOO_MANY_REQUESTS });
+      expect(contractService.invokeContractMethod).toHaveBeenCalledTimes(3);
+    });
   });
 
   describe('decodeReport', () => {

@@ -743,6 +743,15 @@ CO2e, and verifies it so `distribute_coupon` has a usable report immediately.
 Re-running the command skips the existing bond, providers, report, and investor
 subscription.
 
+> **Challenge signing limitation:** `POST /oracle/challenge/:reportId` is JWT
+> authenticated and currently signs with the configured `INVESTOR_SECRET_KEY`.
+> Consequently, only the wallet represented by that key can submit challenges
+> through the API. This temporary single-investor flow will be replaced by
+> client-signed XDR envelopes (for example, via Freighter), after which the API
+> will only relay transactions and will never hold challenger private keys.
+> Challenge evidence must be CIDv0, and each wallet is limited to three
+> challenges per 24 hours.
+
 ---
 
 ## 🔧 Environment Variables

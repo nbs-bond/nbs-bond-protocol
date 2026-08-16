@@ -1,6 +1,6 @@
 import {
   Controller, Get, Post, Body, Param, Req,
-  HttpCode, HttpStatus, ParseIntPipe,
+  HttpCode, HttpStatus, ParseIntPipe, UseGuards,
 } from '@nestjs/common';
 import { OracleService } from './oracle.service';
 import { OracleMonitoringService } from './oracle.monitoring.service';
@@ -14,6 +14,8 @@ import {
   ProviderStatsWithHistory,
   OracleStalenessReport,
 } from './interfaces/oracle.interface';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
 
 @Controller('oracle')
 export class OracleController {
@@ -41,13 +43,13 @@ export class OracleController {
 
   @Post('challenge/:reportId')
   @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
   async challengeReport(
     @Param('reportId', ParseIntPipe) reportId: number,
     @Body() dto: ChallengeDto,
-    @Req() req: any,
+    @Req() req: AuthenticatedRequest,
   ): Promise<ChallengeResponse> {
-    const challengerAddress = req.headers['x-wallet-address'] as string || '';
-    return this.oracleService.challengeReport(reportId, dto, challengerAddress);
+    return this.oracleService.challengeReport(reportId, dto, req.user.walletAddress);
   }
 
   @Post('providers')

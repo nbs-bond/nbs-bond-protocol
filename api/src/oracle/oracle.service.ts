@@ -1,4 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+} from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { toBytes32 } from '../stellar/bytes32';
 import { IpfsService } from '../projects/ipfs.service';
@@ -24,6 +30,9 @@ const ORACLE_CONSUMER = () => process.env.ORACLE_CONSUMER_ADDRESS || '';
 @Injectable()
 export class OracleService {
   private redis: RedisClientType;
+  private readonly localChallengeAttempts = new Map<string, { count: number; expiresAt: number }>();
+  private static readonly CHALLENGE_LIMIT = 3;
+  private static readonly CHALLENGE_WINDOW_SECONDS = 24 * 60 * 60;
 
   constructor(
     private readonly contractService: ContractService,
@@ -109,11 +118,33 @@ export class OracleService {
   }
 
   async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: string): Promise<ChallengeResponse> {
-    const adminSecret = this.getAdminSecret();
+    if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(dto.counterEvidenceHash)) {
+      throw new BadRequestException(
+        'counterEvidenceHash must be a valid 46-character CIDv0 beginning with Qm',
+      );
+    }
+
+    let investorSecret: string;
+    try {
+      investorSecret = this.getInvestorSecret();
+      Address.fromString(challengerAddress);
+    } catch {
+      throw new BadRequestException('A valid challenger wallet address is required');
+    }
+    const signerAddress = this.stellarService
+      .getKeypairFromSecret(investorSecret)
+      .publicKey();
+    if (challengerAddress !== signerAddress) {
+      throw new ForbiddenException(
+        'Challenge signing is temporarily limited to the configured investor wallet',
+      );
+    }
+
+    await this.enforceChallengeRateLimit(challengerAddress);
     const nonce = await this.nonceService.next(ORACLE_CONSUMER(), challengerAddress);
 
     await this.contractService.invokeContractMethod(
-      ORACLE_CONSUMER(), 'challenge_report', adminSecret,
+      ORACLE_CONSUMER(), 'challenge_report', investorSecret,
       [
         Address.fromString(challengerAddress).toScVal(),
         nativeToScVal(BigInt(reportId), { type: 'u64' }),
@@ -326,5 +357,38 @@ export class OracleService {
 
   private getAdminSecret(): string {
     return process.env.ADMIN_SECRET_KEY || '';
+  }
+
+  private getInvestorSecret(): string {
+    const secret = process.env.INVESTOR_SECRET_KEY;
+    if (!secret) throw new Error('INVESTOR_SECRET_KEY is not configured');
+    return secret;
+  }
+
+  private async enforceChallengeRateLimit(challengerAddress: string): Promise<void> {
+    const key = `oracle:challenge-limit:${challengerAddress}`;
+    let attempts: number;
+
+    if (this.redis.isReady) {
+      attempts = await this.redis.incr(key);
+      if (attempts === 1) {
+        await this.redis.expire(key, OracleService.CHALLENGE_WINDOW_SECONDS);
+      }
+    } else {
+      const now = Date.now();
+      const current = this.localChallengeAttempts.get(key);
+      const next = !current || current.expiresAt <= now
+        ? { count: 1, expiresAt: now + OracleService.CHALLENGE_WINDOW_SECONDS * 1_000 }
+        : { ...current, count: current.count + 1 };
+      this.localChallengeAttempts.set(key, next);
+      attempts = next.count;
+    }
+
+    if (attempts > OracleService.CHALLENGE_LIMIT) {
+      throw new HttpException(
+        'Challenge limit exceeded: maximum 3 challenges per wallet per 24 hours',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
   }
 }
