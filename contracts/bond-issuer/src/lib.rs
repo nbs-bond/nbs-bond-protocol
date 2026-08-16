@@ -1,6 +1,6 @@
 #![no_std]
 #![allow(deprecated)]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
 use nbbs_shared::{BondConfig, BondError, BondStatus};
 
 pub const MAX_SUPPLY: i128 = 1_000_000_000_000_000_000;
@@ -13,6 +13,7 @@ pub enum DataKey {
     BondState(u64),
     HolderBalance(u64, Address),
     BondCount,
+    BondList,
     Nonce(Address),
 }
 
@@ -110,6 +111,16 @@ impl BondIssuer {
         env.storage()
             .instance()
             .set(&DataKey::BondState(bond_id), &state);
+
+        let mut bond_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondList)
+            .unwrap_or(vec![&env]);
+        bond_list.push_back(bond_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BondList, &bond_list);
 
         env.events().publish(
             (Symbol::new(&env, "bond_issued"),),
@@ -383,6 +394,41 @@ impl BondIssuer {
             .instance()
             .get(&DataKey::BondCount)
             .unwrap_or(0)
+    }
+
+    pub fn get_all_bond_ids(env: Env) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BondList)
+            .unwrap_or(vec![&env])
+    }
+
+    /// Returns up to `count` bond IDs starting at index `start` of the
+    /// persistent `BondList`, preserving issuance order. `start` is a
+    /// zero-based offset into the list, not a bond ID. Returns an empty
+    /// vector when `start` is beyond the end of the list or when `count`
+    /// is zero. Does not modify storage.
+    pub fn get_bond_ids_range(env: Env, start: u32, count: u32) -> Vec<u64> {
+        let bond_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondList)
+            .unwrap_or(vec![&env]);
+        let mut result: Vec<u64> = vec![&env];
+
+        let len = bond_list.len();
+        if count == 0 || start >= len {
+            return result;
+        }
+
+        let end = ((start as u64) + (count as u64)).min(len as u64) as u32;
+        for i in start..end {
+            if let Some(id) = bond_list.get(i) {
+                result.push_back(id);
+            }
+        }
+
+        result
     }
 
     pub fn mature_bond(
@@ -846,6 +892,80 @@ mod test {
 
         client.issue_bond(&admin, &config, &1);
         assert_eq!(client.bond_count(), 2);
+    }
+
+    #[test]
+    fn test_get_all_bond_ids_empty() {
+        let (env, client, _admin, _user) = setup();
+        assert_eq!(client.get_all_bond_ids(), vec![&env]);
+    }
+
+    #[test]
+    fn test_get_bond_ids_range_empty() {
+        let (env, client, _admin, _user) = setup();
+        assert_eq!(client.get_bond_ids_range(&0, &20), vec![&env]);
+    }
+
+    #[test]
+    fn test_bond_list_first_bond() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+
+        let bond_id = client.issue_bond(&admin, &config, &0);
+        assert_eq!(bond_id, 1);
+
+        assert_eq!(client.get_all_bond_ids(), vec![&env, 1u64]);
+        assert_eq!(client.get_bond_ids_range(&0, &20), vec![&env, 1u64]);
+        assert_eq!(client.bond_count(), 1);
+    }
+
+    #[test]
+    fn test_bond_list_multiple_bonds() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+
+        for nonce in 0..5u64 {
+            let bond_id = client.issue_bond(&admin, &config, &nonce);
+            assert_eq!(bond_id, nonce + 1);
+        }
+
+        let ids = client.get_all_bond_ids();
+        assert_eq!(ids, vec![&env, 1u64, 2u64, 3u64, 4u64, 5u64]);
+        assert_eq!(ids.len(), 5);
+        assert_eq!(client.bond_count(), 5);
+
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            let bond = client.get_bond(&id);
+            assert_eq!(bond.face_value, 1000);
+        }
+    }
+
+    #[test]
+    fn test_bond_ids_range() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+
+        for nonce in 0..5u64 {
+            client.issue_bond(&admin, &config, &nonce);
+        }
+
+        assert_eq!(
+            client.get_bond_ids_range(&0, &3),
+            vec![&env, 1u64, 2u64, 3u64]
+        );
+        assert_eq!(
+            client.get_bond_ids_range(&2, &2),
+            vec![&env, 3u64, 4u64]
+        );
+        assert_eq!(
+            client.get_bond_ids_range(&4, &20),
+            vec![&env, 5u64]
+        );
+        assert_eq!(client.get_bond_ids_range(&5, &20), vec![&env]);
+        assert_eq!(client.get_bond_ids_range(&100, &20), vec![&env]);
+        assert_eq!(client.get_bond_ids_range(&0, &0), vec![&env]);
+        assert_eq!(client.get_all_bond_ids(), vec![&env, 1u64, 2u64, 3u64, 4u64, 5u64]);
     }
 
     mod property {

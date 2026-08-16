@@ -7,6 +7,8 @@ import { OracleMonitoringService } from './oracle.monitoring.service';
 import { SubmitReportDto } from './dto/submit-report.dto';
 import { ChallengeDto } from './dto/challenge.dto';
 import { RegisterProviderDto } from './dto/register-provider.dto';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 import {
   ReportResponse,
   ChallengeResponse,
@@ -53,6 +55,7 @@ export class OracleController {
   }
 
   @Post('providers')
+  @UseGuards(JwtAuthGuard, AdminGuard)
   @HttpCode(HttpStatus.CREATED)
   async registerProvider(@Body() dto: RegisterProviderDto): Promise<ProviderResponse> {
     return this.oracleService.registerProvider(dto);
@@ -60,7 +63,11 @@ export class OracleController {
 
   @Get('providers')
   async listProviders(): Promise<ProviderResponse[]> {
-    return this.oracleService.listProviders();
+    const providers = await this.oracleService.listProviders();
+    const staleness = await this.monitoringService
+      .computeStaleness()
+      .catch(() => undefined);
+    return this.oracleService.mergeProviderHealth(providers, staleness);
   }
 
   @Get('stats/:providerAddress')

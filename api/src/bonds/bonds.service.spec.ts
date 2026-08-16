@@ -266,6 +266,86 @@ describe('BondsService', () => {
     });
   });
 
+  describe('findAll', () => {
+    const configScVal = () =>
+      xdr.ScVal.scvVec([
+        xdr.ScVal.scvBytes(Buffer.from('a1b2'.padEnd(64, '0'), 'hex')),
+        nativeToScVal(BigInt(1000), { type: 'i128' }),
+        xdr.ScVal.scvVec([nativeToScVal(BigInt(1000000), { type: 'u64' })]),
+        nativeToScVal('Carbon', { type: 'symbol' }),
+        nativeToScVal(BigInt(253402300799), { type: 'u64' }),
+        nativeToScVal(BigInt(10000), { type: 'i128' }),
+      ]);
+
+    const stateScVal = () =>
+      xdr.ScVal.scvVec([
+        nativeToScVal(BigInt(5000), { type: 'i128' }),
+        nativeToScVal('Active', { type: 'symbol' }),
+        nativeToScVal(BigInt(1767225600), { type: 'u64' }),
+      ]);
+
+    it('lists bonds via get_bond_ids_range instead of iterating 1..BondCount', async () => {
+      const contractService = {
+        simulateCall: jest.fn(({ method }: { method: string }) => {
+          if (method === 'bond_count') {
+            return Promise.resolve(nativeToScVal(BigInt(3), { type: 'u64' }));
+          }
+          if (method === 'get_bond_ids_range') {
+            return Promise.resolve(
+              xdr.ScVal.scvVec([nativeToScVal(BigInt(3), { type: 'u64' })]),
+            );
+          }
+          if (method === 'get_bond') {
+            return Promise.resolve(configScVal());
+          }
+          return Promise.resolve(stateScVal());
+        }),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      const result = await svc.findAll(2, 2);
+
+      const rangeCall: any = contractService.simulateCall.mock.calls.find(
+        ([options]: any[]) => options.method === 'get_bond_ids_range',
+      );
+      expect(rangeCall).toBeDefined();
+      expect(rangeCall[0].args).toEqual([
+        nativeToScVal(2, { type: 'u32' }),
+        nativeToScVal(2, { type: 'u32' }),
+      ]);
+
+      const getBondCalls = contractService.simulateCall.mock.calls.filter(
+        ([options]: any[]) => options.method === 'get_bond',
+      );
+      expect(
+        getBondCalls.map(([options]: any[]) =>
+          Number(scValToNative(options.args[0])),
+        ),
+      ).toEqual([3]);
+
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0].id).toBe(3);
+      expect(result.meta).toEqual({
+        page: 2,
+        limit: 2,
+        total: 3,
+        totalPages: 2,
+      });
+    });
+  });
+
   describe('buildBondResponse', () => {
     const configScVal = (maturityDate: number) =>
       xdr.ScVal.scvVec([

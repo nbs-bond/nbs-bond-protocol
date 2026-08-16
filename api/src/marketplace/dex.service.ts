@@ -113,7 +113,7 @@ export class DexService {
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
         nativeToScVal(BigInt(dto.pricePerToken), { type: 'i128' }),
         nativeToScVal(dto.quoteAsset, { type: 'symbol' }),
-        nativeToScVal(BigInt(dto.expiresAfterSeconds || 604800), { type: 'u64' }),
+        nativeToScVal(BigInt(dto.expiresAfterSeconds ?? 86400), { type: 'u64' }),
       ],
       nonce,
     );

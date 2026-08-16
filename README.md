@@ -495,7 +495,7 @@ Maintains the canonical on-chain registry of all NbS projects eligible for bond 
 
 ### `CreditRetirement`
 
-Handles the permanent on-chain retirement of carbon and biodiversity credits. Retired credits are burned and a retirement certificate NFT is issued to the retiring wallet — usable for corporate net-zero disclosures.
+Handles the permanent on-chain retirement of carbon and biodiversity credits. Retired credits are burned and a retirement certificate is recorded for the retiring wallet, carrying the bond, project, oracle report and vintage year the credits originated from — usable for corporate net-zero disclosures. See [docs/retirement-certificates.md](docs/retirement-certificates.md).
 
 ---
 
@@ -736,21 +736,16 @@ cd frontend && ng serve
 open http://localhost:4200
 ```
 
-The seed command uses `USER_SECRET_KEY` as the report submitter and
-`INVESTOR_SECRET_KEY` as an independent verifier. It registers both for the
-bond project's `VERRA-VCS` methodology, submits a report containing 250,000 kg
-CO2e, and verifies it so `distribute_coupon` has a usable report immediately.
-Re-running the command skips the existing bond, providers, report, and investor
-subscription.
+### Wallet Requirement (Freighter)
 
-> **Challenge signing limitation:** `POST /oracle/challenge/:reportId` is JWT
-> authenticated and currently signs with the configured `INVESTOR_SECRET_KEY`.
-> Consequently, only the wallet represented by that key can submit challenges
-> through the API. This temporary single-investor flow will be replaced by
-> client-signed XDR envelopes (for example, via Freighter), after which the API
-> will only relay transactions and will never hold challenger private keys.
-> Challenge evidence must be CIDv0, and each wallet is limited to three
-> challenges per 24 hours.
+Signing in requires the [Freighter](https://www.freighter.app/) browser extension. If it is
+not installed, the app shows an install prompt linking to the listing for your browser
+(Chrome Web Store for Chrome, Brave and Edge; Firefox Add-ons for Firefox) rather than
+failing silently. Install the extension and use **I have installed it — retry** — no page
+reload needed, since Freighter injects itself as soon as its content script runs.
+
+Prompts you dismiss inside Freighter (connection or signature requests) are reported as
+declined, distinct from the extension being absent.
 
 ---
 
@@ -964,6 +959,8 @@ nbs-bond-protocol/
 | `POST` | `/oracle/reports` | Submit a measurement report (providers only) |
 | `GET` | `/oracle/reports/:projectId` | Get oracle history for a project |
 | `POST` | `/oracle/challenge/:reportId` | Challenge a submitted report |
+| `GET` | `/oracle/providers` | List registered oracle providers with stake and health |
+| `POST` | `/oracle/providers` | Register a new oracle provider (admin only) |
 
 ---
 
