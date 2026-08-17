@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { startMonitorServer } from './monitor';
+import { MockHttpClient } from './test-helpers';
 
 const REFERENCE_TIMESTAMP = Math.floor(Date.UTC(2200, 0, 1, 0, 0, 0) / 1000);
 const DAY_SECONDS = 24 * 60 * 60;
@@ -135,5 +136,58 @@ describe('staleness monitor reference timestamp', () => {
     expect(response.status).toBe(200);
     expect(response.body.asOf).toBe(toIso(REFERENCE_TIMESTAMP));
     expect(response.body.projects[0].isStale).toBe(true);
+  });
+});
+
+describe('monitor degradation alerting', () => {
+  interface HealthResponse {
+    asOf: string;
+    status: string;
+    adapters: Array<{ adapter: string; status: string }>;
+  }
+
+  it('fires a degradation webhook when a /health probe degrades', async () => {
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    const healthHttp = new MockHttpClient([{ status: 429, data: {} }]);
+    const webhookHttp = new MockHttpClient([{ status: 200, data: {} }]);
+    const server = startMonitorServer(
+      [{ adapter: 'satellite', url: 'https://upstream.example/v1' }],
+      0,
+      {
+        webhookUrl: 'https://hooks.example.com/webhook',
+        http: webhookHttp,
+        logger: { warn: () => {}, info: () => {} },
+        now: () => 1_000,
+      },
+      { http: healthHttp },
+    );
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+
+    try {
+      const response = await requestJson(server, 'GET', '/health');
+      const body = response.body as unknown as HealthResponse;
+
+      expect(response.status).toBe(200);
+      expect(body.adapters).toHaveLength(1);
+      expect(body.adapters[0].status).toBe('degraded');
+
+      expect(webhookHttp.calls).toHaveLength(1);
+      expect(webhookHttp.calls[0].method).toBe('post');
+      expect(webhookHttp.calls[0].url).toBe('https://hooks.example.com/webhook');
+      const payload = webhookHttp.calls[0].body as {
+        provider: { name: string };
+        status: string;
+        alert: { type: string };
+      };
+      expect(payload.alert.type).toBe('provider_degraded');
+      expect(payload.provider.name).toBe('satellite');
+      expect(payload.status).toBe('degraded');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+      jest.restoreAllMocks();
+    }
   });
 });

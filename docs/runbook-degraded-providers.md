@@ -9,6 +9,7 @@ provider health, what alerts mean, and how to respond.
 | Signal | Where | Description |
 |--------|-------|-------------|
 | Adapter health | `oracle` monitor, `GET /health` | Per-adapter upstream probe: `up` / `degraded` / `down` + latency |
+| Degradation alerts | `oracle` monitor + webhook | Structured log event + optional webhook POST when a provider degrades (see below) |
 | Report staleness | API, `GET /oracle/monitoring/staleness` | Per-project and per-provider time since last verified report vs. expected window |
 | Provider stats | API, `GET /oracle/stats/:providerAddress` | Reports submitted, challenges faced, slash history (from chain) |
 | Alert log | API scheduler | Log-based alert when a project misses its reporting window + grace |
@@ -38,6 +39,80 @@ Endpoints:
   ]
 }
 ```
+
+## Degradation alerting (webhook)
+
+A `degraded`/`down` status is only useful if somebody reacts to it. The oracle
+monitor feeds every `GET /health` probe through a `ProviderAlertTracker`
+(`oracle/health.ts`) that, when a provider degrades, emits a structured `WARN`
+log event and — if a webhook is configured — POSTs a documented JSON payload to
+it.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ORACLE_ALERT_WEBHOOK` | *(unset — log-only)* | URL to POST degradation alerts to (PagerDuty, Slack, OpsGenie, …) |
+| `ORACLE_ALERT_COOLDOWN_MS` | `3600000` (1h) | Minimum interval between alerts **per provider**. Prevents alert fatigue when a provider oscillates healthy/degraded within one reporting window; while a provider stays degraded the alert re-fires at most once per cooldown |
+| `ORACLE_ALERT_TIMEOUT_MS` | `2000` (2s) | Webhook POST timeout. Delivery is fire-and-forget — a slow or unreachable webhook endpoint never blocks health checks or monitoring of other providers |
+
+### Webhook payload
+
+```json
+{
+  "alert": {
+    "id": "provider-degraded-1-1786960386000",
+    "type": "provider_degraded",
+    "severity": "warning",
+    "generatedAt": "2026-08-17T09:53:06.000Z"
+  },
+  "provider": {
+    "name": "satellite",
+    "address": "GABC123...",
+    "methodology": "REMOTE-SENSING"
+  },
+  "status": "degraded",
+  "previousStatus": "up",
+  "consecutiveMissedWindows": 2,
+  "lastSeenAt": "2026-07-01T00:00:00.000Z",
+  "checkedAt": "2026-08-17T09:53:06.000Z",
+  "latencyMs": 6200,
+  "url": "https://api.satellite-processor.io/v1",
+  "error": "probe latency 6200ms exceeds threshold 5000ms",
+  "message": "oracle provider satellite (GABC123...) is degraded after 2 consecutive missed windows, last seen 2026-07-01T00:00:00.000Z: probe latency 6200ms exceeds threshold 5000ms"
+}
+```
+
+Field semantics:
+
+- `alert.severity` — `warning` when `status` is `degraded`, `critical` when it is `down`.
+- `provider.address` / `provider.methodology` — optional enrichment; pass them when
+  evaluating health results (e.g. from the on-chain provider registry).
+- `consecutiveMissedWindows` — number of consecutive degraded/down health checks
+  (a proxy for missed reporting windows; resets to 0 on recovery).
+- `lastSeenAt` — ISO timestamp of the last healthy observation (or the last
+  verified report when supplied as context).
+- `message` — the same human-readable line written to the structured log.
+
+The structured log event carries the same fields under a `provider`/`providerAddress`
+key and also includes `webhookUrl`, so an on-call engineer can act without
+additional lookups.
+
+### Alert lifecycle
+
+1. Provider reports `degraded` or `down` → alert fires (log + webhook) and the
+   cooldown timer starts for that provider.
+2. Provider recovers to `up` → no alert; the consecutive-missed counter resets,
+   but the cooldown is **not** cleared, so an oscillation within one cooldown
+   window does not re-alert.
+3. Provider is still degraded when the cooldown elapses → the alert re-fires
+   (at most once per cooldown per provider).
+4. Webhook failures are logged (`oracle degradation webhook delivery failed`)
+   and never block monitoring.
+
+Webhooks fire when the monitor serves a `GET /health` request and the probe
+returns a degraded status — wire `GET /health` into your existing uptime cron
+to drive alerting.
 
 ### API endpoints
 

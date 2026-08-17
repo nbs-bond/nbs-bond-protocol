@@ -592,6 +592,27 @@ npm run typecheck          # tsc --noEmit
 
 To point an adapter at a live registry instead, set the matching environment variable (`VERRA_REGISTRY_URL`, `SATELLITE_API_URL`, `IOT_API_URL`, `BLUE_CARBON_API_URL`) and call the exported ingest function, e.g. `pollVerraProject('VCS-1234', { periodStart: '2025-01-01', periodEnd: '2025-03-31' })`.
 
+### Degradation alerts
+
+A `degraded`/`down` adapter health status now triggers action instead of being
+silent. When the oracle monitor serves `GET /health`, each probe result is fed
+through a `ProviderAlertTracker` (`oracle/health.ts`) that:
+
+- emits a **structured log event** (provider, provider address, methodology,
+  `consecutiveMissedWindows`, `lastSeenAt`, status, checked-at, upstream URL) so
+  an on-call engineer has full context;
+- **POSTs a documented webhook payload** to `ORACLE_ALERT_WEBHOOK`
+  (PagerDuty / Slack / OpsGenie) when configured — see
+  [docs/runbook-degraded-providers.md](docs/runbook-degraded-providers.md) for
+  the schema and the alert lifecycle;
+- **rate-limits alerts per provider** via `ORACLE_ALERT_COOLDOWN_MS` (default
+  1h) so a provider oscillating healthy/degraded within one reporting window
+  cannot cause alert fatigue; while it stays degraded the alert re-fires at
+  most once per cooldown;
+- delivers the webhook **fire-and-forget** with a short timeout
+  (`ORACLE_ALERT_TIMEOUT_MS`, default 2s) — a slow or unreachable webhook
+  endpoint never blocks health checks or the monitoring of other providers.
+
 ### Measurement models
 
 - **Verra** — sums `carbon_sequestered_kg` across reports whose `verification_status === 'VERIFIED'` and whose reporting period falls inside the requested window.

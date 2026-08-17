@@ -3,9 +3,12 @@ import * as fs from 'fs';
 import {
   AdapterHealth,
   HealthCheckConfig,
+  HealthCheckOptions,
   runHealthChecks,
   checkAdapterHealth,
   defaultHealthChecks,
+  AlertNotificationOptions,
+  ProviderAlertTracker,
 } from './health';
 import {
   StalenessInput,
@@ -76,22 +79,32 @@ function readBody(request: http.IncomingMessage): Promise<string> {
  * Start the oracle monitor HTTP server.
  *
  * Endpoints:
- *   GET  /health                 per-adapter health check
+ *   GET  /health                 per-adapter health check (feeds degradation alerts)
  *   GET  /staleness              staleness from ORACLE_STALENESS_FILE
  *   POST /staleness              staleness computed from a JSON body
  *
  * Both staleness endpoints accept an optional `referenceTimestamp` Unix
  * timestamp in seconds, matching Soroban's ledger timestamp.
+ *
+ * When `alertOptions` is provided (or `ORACLE_ALERT_WEBHOOK` is set), every
+ * `GET /health` probe is fed through a `ProviderAlertTracker`: providers that
+ * degrade emit structured log events and a fire-and-forget webhook POST, at
+ * most once per cooldown per provider. Alert delivery never blocks the
+ * health response.
  */
 export function startMonitorServer(
   adapters: HealthCheckConfig[] = [],
   port: number = DEFAULT_PORT,
+  alertOptions: AlertNotificationOptions = {},
+  healthOptions: HealthCheckOptions = {},
 ): http.Server {
+  const tracker = new ProviderAlertTracker(alertOptions);
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://localhost');
 
     if (url.pathname === '/health' && request.method === 'GET') {
-      const health: AdapterHealth[] = await runHealthChecks(adapters);
+      const health: AdapterHealth[] = await runHealthChecks(adapters, healthOptions);
+      health.forEach((entry) => tracker.evaluate(entry));
       sendJson(response, 200, {
         asOf: new Date().toISOString(),
         status: health.some((entry) => entry.status === 'down') ? 'down' : 'ok',
