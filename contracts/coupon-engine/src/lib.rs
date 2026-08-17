@@ -434,6 +434,42 @@ impl CouponEngine {
             .ok_or(BondError::BondNotFound)
     }
 
+    /// Returns up to `count` `PeriodInfo` records for `bond_id`, starting at
+    /// period index `start`. `start` is a zero-based offset into the period
+    /// history, not a period ID, mirroring `get_bond_ids_range`. Returns an
+    /// empty vector when `start` is beyond the last distributed period or when
+    /// `count` is zero. Does not modify storage.
+    pub fn get_period_info_range(
+        env: Env,
+        bond_id: u64,
+        start: u32,
+        count: u32,
+    ) -> Vec<PeriodInfo> {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodCount(bond_id))
+            .unwrap_or(0);
+        let mut result: Vec<PeriodInfo> = vec![&env];
+
+        if count == 0 || start >= total {
+            return result;
+        }
+
+        let end = ((start as u64) + (count as u64)).min(total as u64) as u32;
+        for i in start..end {
+            if let Some(info) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PeriodInfo(bond_id, i))
+            {
+                result.push_back(info);
+            }
+        }
+
+        result
+    }
+
     pub fn get_period_count(env: Env, bond_id: u64) -> u32 {
         env.storage()
             .persistent()
@@ -1215,6 +1251,55 @@ mod test {
         let report_id2 = submit_verified_report(&t._env, &t, &project_id, 200_000, BiodiversityMetrics::Absent, 2);
         t.client.distribute_coupon(&t.admin, &bond_id, &1, &holders, &report_id2, &2);
         assert_eq!(t.client.get_period_count(&bond_id), 2);
+    }
+
+    #[test]
+    fn test_get_period_info_range_paginates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = create_project_id(&t._env, 1);
+        let holder = Address::generate(&t._env);
+
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        for period in 0..3u32 {
+            let report_id = submit_verified_report(
+                &t._env,
+                &t,
+                &project_id,
+                100_000,
+                BiodiversityMetrics::Absent,
+                (period as u64) * 2,
+            );
+            let holders = vec![&t._env, holder.clone()];
+            t.client.distribute_coupon(
+                &t.admin,
+                &bond_id,
+                &period,
+                &holders,
+                &report_id,
+                &((period as u64) + 1),
+            );
+        }
+
+        assert_eq!(t.client.get_period_count(&bond_id), 3);
+
+        let first_page = t.client.get_period_info_range(&bond_id, &0, &2);
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page.get(0).unwrap().period_index, 0);
+        assert_eq!(first_page.get(1).unwrap().period_index, 1);
+
+        let second_page = t.client.get_period_info_range(&bond_id, &2, &2);
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page.get(0).unwrap().period_index, 2);
+
+        assert_eq!(t.client.get_period_info_range(&bond_id, &5, &20).len(), 0);
+        assert_eq!(t.client.get_period_info_range(&bond_id, &0, &0).len(), 0);
     }
 
     #[test]

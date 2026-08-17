@@ -21,6 +21,10 @@ import {
   AccruedCreditsByType,
   AccruedCreditsResponse,
   SweepUndistributedResponse,
+  PeriodInfoResponse,
+  PeriodListResponse,
+  PeriodReportResponse,
+  ReportStatus,
   BondStatusEnum,
   BondMaturityStatusEnum,
   CreditTypeEnum,
@@ -28,6 +32,7 @@ import {
 
 const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
 const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
+const ORACLE_CONSUMER = () => process.env.ORACLE_CONSUMER_ADDRESS || '';
 
 const BOND_ERROR_CODE = {
   NotInitialized: 1,
@@ -292,6 +297,120 @@ export class BondsService {
       total: Number(scValToNative(totalScVal)),
       perCreditType,
     };
+  }
+
+  /**
+   * Coupon period history for a bond, paginated to keep responses bounded for
+   * long-running bonds. Reads the full page in a single `get_period_info_range`
+   * cross-contract call (one round-trip per page) instead of N round-trips.
+   * Pass `includeReport=true` to hydrate each period's `report_id` into a full
+   * OracleConsumer report summary; this is opt-in to avoid the extra
+   * cross-contract calls by default.
+   */
+  async getPeriods(
+    id: number,
+    page = 1,
+    limit = 20,
+    includeReport = false,
+  ): Promise<PeriodListResponse> {
+    const cacheKey = `bond:${id}:periods:${page}:${limit}:${includeReport}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    const countScVal = await this.contractService.simulateCall({
+      contractAddress: COUPON_ENGINE(),
+      method: 'get_period_count',
+      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
+    });
+    const total = Number(scValToNative(countScVal));
+
+    const start = (page - 1) * limit;
+    const periodsScVal = await this.contractService.simulateCall({
+      contractAddress: COUPON_ENGINE(),
+      method: 'get_period_info_range',
+      args: [
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        nativeToScVal(start, { type: 'u32' }),
+        nativeToScVal(limit, { type: 'u32' }),
+      ],
+    });
+
+    const data: PeriodInfoResponse[] = [];
+    for (const raw of (scValToNative(periodsScVal) as any[]) ?? []) {
+      const period = this.decodePeriodInfo(raw);
+      if (includeReport && period.reportId > 0) {
+        period.report = await this.getReportSummary(period.reportId);
+      }
+      data.push(period);
+    }
+
+    const result: PeriodListResponse = {
+      data,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit) || 1,
+      },
+    };
+
+    await this.redis.setEx(cacheKey, 60, JSON.stringify(result));
+    return result;
+  }
+
+  /**
+   * Decodes a CouponEngine `PeriodInfo` struct (field order matches the
+   * contract declaration): period_index, start_time, end_time,
+   * total_credits_earned, distributed, report_id, undistributed.
+   */
+  private decodePeriodInfo(data: any[]): PeriodInfoResponse {
+    return {
+      periodIndex: Number(data[0]),
+      startTime: Number(data[1]),
+      endTime: Number(data[2]),
+      totalCreditsEarned: Number(data[3]),
+      distributed: Boolean(data[4]),
+      reportId: Number(data[5]),
+      undistributed: Number(data[6]),
+    };
+  }
+
+  private async getReportSummary(reportId: number): Promise<PeriodReportResponse> {
+    const reportScVal = await this.contractService.simulateCall({
+      contractAddress: ORACLE_CONSUMER(),
+      method: 'get_report',
+      args: [nativeToScVal(BigInt(reportId), { type: 'u64' })],
+    });
+    return this.decodeReport(scValToNative(reportScVal) as any[]);
+  }
+
+  /**
+   * Decodes an OracleConsumer `Report` struct. Field order matches the
+   * contract declaration; note the `biodiversity` field is skipped by
+   * position (index 6) when building the summary.
+   */
+  private decodeReport(data: any[]): PeriodReportResponse {
+    return {
+      id: Number(data[0]),
+      providerAddress: data[1] as string,
+      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
+      periodStart: Number(data[3]),
+      periodEnd: Number(data[4]),
+      carbonSequestered: Number(data[5]),
+      methodology: data[7] as string,
+      ipfsHash: Buffer.from(data[8] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[9])),
+      submittedAt: Number(data[10]),
+      verifiedAt: Number(data[11]),
+    };
+  }
+
+  private reportStatusFromIndex(index: number): ReportStatus {
+    return (
+      ['Pending', 'Verified', 'Challenged', 'Rejected'][index] as
+        | ReportStatus
+        | undefined
+    ) ?? 'Pending';
   }
 
   async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {

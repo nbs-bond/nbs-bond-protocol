@@ -87,3 +87,44 @@ export interface SweepUndistributedResponse {
   swept: number;
   transactionHash: string;
 }
+
+export type ReportStatus =
+  | 'Pending'
+  | 'Verified'
+  | 'Challenged'
+  | 'Rejected';
+
+export interface PeriodReportResponse {
+  id: number;
+  projectId: string;
+  periodStart: number;
+  periodEnd: number;
+  carbonSequestered: number;
+  methodology: string;
+  ipfsHash: string;
+  providerAddress: string;
+  status: ReportStatus;
+  submittedAt: number;
+  verifiedAt: number;
+}
+
+export interface PeriodInfoResponse {
+  periodIndex: number;
+  startTime: number;
+  endTime: number;
+  totalCreditsEarned: number;
+  distributed: boolean;
+  reportId: number;
+  undistributed: number;
+  report?: PeriodReportResponse;
+}
+
+export interface PeriodListResponse {
+  data: PeriodInfoResponse[];
+  meta: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+}

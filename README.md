@@ -961,6 +961,7 @@ nbs-bond-protocol/
 | `GET` | `/bonds/:id` | Get bond tranche details |
 | `POST` | `/bonds/:id/subscribe` | Subscribe to a bond tranche |
 | `GET` | `/bonds/:id/holders` | List all token holders |
+| `GET` | `/bonds/:id/periods` | Coupon period history (paginated, optional `?include_report=true`) |
 | `POST` | `/bonds/:id/coupon` | Trigger coupon distribution (admin) |
 
 ### Projects

@@ -47,4 +47,27 @@ describe('BondsController guards', () => {
     await expect(controller.getAccruedCredits(1, 'holder-key')).resolves.toBe(accrued);
     expect(service.getAccruedCredits).toHaveBeenCalledWith(1, 'holder-key');
   });
+
+  it('routes the periods handler under the /bonds/:id/periods path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.getPeriods);
+    expect(path).toBe(':id/periods');
+  });
+
+  it('exposes GET /:id/periods as a read-only public endpoint', () => {
+    const guards: unknown[] | undefined = Reflect.getMetadata(
+      GUARDS_METADATA,
+      BondsController.prototype.getPeriods,
+    );
+    expect(guards).toBeUndefined();
+  });
+
+  it('delegates GET /:id/periods to the service with pagination + includeReport', async () => {
+    const periods = { data: [], meta: { page: 1, limit: 20, total: 0, totalPages: 1 } };
+    const service = { getPeriods: jest.fn().mockResolvedValue(periods) };
+    const controller = new BondsController(service as any);
+
+    const query = { page: 2, limit: 10, includeReport: true } as any;
+    await expect(controller.getPeriods(7, query)).resolves.toBe(periods);
+    expect(service.getPeriods).toHaveBeenCalledWith(7, 2, 10, true);
+  });
 });

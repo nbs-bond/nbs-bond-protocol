@@ -152,6 +152,7 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | POST | /bonds/:id/coupon | Trigger coupon distribution (by report_id) |
 | POST | /bonds/:id/claim | Claim accrued credits |
 | GET | /bonds/:id/undistributed | Get undistributed coupon dust total |
+| GET | /bonds/:id/periods | Coupon period history (paginated, optional `?include_report=true`) |
 | POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust (admin only) |
 | POST | /bonds/:id/transfer | Transfer bond tokens to another address |
 | POST | /projects | Register project |

@@ -1,6 +1,6 @@
 import { Test } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
-import { xdr, scValToNative, nativeToScVal } from '@stellar/stellar-sdk';
+import { xdr, scValToNative, nativeToScVal, Address } from '@stellar/stellar-sdk';
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -471,6 +471,204 @@ describe('BondsService', () => {
       const result = await svc.getAccruedCredits(1, HOLDER);
       expect(result.total).toBe(0);
       expect(result.perCreditType).toEqual([]);
+    });
+  });
+
+  describe('getPeriods', () => {
+    const REPORT_HOLDER = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    const periodScVal = (periodIndex: number, reportId: number) =>
+      xdr.ScVal.scvVec([
+        xdr.ScVal.scvU32(periodIndex),
+        nativeToScVal(BigInt(1000), { type: 'u64' }),
+        nativeToScVal(BigInt(2000), { type: 'u64' }),
+        nativeToScVal(BigInt(150), { type: 'i128' }),
+        xdr.ScVal.scvBool(true),
+        nativeToScVal(BigInt(reportId), { type: 'u64' }),
+        nativeToScVal(BigInt(10), { type: 'i128' }),
+      ]);
+
+    const reportScVal = () =>
+      xdr.ScVal.scvVec([
+        nativeToScVal(BigInt(7), { type: 'u64' }),
+        Address.fromString(REPORT_HOLDER).toScVal(),
+        xdr.ScVal.scvBytes(Buffer.alloc(32)),
+        nativeToScVal(BigInt(1000), { type: 'u64' }),
+        nativeToScVal(BigInt(2000), { type: 'u64' }),
+        nativeToScVal(BigInt(500), { type: 'i128' }),
+        xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]),
+        nativeToScVal('VM0003', { type: 'symbol' }),
+        xdr.ScVal.scvBytes(Buffer.alloc(32)),
+        xdr.ScVal.scvU32(1),
+        nativeToScVal(BigInt(1700000000), { type: 'u64' }),
+        nativeToScVal(BigInt(1700000060), { type: 'u64' }),
+      ]);
+
+    const buildService = async (
+      simulateCall: jest.Mock,
+    ) => {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: { simulateCall } },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+        ],
+      }).compile();
+      return moduleRef.get(BondsService);
+    };
+
+    it('reads one page per-call via get_period_info_range and returns paginated meta', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) => {
+        if (method === 'get_period_count') {
+          return Promise.resolve(xdr.ScVal.scvU32(3));
+        }
+        return Promise.resolve(
+          xdr.ScVal.scvVec([periodScVal(0, 1), periodScVal(1, 2)]),
+        );
+      });
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 2);
+
+      const rangeCall: any = simulateCall.mock.calls.find(
+        ([options]: any[]) => options.method === 'get_period_info_range',
+      );
+      expect(rangeCall).toBeDefined();
+      expect(rangeCall[0].args).toEqual([
+        nativeToScVal(BigInt(3), { type: 'u64' }),
+        nativeToScVal(0, { type: 'u32' }),
+        nativeToScVal(2, { type: 'u32' }),
+      ]);
+
+      expect(result.meta).toEqual({ page: 1, limit: 2, total: 3, totalPages: 2 });
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0]).toEqual({
+        periodIndex: 0,
+        startTime: 1000,
+        endTime: 2000,
+        totalCreditsEarned: 150,
+        distributed: true,
+        reportId: 1,
+        undistributed: 10,
+      });
+    });
+
+    it('returns an empty page for bonds without any distributed period', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) =>
+        method === 'get_period_count'
+          ? Promise.resolve(xdr.ScVal.scvU32(0))
+          : Promise.resolve(xdr.ScVal.scvVec([])),
+      );
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 20);
+
+      expect(result.data).toEqual([]);
+      expect(result.meta).toEqual({ page: 1, limit: 20, total: 0, totalPages: 1 });
+    });
+
+    it('does not hydrate reports by default', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) => {
+        if (method === 'get_period_count') {
+          return Promise.resolve(xdr.ScVal.scvU32(1));
+        }
+        return Promise.resolve(xdr.ScVal.scvVec([periodScVal(0, 7)]));
+      });
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 20);
+
+      expect(result.data[0].report).toBeUndefined();
+      const reportCalls = simulateCall.mock.calls.filter(
+        ([options]: any[]) => options.method === 'get_report',
+      );
+      expect(reportCalls).toHaveLength(0);
+    });
+
+    it('hydrates linked reports when includeReport is set', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) => {
+        if (method === 'get_period_count') {
+          return Promise.resolve(xdr.ScVal.scvU32(1));
+        }
+        if (method === 'get_period_info_range') {
+          return Promise.resolve(xdr.ScVal.scvVec([periodScVal(0, 7)]));
+        }
+        return Promise.resolve(reportScVal());
+      });
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 20, true);
+
+      expect(result.data[0].report).toEqual({
+        id: 7,
+        providerAddress: REPORT_HOLDER,
+        projectId: Buffer.alloc(32).toString('hex'),
+        periodStart: 1000,
+        periodEnd: 2000,
+        carbonSequestered: 500,
+        methodology: 'VM0003',
+        ipfsHash: Buffer.alloc(32).toString('hex'),
+        status: 'Verified',
+        submittedAt: 1700000000,
+        verifiedAt: 1700000060,
+      });
+    });
+
+    it('decodes a PeriodInfo struct from contract field order', async () => {
+      const svc = await buildService(jest.fn());
+      const period = (svc as any).decodePeriodInfo([
+        2,
+        BigInt(1000),
+        BigInt(2000),
+        BigInt(150),
+        true,
+        BigInt(9),
+        BigInt(0),
+      ]);
+      expect(period).toEqual({
+        periodIndex: 2,
+        startTime: 1000,
+        endTime: 2000,
+        totalCreditsEarned: 150,
+        distributed: true,
+        reportId: 9,
+        undistributed: 0,
+      });
+    });
+
+    it('decodes an OracleConsumer Report struct skipping the biodiversity field', async () => {
+      const svc = await buildService(jest.fn());
+      const report = (svc as any).decodeReport([
+        BigInt(9),
+        REPORT_HOLDER,
+        Buffer.alloc(32),
+        BigInt(1000),
+        BigInt(2000),
+        BigInt(500),
+        [0],
+        'VM0003',
+        Buffer.alloc(32),
+        1,
+        BigInt(1700000000),
+        BigInt(1700000060),
+      ]);
+      expect(report).toEqual({
+        id: 9,
+        providerAddress: REPORT_HOLDER,
+        projectId: Buffer.alloc(32).toString('hex'),
+        periodStart: 1000,
+        periodEnd: 2000,
+        carbonSequestered: 500,
+        methodology: 'VM0003',
+        ipfsHash: Buffer.alloc(32).toString('hex'),
+        status: 'Verified',
+        submittedAt: 1700000000,
+        verifiedAt: 1700000060,
+      });
     });
   });
 });
