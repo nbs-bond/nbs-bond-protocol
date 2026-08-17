@@ -778,6 +778,8 @@ IPFS_API_URL=https://api.pinata.cloud
 IPFS_API_KEY=your_pinata_api_key
 IPFS_SECRET_KEY=your_pinata_secret_key
 IPFS_GATEWAY=https://gateway.pinata.cloud/ipfs/
+IPFS_LOCAL_API_URL=http://localhost:5001/api/v0
+REQUIRE_IPFS_PINNING=false
 
 # ── Oracle ───────────────────────────────────────────────────────
 # Whitelisted provider addresses allowed to submit reports
@@ -799,6 +801,12 @@ PORT=3000
 NODE_ENV=development
 LOG_LEVEL=debug
 ```
+
+Project documents are uploaded and pinned directly through Pinata when both
+Pinata credentials are configured. Without credentials, non-production
+environments use `IPFS_LOCAL_API_URL` and log that remote pinning was skipped.
+Production always requires Pinata credentials; set `REQUIRE_IPFS_PINNING=true`
+to enforce the same behavior in another environment.
 
 ---
 

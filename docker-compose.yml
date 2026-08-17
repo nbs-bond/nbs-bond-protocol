@@ -32,9 +32,11 @@ services:
       STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
       DATABASE_URL: postgresql://nbs:nbs@postgres:5432/nbs_bond
       REDIS_URL: redis://redis:6379
+      IPFS_LOCAL_API_URL: http://ipfs:5001/api/v0
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_started }
+      ipfs: { condition: service_healthy }
     volumes: [./api:/app, /app/node_modules]
 
   ipfs:
