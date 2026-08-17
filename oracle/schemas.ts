@@ -140,17 +140,22 @@ export type BlueCarbonProjectConfig = z.infer<typeof BlueCarbonProjectConfigSche
  * `Report` struct: `period_start`, `period_end`, `carbon_sequestered`,
  * `methodology` and `ipfs_evidence_hash`.
  */
-export const OracleReportSchema = z.object({
-  project_id: z.string().min(1),
-  provider: z.string().min(1),
-  methodology: z.string().min(1),
-  period_start: isoDate,
-  period_end: isoDate,
-  carbon_sequestered: z.number().nonnegative(),
-  confidence: z.number().min(0).max(1),
-  ipfs_evidence_hash: z.string().min(1),
-  evidence: z.record(z.string(), z.unknown()),
-});
+export const OracleReportSchema = z
+  .object({
+    project_id: z.string().min(1),
+    provider: z.string().min(1),
+    methodology: z.string().min(1),
+    period_start: isoDate,
+    period_end: isoDate,
+    carbon_sequestered: z.number().nonnegative(),
+    confidence: z.number().min(0).max(1),
+    ipfs_evidence_hash: z.string().min(1),
+    evidence: z.record(z.string(), z.unknown()),
+  })
+  .refine((data) => data.period_start < data.period_end, {
+    message: 'period_start must be strictly before period_end',
+    path: ['period_end'],
+  });
 export type OracleReport = z.infer<typeof OracleReportSchema>;
 
 /** Optional per-source evidence values hashed into `ipfs_evidence_hash`. */

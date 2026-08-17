@@ -1,6 +1,13 @@
 import { hashEvidence } from '../ipfs/evidence';
 import { OracleReportSchema, OracleReport, ReportEvidence } from './schemas';
 
+export class OracleReportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OracleReportError';
+  }
+}
+
 export interface BuildReportInput {
   project_id: string;
   provider: string;
@@ -17,6 +24,12 @@ export interface BuildReportInput {
  * `ipfs_evidence_hash`, and validate the result against `OracleReportSchema`.
  */
 export function buildOracleReport(input: BuildReportInput): OracleReport {
+  if (input.period_start >= input.period_end) {
+    throw new OracleReportError(
+      `Invalid reporting period: period_start (${input.period_start}) must be strictly before period_end (${input.period_end})`,
+    );
+  }
+
   const payload = {
     project_id: input.project_id,
     provider: input.provider,
@@ -43,3 +56,6 @@ export function buildOracleReport(input: BuildReportInput): OracleReport {
     evidence: input.evidence,
   });
 }
+
+/** Alias for `buildOracleReport`. */
+export const buildReport = buildOracleReport;
