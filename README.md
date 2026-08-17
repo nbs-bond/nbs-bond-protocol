@@ -1043,12 +1043,22 @@ ng e2e
 
 ### Docker
 
+> **Requirement:** Docker Compose **v2** (bundled with Docker Desktop 4.x and recent
+> Docker Engine). The stack relies on the Compose Specification
+> (`depends_on: { condition: service_healthy }`), which legacy Compose v1 does not
+> support. Verify with `docker compose version`.
+
 ```bash
-# Start all services (API + PostgreSQL + Redis)
-docker-compose up -d
+# Start all services (API + PostgreSQL + Redis).
+# The API waits for Postgres and Redis to become healthy before starting, so it
+# no longer crashes on the first request while the database is still initializing.
+docker compose up -d
 
 # View logs
-docker-compose logs -f api
+docker compose logs -f api
+
+# Watch dependency health status
+docker compose ps
 ```
 
 ---

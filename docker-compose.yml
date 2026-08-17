@@ -1,3 +1,7 @@
+# Compose file format: Docker Compose Specification (no `version` key).
+# Requires Docker Compose v2 (bundled with Docker Desktop 4.x and recent Docker Engine).
+# `depends_on: { condition: service_healthy }` is only supported by the Compose
+# Specification; legacy Compose v1 files declaring `version: "3"` do not support it.
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,15 +12,21 @@ services:
     ports: ["5432:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nbs"]
+      # Authenticate as the same user/database used in DATABASE_URL
+      # (postgresql://nbs:nbs@postgres:5432/nbs_bond) so readiness is only
+      # reported once the target role and database are actually available.
+      # `$$` escapes the variable so Compose substitutes it inside the container.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
     healthcheck:
+      # redis-cli is shipped with the official redis:7-alpine image
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
@@ -27,6 +37,9 @@ services:
       context: ./api
       dockerfile: Dockerfile
     ports: ["3000:3000"]
+    # Belt-and-suspenders: recover even if a dependency healthcheck passes
+    # marginally early, so the API no longer exits on the first request.
+    restart: unless-stopped
     environment:
       STELLAR_NETWORK: testnet
       STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
@@ -35,7 +48,7 @@ services:
       IPFS_LOCAL_API_URL: http://ipfs:5001/api/v0
     depends_on:
       postgres: { condition: service_healthy }
-      redis: { condition: service_started }
+      redis: { condition: service_healthy }
       ipfs: { condition: service_healthy }
     volumes: [./api:/app, /app/node_modules]
 
