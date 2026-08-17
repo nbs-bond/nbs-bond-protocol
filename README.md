@@ -716,14 +716,14 @@ cd contracts && cargo build --release && cd ..
 
 ```bash
 # 1. Configure environment
-cp .env.example .env
-# Edit .env with your Stellar keys and API credentials
+cp .env.example api/.env
+# Edit api/.env with your Stellar keys and API credentials
 
 # 2. Deploy contracts to testnet
 ./scripts/deploy-testnet.sh
 
 # 3. Seed one bond, two oracle providers, and a verified report
-set -a && source .env && set +a
+set -a && source api/.env && set +a
 NODE_PATH=api/node_modules api/node_modules/.bin/ts-node --transpile-only scripts/seed-testnet.ts
 
 # 4. Start the API server
@@ -751,7 +751,7 @@ declined, distinct from the extension being absent.
 
 ## 🔧 Environment Variables
 
-Create `.env` from the provided template:
+Create `api/.env` from the provided template:
 
 ```env
 # ── Stellar Network ──────────────────────────────────────────────
@@ -778,6 +778,8 @@ IPFS_API_URL=https://api.pinata.cloud
 IPFS_API_KEY=your_pinata_api_key
 IPFS_SECRET_KEY=your_pinata_secret_key
 IPFS_GATEWAY=https://gateway.pinata.cloud/ipfs/
+IPFS_LOCAL_API_URL=http://localhost:5001/api/v0
+REQUIRE_IPFS_PINNING=false
 
 # ── Oracle ───────────────────────────────────────────────────────
 # Whitelisted provider addresses allowed to submit reports
@@ -799,6 +801,12 @@ PORT=3000
 NODE_ENV=development
 LOG_LEVEL=debug
 ```
+
+Project documents are uploaded and pinned directly through Pinata when both
+Pinata credentials are configured. Without credentials, non-production
+environments use `IPFS_LOCAL_API_URL` and log that remote pinning was skipped.
+Production always requires Pinata credentials; set `REQUIRE_IPFS_PINNING=true`
+to enforce the same behavior in another environment.
 
 ---
 
@@ -1018,7 +1026,7 @@ ng e2e
 # Deploy all contracts to Stellar testnet
 ./scripts/deploy-testnet.sh
 
-# The script writes contract addresses into .env automatically
+# The script writes contract addresses into api/.env automatically
 # BOND_ISSUER_ADDRESS=C...
 # COUPON_ENGINE_ADDRESS=C...
 # etc.
@@ -1035,12 +1043,22 @@ ng e2e
 
 ### Docker
 
+> **Requirement:** Docker Compose **v2** (bundled with Docker Desktop 4.x and recent
+> Docker Engine). The stack relies on the Compose Specification
+> (`depends_on: { condition: service_healthy }`), which legacy Compose v1 does not
+> support. Verify with `docker compose version`.
+
 ```bash
-# Start all services (API + PostgreSQL + Redis)
-docker-compose up -d
+# Start all services (API + PostgreSQL + Redis).
+# The API waits for Postgres and Redis to become healthy before starting, so it
+# no longer crashes on the first request while the database is still initializing.
+docker compose up -d
 
 # View logs
-docker-compose logs -f api
+docker compose logs -f api
+
+# Watch dependency health status
+docker compose ps
 ```
 
 ---

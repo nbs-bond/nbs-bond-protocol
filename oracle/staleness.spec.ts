@@ -1,25 +1,35 @@
 import { computeStaleness, cadenceForMethodology, DEFAULT_GRACE_SECONDS } from './staleness';
 
-const NOW = Date.UTC(2026, 0, 1, 0, 0, 0);
-const DAY = 24 * 60 * 60 * 1000;
-const CADENCE_GRACE_MS = (365 + DEFAULT_GRACE_SECONDS / (24 * 60 * 60)) * DAY;
+const REFERENCE_TIMESTAMP = Math.floor(Date.UTC(2200, 0, 1, 0, 0, 0) / 1000);
+const DAY_SECONDS = 24 * 60 * 60;
+const CADENCE_GRACE_SECONDS = 365 * DAY_SECONDS + DEFAULT_GRACE_SECONDS;
+
+function toIso(timestamp: number): string {
+  return new Date(timestamp * 1000).toISOString();
+}
 
 describe('computeStaleness', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   it('marks a project stale after the reporting window plus grace elapses', () => {
     const results = computeStaleness(
       [
         {
           projectId: 'VCS-1234',
-          createdAt: new Date(NOW - 2 * CADENCE_GRACE_MS).toISOString(),
-          lastVerifiedAt: new Date(NOW - CADENCE_GRACE_MS - DAY).toISOString(),
-          cadenceSeconds: 365 * 24 * 60 * 60,
+          createdAt: toIso(REFERENCE_TIMESTAMP - 2 * CADENCE_GRACE_SECONDS),
+          lastVerifiedAt: toIso(
+            REFERENCE_TIMESTAMP - CADENCE_GRACE_SECONDS - DAY_SECONDS,
+          ),
+          cadenceSeconds: 365 * DAY_SECONDS,
         },
       ],
-      NOW,
+      REFERENCE_TIMESTAMP,
     );
 
     expect(results[0].isStale).toBe(true);
-    expect(results[0].stalenessSeconds).toBe((CADENCE_GRACE_MS + DAY) / 1000);
+    expect(results[0].stalenessSeconds).toBe(CADENCE_GRACE_SECONDS + DAY_SECONDS);
   });
 
   it('keeps a project healthy inside the window', () => {
@@ -27,16 +37,16 @@ describe('computeStaleness', () => {
       [
         {
           projectId: 'VCS-1234',
-          createdAt: new Date(NOW - 2 * CADENCE_GRACE_MS).toISOString(),
-          lastVerifiedAt: new Date(NOW - DAY).toISOString(),
-          cadenceSeconds: 365 * 24 * 60 * 60,
+          createdAt: toIso(REFERENCE_TIMESTAMP - 2 * CADENCE_GRACE_SECONDS),
+          lastVerifiedAt: toIso(REFERENCE_TIMESTAMP - DAY_SECONDS),
+          cadenceSeconds: 365 * DAY_SECONDS,
         },
       ],
-      NOW,
+      REFERENCE_TIMESTAMP,
     );
 
     expect(results[0].isStale).toBe(false);
-    expect(results[0].lastVerifiedAt).toBe(new Date(NOW - DAY).toISOString());
+    expect(results[0].lastVerifiedAt).toBe(toIso(REFERENCE_TIMESTAMP - DAY_SECONDS));
   });
 
   it('falls back to the project creation date when never verified', () => {
@@ -44,11 +54,13 @@ describe('computeStaleness', () => {
       [
         {
           projectId: 'VCS-9999',
-          createdAt: new Date(NOW - CADENCE_GRACE_MS - DAY).toISOString(),
-          cadenceSeconds: 365 * 24 * 60 * 60,
+          createdAt: toIso(
+            REFERENCE_TIMESTAMP - CADENCE_GRACE_SECONDS - DAY_SECONDS,
+          ),
+          cadenceSeconds: 365 * DAY_SECONDS,
         },
       ],
-      NOW,
+      REFERENCE_TIMESTAMP,
     );
 
     expect(results[0].isStale).toBe(true);
@@ -56,21 +68,38 @@ describe('computeStaleness', () => {
   });
 
   it('respects a custom grace period', () => {
-    const graceSeconds = 7 * 24 * 60 * 60;
+    const graceSeconds = 7 * DAY_SECONDS;
     const results = computeStaleness(
       [
         {
           projectId: 'VCS-1234',
-          createdAt: new Date(NOW - 400 * DAY).toISOString(),
-          lastVerifiedAt: new Date(NOW - (365 + 7) * DAY - DAY).toISOString(),
-          cadenceSeconds: 365 * 24 * 60 * 60,
+          createdAt: toIso(REFERENCE_TIMESTAMP - 400 * DAY_SECONDS),
+          lastVerifiedAt: toIso(
+            REFERENCE_TIMESTAMP - (365 + 7) * DAY_SECONDS - DAY_SECONDS,
+          ),
+          cadenceSeconds: 365 * DAY_SECONDS,
           graceSeconds,
         },
       ],
-      NOW,
+      REFERENCE_TIMESTAMP,
     );
 
     expect(results[0].isStale).toBe(true);
+  });
+
+  it('converts the wall clock fallback from milliseconds to seconds', () => {
+    jest.spyOn(Date, 'now').mockReturnValue(REFERENCE_TIMESTAMP * 1000);
+
+    const results = computeStaleness([
+      {
+        projectId: 'VCS-1234',
+        createdAt: toIso(REFERENCE_TIMESTAMP - DAY_SECONDS),
+        cadenceSeconds: 365 * DAY_SECONDS,
+      },
+    ]);
+
+    expect(results[0].stalenessSeconds).toBe(DAY_SECONDS);
+    expect(results[0].isStale).toBe(false);
   });
 });
 

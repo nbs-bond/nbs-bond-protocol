@@ -9,7 +9,6 @@ import {
 } from './health';
 import {
   StalenessInput,
-  StalenessResult,
   computeStaleness,
   cadenceForMethodology,
 } from './staleness';
@@ -20,6 +19,8 @@ interface StalenessRequestBody {
   projects?: Array<
     Omit<StalenessInput, 'cadenceSeconds'> & { methodology?: string }
   >;
+  /** Unix timestamp in seconds, matching Soroban's ledger timestamp. */
+  referenceTimestamp?: number;
 }
 
 function readStalenessFile(filePath?: string): StalenessInput[] | null {
@@ -35,6 +36,25 @@ function readStalenessFile(filePath?: string): StalenessInput[] | null {
 function sendJson(response: http.ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { 'Content-Type': 'application/json' });
   response.end(JSON.stringify(body));
+}
+
+function resolveReferenceTimestamp(value: unknown): number {
+  if (value === undefined || value === null || value === '') {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error('referenceTimestamp must be a non-negative Unix timestamp in seconds');
+  }
+  return parsed;
+}
+
+function stalenessResponse(inputs: StalenessInput[], referenceTimestamp: number): unknown {
+  return {
+    asOf: new Date(referenceTimestamp * 1000).toISOString(),
+    projects: computeStaleness(inputs, referenceTimestamp),
+  };
 }
 
 function readBody(request: http.IncomingMessage): Promise<string> {
@@ -57,8 +77,11 @@ function readBody(request: http.IncomingMessage): Promise<string> {
  *
  * Endpoints:
  *   GET  /health                 per-adapter health check
- *   GET  /staleness              staleness from ORACLE_STALENESS_FILE (optional)
+ *   GET  /staleness              staleness from ORACLE_STALENESS_FILE
  *   POST /staleness              staleness computed from a JSON body
+ *
+ * Both staleness endpoints accept an optional `referenceTimestamp` Unix
+ * timestamp in seconds, matching Soroban's ledger timestamp.
  */
 export function startMonitorServer(
   adapters: HealthCheckConfig[] = [],
@@ -85,7 +108,16 @@ export function startMonitorServer(
         });
         return;
       }
-      sendJson(response, 200, { asOf: new Date().toISOString(), projects: computeStaleness(inputs) });
+      try {
+        const referenceTimestamp = resolveReferenceTimestamp(
+          url.searchParams.get('referenceTimestamp'),
+        );
+        sendJson(response, 200, stalenessResponse(inputs, referenceTimestamp));
+      } catch (error) {
+        sendJson(response, 400, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return;
     }
 
@@ -101,8 +133,10 @@ export function startMonitorServer(
           cadenceSeconds: project.cadenceSeconds ?? cadenceForMethodology(project.methodology ?? ''),
           graceSeconds: project.graceSeconds,
         }));
-        const results: StalenessResult[] = computeStaleness(inputs);
-        sendJson(response, 200, { asOf: new Date().toISOString(), projects: results });
+        const referenceTimestamp = resolveReferenceTimestamp(
+          body.referenceTimestamp ?? url.searchParams.get('referenceTimestamp'),
+        );
+        sendJson(response, 200, stalenessResponse(inputs, referenceTimestamp));
       } catch (error) {
         sendJson(response, 400, {
           error: error instanceof Error ? error.message : String(error),
