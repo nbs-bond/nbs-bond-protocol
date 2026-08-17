@@ -36,6 +36,7 @@ const DEX_ERROR_CODE = {
   ZeroAmount: 9,
   InsufficientFunds: 10,
   Overflow: 11,
+  SellerBalanceDepleted: 12,
 } as const;
 
 @Injectable()
@@ -150,6 +151,12 @@ export class DexService {
         nonce,
       );
     } catch (error) {
+      // The buy attempt consumed one API-managed nonce slot before failing.
+      // Soroban transactions are atomic, so the on-chain nonce and the escrow
+      // bookkeeping were rolled back with the frame — re-sync the nonce mirror
+      // from the chain so the buyer can simply retry the purchase instead of
+      // hitting InvalidNonce on the next attempt.
+      await this.nonceService.sync(DEX_ROUTER(), buyerAddress).catch(() => undefined);
       throw this.mapDexError(error);
     }
 
@@ -283,6 +290,23 @@ export class DexService {
       return new HttpException(
         'Insufficient escrowed funds. Call POST /marketplace/escrow/deposit before purchasing.',
         HttpStatus.PAYMENT_REQUIRED,
+      );
+    }
+
+    if (code === DEX_ERROR_CODE.SellerBalanceDepleted) {
+      return new HttpException(
+        {
+          statusCode: HttpStatus.CONFLICT,
+          error: 'Conflict',
+          message:
+            'Order could not be filled because the seller no longer holds enough ' +
+            'bond tokens. Your escrowed funds were not debited and remain ' +
+            'available. The nonce for this attempted purchase was consumed — ' +
+            'retry the purchase.',
+          reason: 'seller_balance_depleted',
+          nonce_consumed: true,
+        },
+        HttpStatus.CONFLICT,
       );
     }
 

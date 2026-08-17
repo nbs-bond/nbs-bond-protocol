@@ -309,6 +309,25 @@ impl DEXRouter {
             return Err(DEXError::InsufficientBalance);
         }
 
+        // Holder balance is verified at listing time, so a seller can list
+        // tokens and transfer them away before the order fills. Re-check at
+        // execution time: the seller must still hold `amount` bond tokens for
+        // the fill to succeed. Because the whole purchase runs in a single
+        // atomic frame this re-check is race-free, and on failure the escrow
+        // bookkeeping below is rolled back with the frame — the buyer's quote
+        // balance is never debited.
+        if verify_holder_balance(&env, &order.seller, order.bond_id, amount).is_err() {
+            env.events().publish(
+                (Symbol::new(&env, "purchase_failed"),),
+                (
+                    order_id,
+                    buyer.clone(),
+                    Symbol::new(&env, "seller_balance_depleted"),
+                ),
+            );
+            return Err(DEXError::SellerBalanceDepleted);
+        }
+
         let proceeds = amount
             .checked_mul(order.price_per_token)
             .ok_or(DEXError::Overflow)?;
@@ -742,7 +761,7 @@ mod test {
         client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &100_000i128, &0);
 
         let result = client.try_execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &1);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(DEXError::SellerBalanceDepleted)));
 
         let order = client.get_order(&order_id);
         assert_eq!(order.status, OrderStatus::Open);
@@ -754,6 +773,69 @@ mod test {
             100_000
         );
         assert_eq!(client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")), 0);
+
+        // The failed purchase is fully atomic: the buyer's nonce is rolled back
+        // together with the escrow bookkeeping, so the same nonce can be reused
+        // for the retry. Retrying with the *next* nonce instead fails with
+        // InvalidNonce, because the contract still expects the untouched nonce.
+        let retry_same_nonce =
+            client.try_execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &1);
+        assert_eq!(retry_same_nonce, Err(Ok(DEXError::SellerBalanceDepleted)));
+        let retry_next_nonce =
+            client.try_execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &2);
+        assert_eq!(retry_next_nonce, Err(Ok(DEXError::InvalidNonce)));
+    }
+
+    #[test]
+    fn test_replenished_seller_fills_order_on_retry() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let third_party = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 2_000);
+
+        let issuer_client =
+            nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id.clone());
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+
+        // Sell enough to deplete below the listed amount before the buyer
+        // attempts the purchase.
+        issuer_client.transfer(&seller, &third_party, &bond_id, &1_500);
+        assert_eq!(issuer_client.get_holder_balance(&bond_id, &seller), 500);
+
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &100_000i128, &0);
+
+        let result = client.try_execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &1);
+        assert_eq!(result, Err(Ok(DEXError::SellerBalanceDepleted)));
+
+        // The seller replenishes their holdings before the buyer retries with
+        // the same (rolled-back) nonce.
+        issuer_client.transfer(&third_party, &seller, &bond_id, &500);
+
+        client.execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &1);
+
+        let order = client.get_order(&order_id);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(issuer_client.get_holder_balance(&bond_id, &seller), 0);
+        assert_eq!(issuer_client.get_holder_balance(&bond_id, &buyer), 1_000);
     }
 
     #[test]

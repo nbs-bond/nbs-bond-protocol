@@ -46,6 +46,7 @@ pub enum DEXError {
     ZeroAmount = 9,
     InsufficientFunds = 10,
     Overflow = 11,
+    SellerBalanceDepleted = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -125,6 +125,12 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 - `execute_purchase` atomically transfers bond tokens (`BondIssuer.transfer`) and escrowed quote (`price_per_token * amount`) from buyer to seller, so a fill either fully settles or fully reverts.
 - Sellers can `withdraw_quote` their proceeds; `get_quote_balance` reports escrowed balances by symbol.
 
+### Purchase failure semantics
+
+- `list_bond_tokens` checks the seller's bond holder balance at listing time. `execute_purchase` re-checks it at execution time: a seller can list tokens and transfer them away before the order fills, and the re-check rejects the fill with `DEXError::SellerBalanceDepleted` instead of stumbling into the inner `BondIssuer.transfer` failure.
+- A failed purchase is fully atomic. The transaction reverts, so the buyer's escrowed quote is never debited, the order remains `Open`, and the `purchase_failed` event (`seller_balance_depleted`) is published for observability. Note: in Soroban, events emitted by a frame that reverts are not persisted on the ledger — the event is best-effort, while the escrow rollback is the hard guarantee.
+- **Nonce behavior.** The contract keeps a per-address nonce incremented at the start of every call. Because a failed purchase reverts the entire transaction, the on-chain nonce is rolled back too — a raw contract caller can retry with the *same* nonce. The API keeps a Redis nonce mirror (`NonceService`) that is consumed on every attempt; on a failed buy the service re-syncs the mirror from the chain, so the next `/marketplace/buy` retry does not hit `InvalidNonce`. The failed attempt is surfaced as `409 Conflict` with `nonce_consumed: true`, telling the frontend the attempt consumed its nonce slot and should be retried.
+
 ## Coupon Integrity
 
 - `CouponEngine.distribute_coupon` accepts an **on-chain `report_id`** instead of a caller-supplied report, eliminating fabricated distributions.

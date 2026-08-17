@@ -15,6 +15,8 @@ describe('DexService', () => {
 
   const simulateCallMock = jest.fn();
   const invokeContractMethodMock = jest.fn();
+  const nonceNextMock = jest.fn().mockResolvedValue(0);
+  const nonceSyncMock = jest.fn().mockResolvedValue(0);
 
   const SELLER = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 
@@ -62,7 +64,7 @@ describe('DexService', () => {
         { provide: StellarService, useValue: {} },
         {
           provide: NonceService,
-          useValue: { next: jest.fn().mockResolvedValue(0) },
+          useValue: { next: nonceNextMock, sync: nonceSyncMock },
         },
       ],
     }).compile();
@@ -429,6 +431,80 @@ describe('DexService', () => {
         expect.any(Array),
         0,
       );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // buyBondTokens — seller-balance-depleted failure handling
+  // ---------------------------------------------------------------------------
+
+  describe('buyBondTokens', () => {
+    function setupMocksForBuy(depletionErrorMessage?: string): void {
+      jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
+      jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
+        address: SELLER,
+        asset: 'USDC',
+        balance: 1_000, // proceeds for 100 @ 10 = 1_000
+      });
+      if (depletionErrorMessage) {
+        invokeContractMethodMock.mockRejectedValue(
+          new Error(depletionErrorMessage),
+        );
+      } else {
+        invokeContractMethodMock.mockResolvedValue({
+          result: nativeToScVal(true),
+          transactionHash: 'txhash',
+          successful: true,
+        });
+      }
+    }
+
+    it('throws a structured 409 with nonce_consumed:true when the seller balance is depleted', async () => {
+      setupMocksForBuy(
+        'Transaction simulation failed: Error(Contract, #12) (contract error code 12)',
+      );
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+
+      await expect(service.buyBondTokens(dto, SELLER)).rejects.toMatchObject({
+        status: 409,
+        response: {
+          statusCode: 409,
+          reason: 'seller_balance_depleted',
+          nonce_consumed: true,
+        },
+      });
+    });
+
+    it('re-syncs the nonce mirror after a failed buy so the retry is not stuck on InvalidNonce', async () => {
+      setupMocksForBuy(
+        'Transaction simulation failed: Error(Contract, #12) (contract error code 12)',
+      );
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+
+      await service.buyBondTokens(dto, SELLER).catch(() => undefined);
+      expect(nonceSyncMock).toHaveBeenCalledWith(
+        expect.any(String),
+        SELLER,
+      );
+    });
+
+    it('does not re-sync the nonce when the escrow pre-check rejects', async () => {
+      jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
+      jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
+        address: SELLER,
+        asset: 'USDC',
+        balance: 0,
+      });
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+
+      await expect(service.buyBondTokens(dto, SELLER)).rejects.toBeInstanceOf(
+        Error,
+      );
+      expect(invokeContractMethodMock).not.toHaveBeenCalled();
+      expect(nonceSyncMock).not.toHaveBeenCalled();
     });
   });
 });
