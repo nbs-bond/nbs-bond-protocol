@@ -12,6 +12,8 @@ pub enum DataKey {
     BondConfig(u64),
     BondState(u64),
     HolderBalance(u64, Address),
+    HolderList(u64),
+    HolderCount(u64),
     BondCount,
     BondList,
     Nonce(Address),
@@ -35,6 +37,31 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
         return Err(BondError::Unauthorized);
     }
     Ok(())
+}
+
+/// Register a holder in the bond's on-chain `HolderList`. Called once per
+/// holder on the first mint/transfer into a zero balance, so the list tracks
+/// the set of addresses that have ever held the bond without duplicating
+/// entries. Addresses that later transfer their entire balance out remain in
+/// the list (with a zero balance) and are filtered at coupon distribution.
+fn append_holder(env: &Env, bond_id: u64, holder: Address) {
+    let key = DataKey::HolderList(bond_id);
+    let mut list: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(vec![&env]);
+    list.push_back(holder);
+    env.storage().persistent().set(&key, &list);
+
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::HolderCount(bond_id))
+        .unwrap_or(0);
+    env.storage()
+        .instance()
+        .set(&DataKey::HolderCount(bond_id), &(count + 1));
 }
 
 #[contract]
@@ -196,6 +223,10 @@ impl BondIssuer {
             .persistent()
             .set(&balance_key, &new_balance);
 
+        if current_balance == 0 {
+            append_holder(&env, bond_id, investor.clone());
+        }
+
         state.total_subscribed = new_total;
         env.storage()
             .instance()
@@ -273,6 +304,10 @@ impl BondIssuer {
         env.storage()
             .persistent()
             .set(&to_key, &new_to_balance);
+
+        if to_balance == 0 {
+            append_holder(&env, bond_id, to.clone());
+        }
 
         env.events().publish(
             (Symbol::new(&env, "transferred"),),
@@ -369,6 +404,49 @@ impl BondIssuer {
             .persistent()
             .get(&DataKey::HolderBalance(bond_id, holder))
             .unwrap_or(0)
+    }
+
+    /// Full on-chain holder list for `bond_id`, in insertion order.
+    pub fn get_holder_list(env: Env, bond_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HolderList(bond_id))
+            .unwrap_or(vec![&env])
+    }
+
+    /// Number of distinct holders ever recorded for `bond_id`.
+    pub fn get_holder_count(env: Env, bond_id: u64) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::HolderCount(bond_id))
+            .unwrap_or(0)
+    }
+
+    /// Returns up to `count` holder addresses for `bond_id` starting at index
+    /// `start` of the persistent `HolderList`, preserving insertion order.
+    /// Mirrors `get_bond_ids_range` so the API can page through the holder
+    /// list without materialising it in a single call.
+    pub fn get_holder_list_range(env: Env, bond_id: u64, start: u32, count: u32) -> Vec<Address> {
+        let holder_list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderList(bond_id))
+            .unwrap_or(vec![&env]);
+        let mut result: Vec<Address> = vec![&env];
+
+        let len = holder_list.len();
+        if count == 0 || start >= len {
+            return result;
+        }
+
+        let end = ((start as u64) + (count as u64)).min(len as u64) as u32;
+        for i in start..end {
+            if let Some(addr) = holder_list.get(i) {
+                result.push_back(addr);
+            }
+        }
+
+        result
     }
 
     pub fn total_supply(env: Env, bond_id: u64) -> Result<i128, BondError> {
@@ -878,6 +956,120 @@ mod test {
 
         assert_eq!(client.get_holder_balance(&bond_id, &user), 300);
         assert_eq!(client.get_holder_balance(&bond_id, &user2), 1000);
+    }
+
+    #[test]
+    fn test_holder_list_tracks_subscribers() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &2000, &0);
+        client.subscribe(&user2, &bond_id, &3000, &0);
+
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_list(&bond_id),
+            vec![&env, user.clone(), user2.clone()]
+        );
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &0, &1),
+            vec![&env, user.clone()]
+        );
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &1, &10),
+            vec![&env, user2.clone()]
+        );
+    }
+
+    #[test]
+    fn test_holder_list_dedupes_repeat_subscriber() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &500, &0);
+        client.subscribe(&user, &bond_id, &500, &1);
+
+        assert_eq!(client.get_holder_count(&bond_id), 1);
+        assert_eq!(client.get_holder_list(&bond_id), vec![&env, user.clone()]);
+    }
+
+    #[test]
+    fn test_holder_list_appends_transfer_recipient() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &1000, &0);
+        client.transfer(&user, &user2, &bond_id, &600);
+
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_list(&bond_id),
+            vec![&env, user.clone(), user2.clone()]
+        );
+        assert_eq!(client.get_holder_balance(&bond_id, &user), 400);
+        assert_eq!(client.get_holder_balance(&bond_id, &user2), 600);
+    }
+
+    #[test]
+    fn test_holder_list_keeps_source_after_full_transfer() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &1000, &0);
+        client.transfer(&user, &user2, &bond_id, &1000);
+
+        // The source keeps a zero balance and remains in the list; the API
+        // filters zero-balance addresses out at distribution time.
+        assert_eq!(client.get_holder_balance(&bond_id, &user), 0);
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_list(&bond_id),
+            vec![&env, user.clone(), user2.clone()]
+        );
+    }
+
+    #[test]
+    fn test_holder_list_empty_for_new_bond() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        assert_eq!(client.get_holder_count(&bond_id), 0);
+        assert_eq!(client.get_holder_list(&bond_id), vec![&env]);
+        assert_eq!(client.get_holder_list_range(&bond_id, &0, &20), vec![&env]);
+    }
+
+    #[test]
+    fn test_holder_list_range_pagination() {
+        let (env, client, admin, _user) = setup();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&a, &bond_id, &100, &0);
+        client.subscribe(&b, &bond_id, &200, &0);
+        client.subscribe(&c, &bond_id, &300, &0);
+
+        assert_eq!(client.get_holder_count(&bond_id), 3);
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &0, &2),
+            vec![&env, a.clone(), b.clone()]
+        );
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &2, &2),
+            vec![&env, c.clone()]
+        );
+        assert_eq!(client.get_holder_list_range(&bond_id, &3, &20), vec![&env]);
+        assert_eq!(client.get_holder_list_range(&bond_id, &0, &0), vec![&env]);
     }
 
     #[test]

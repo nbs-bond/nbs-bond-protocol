@@ -1,6 +1,6 @@
 import { Test } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
-import { xdr, scValToNative, nativeToScVal, Address } from '@stellar/stellar-sdk';
+import { xdr, scValToNative, nativeToScVal, Address, Keypair } from '@stellar/stellar-sdk';
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -15,6 +15,8 @@ jest.mock('@redis/client', () => {
     createClient: jest.fn().mockReturnValue(mockClient),
   };
 });
+
+import { createClient } from '@redis/client';
 
 import { BondsService } from './bonds.service';
 import { ContractService } from '../stellar/contract.service';
@@ -90,6 +92,9 @@ describe('BondsService', () => {
           ]),
           successful: true,
         }),
+        simulateCall: jest
+          .fn()
+          .mockResolvedValue(nativeToScVal(BigInt(0), { type: 'u64' })),
       };
       const stellarService = {
         getKeypairFromSecret: jest.fn().mockReturnValue({
@@ -123,6 +128,138 @@ describe('BondsService', () => {
         'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
       );
       expect(scValToNative(args[4])).toBe(BigInt(7));
+    });
+  });
+
+  describe('distributeCoupon holder reconciliation', () => {
+    const ADMIN = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    const redisMock = () =>
+      createClient() as unknown as {
+        sMembers: jest.Mock;
+        sAdd: jest.Mock;
+      };
+
+    const holderListScVal = (addrs: string[]) =>
+      xdr.ScVal.scvVec(addrs.map((a) => Address.fromString(a).toScVal()));
+
+    const buildService = async (opts: {
+      dbHolders: string[];
+      onChainHolders: string[];
+      balances: Record<string, number>;
+      holderListFails?: boolean;
+    }) => {
+      redisMock().sMembers.mockResolvedValue(opts.dbHolders);
+
+      const simulateCall = jest.fn(
+        ({ method, args }: { method: string; args: any[] }) => {
+          if (method === 'get_holder_count') {
+            if (opts.holderListFails) {
+              return Promise.reject(new Error('contract not found'));
+            }
+            return Promise.resolve(
+              nativeToScVal(BigInt(opts.onChainHolders.length), { type: 'u64' }),
+            );
+          }
+          if (method === 'get_holder_list_range') {
+            return Promise.resolve(holderListScVal(opts.onChainHolders));
+          }
+          if (method === 'get_holder_balance') {
+            const holder = scValToNative(args[1]) as string;
+            return Promise.resolve(
+              nativeToScVal(BigInt(opts.balances[holder] ?? 0), { type: 'i128' }),
+            );
+          }
+          return Promise.resolve(nativeToScVal(BigInt(0), { type: 'u64' }));
+        },
+      );
+
+      const invokeContractMethod = jest.fn().mockResolvedValue({
+        result: xdr.ScVal.scvVec([
+          nativeToScVal(BigInt(1), { type: 'u64' }),
+          xdr.ScVal.scvU32(0),
+          nativeToScVal(BigInt(1_000_000), { type: 'i128' }),
+          xdr.ScVal.scvU32(1),
+        ]),
+        successful: true,
+      });
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: { simulateCall, invokeContractMethod } },
+          {
+            provide: StellarService,
+            useValue: {
+              getKeypairFromSecret: jest.fn().mockReturnValue({ publicKey: () => ADMIN }),
+            },
+          },
+          { provide: NonceService, useValue: { next: jest.fn().mockResolvedValue(0) } },
+        ],
+      }).compile();
+
+      return { svc: moduleRef.get(BondsService), invokeContractMethod };
+    };
+
+    const passedHolders = (invokeContractMethod: jest.Mock): string[] =>
+      scValToNative(invokeContractMethod.mock.calls[0][3][3]) as string[];
+
+    it('includes on-chain holders missing from the off-chain DB set', async () => {
+      const dbHolder = Keypair.random().publicKey();
+      const onChainOnly = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [dbHolder],
+        onChainHolders: [dbHolder, onChainOnly],
+        balances: { [dbHolder]: 100, [onChainOnly]: 200 },
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod).sort()).toEqual(
+        [dbHolder, onChainOnly].sort(),
+      );
+    });
+
+    it('filters stale zero-balance addresses out of the holder list', async () => {
+      const stale = Keypair.random().publicKey();
+      const active = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [stale, active],
+        onChainHolders: [],
+        balances: { [stale]: 0, [active]: 100 },
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod)).toEqual([active]);
+    });
+
+    it('deduplicates holders present in both the DB set and the on-chain list', async () => {
+      const h1 = Keypair.random().publicKey();
+      const h2 = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [h1],
+        onChainHolders: [h1, h2],
+        balances: { [h1]: 100, [h2]: 200 },
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod).sort()).toEqual([h1, h2].sort());
+    });
+
+    it('falls back to the DB set when the on-chain holder list cannot be read', async () => {
+      const dbHolder = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [dbHolder],
+        onChainHolders: [],
+        balances: { [dbHolder]: 100 },
+        holderListFails: true,
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod)).toEqual([dbHolder]);
     });
   });
 

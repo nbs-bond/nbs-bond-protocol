@@ -153,17 +153,82 @@ export class BondsService {
     const holders = [];
 
     for (const address of holderAddresses) {
-      try {
-        const balanceScVal = await this.contractService.simulateCall({
-          contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
-          args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
-        });
-        const balance = Number(scValToNative(balanceScVal));
-        if (balance > 0) holders.push({ address, balance });
-      } catch {}
+      const balance = await this.getHolderBalance(id, address);
+      if (balance > 0) holders.push({ address, balance });
     }
 
     return { bondId: id, holders, total: holders.length };
+  }
+
+  /**
+   * Returns the on-chain balance for `address` in bond `id`, or 0 when the
+   * address cannot be resolved on-chain. Used to filter the holder set passed
+   * to CouponEngine so stale (zero-balance) addresses are never forwarded.
+   */
+  private async getHolderBalance(id: number, address: string): Promise<number> {
+    try {
+      const balanceScVal = await this.contractService.simulateCall({
+        contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
+        args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+      });
+      return Number(scValToNative(balanceScVal));
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Reconciles the off-chain holder set against on-chain state. Candidates are
+   * the union of the Redis `bond:<id>:holders` set and the on-chain
+   * `HolderList`, so holders who subscribed/transferred without going through
+   * the API are included, then filtered to those with a positive balance.
+   */
+  private async resolveOnChainHolders(id: number): Promise<string[]> {
+    const dbHolders = await this.redis.sMembers(`bond:${id}:holders`);
+    const onChainHolders = await this.readOnChainHolderList(id);
+
+    const candidates = new Set<string>([...dbHolders, ...onChainHolders]);
+    const holders: string[] = [];
+    for (const address of candidates) {
+      const balance = await this.getHolderBalance(id, address);
+      if (balance > 0) holders.push(address);
+    }
+    return holders;
+  }
+
+  /**
+   * Reads the on-chain holder list in pages (`get_holder_count` +
+   * `get_holder_list_range`) so a bond with many holders does not materialise
+   * the full list in a single contract call. Falls back to an empty list if
+   * the on-chain list cannot be read, leaving the DB set as the sole source.
+   */
+  private async readOnChainHolderList(id: number): Promise<string[]> {
+    try {
+      const countScVal = await this.contractService.simulateCall({
+        contractAddress: BOND_ISSUER(), method: 'get_holder_count',
+        args: [nativeToScVal(BigInt(id), { type: 'u64' })],
+      });
+      const count = Number(scValToNative(countScVal));
+
+      const pageSize = 200;
+      const holders: string[] = [];
+      for (let start = 0; start < count; start += pageSize) {
+        const pageScVal = await this.contractService.simulateCall({
+          contractAddress: BOND_ISSUER(), method: 'get_holder_list_range',
+          args: [
+            nativeToScVal(BigInt(id), { type: 'u64' }),
+            nativeToScVal(start, { type: 'u32' }),
+            nativeToScVal(pageSize, { type: 'u32' }),
+          ],
+        });
+        const page = scValToNative(pageScVal) as string[];
+        if (!page || page.length === 0) break;
+        holders.push(...page);
+      }
+      return holders;
+    } catch {
+      return [];
+    }
   }
 
   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
@@ -171,7 +236,11 @@ export class BondsService {
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
     const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
 
-    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+    // Reconcile the off-chain holder set against on-chain state before
+    // calling distribute_coupon: include holders the DB missed (e.g. after a
+    // peer-to-peer transfer that bypassed the API) and drop zero-balance
+    // addresses so stale rows are never forwarded to the contract.
+    const holderAddresses = await this.resolveOnChainHolders(id);
 
     const { result } = await this.contractService.invokeContractMethod(
       COUPON_ENGINE(), 'distribute_coupon', adminSecret,
