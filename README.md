@@ -1019,12 +1019,63 @@ cd api
 # Unit tests
 npm run test
 
-# Integration tests (requires testnet connection)
+# E2E tests
 npm run test:e2e
 
 # Coverage report
 npm run test:cov
 ```
+
+#### E2E test suites
+
+`npm run test:e2e` runs two categories of suite:
+
+| Suite | Keys required | Behaviour when keys absent |
+|---|---|---|
+| **API validation** | None | Always runs — uses an in-process probe controller, no network |
+| **Signing suites** (bond issuance, investor subscription) | `ADMIN_SECRET_KEY`, `INVESTOR_SECRET_KEY` | Skipped automatically with a log message |
+
+The skip logic lives in `api/test/testenv.ts` and uses `describe.skip` at
+collection time (not `test.skip` inside `beforeAll`), which is the correct
+Jest primitive for conditionally skipping a suite.
+
+**To enable the signing suites against testnet:**
+
+1. Copy `.env.example` to `api/.env` and fill in real Stellar testnet keys:
+
+   ```env
+   ADMIN_SECRET_KEY=S<55 base32 chars>   # valid StrKey-encoded Ed25519 seed
+   INVESTOR_SECRET_KEY=S<55 base32 chars>
+   USER_SECRET_KEY=S<55 base32 chars>
+   ```
+
+   Keys must satisfy the full Stellar StrKey spec — starts with `S`, 56
+   characters total, valid base32 checksum. The validation uses
+   `StrKey.isValidEd25519SecretSeed()` from `@stellar/stellar-sdk`, not a
+   simple regex, so near-valid keys are also caught before reaching the
+   network.
+
+2. Fund each account via Friendbot (testnet only):
+
+   ```
+   https://friendbot.stellar.org/?addr=<YOUR_PUBLIC_KEY>
+   ```
+
+   A correctly formatted key that has never been funded will still produce
+   `tx_failed` errors. Funding is required before any signing test can
+   succeed.
+
+3. Deploy the contracts to testnet:
+
+   ```bash
+   ./scripts/deploy-testnet.sh
+   ```
+
+4. Run:
+
+   ```bash
+   cd api && npm run test:e2e
+   ```
 
 ### Frontend
 
