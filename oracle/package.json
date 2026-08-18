@@ -10,6 +10,7 @@
     "ingest:blue-carbon": "ts-node run.ts blue-carbon",
     "ingest": "ts-node run.ts all",
     "monitor": "ts-node run.ts monitor",
+    "dead-letter": "ts-node run.ts dead-letter",
     "test": "jest",
     "test:cov": "jest --coverage",
     "typecheck": "tsc --noEmit"

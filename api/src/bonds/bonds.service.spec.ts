@@ -22,7 +22,12 @@ import { BondsService } from './bonds.service';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
+import { KycService } from '../auth/kyc.service';
 import { InvalidProjectIdError } from '../stellar/bytes32';
+
+const kycServiceMock = {
+  isEligible: jest.fn().mockResolvedValue(true),
+};
 
 describe('BondsService', () => {
   let service: BondsService;
@@ -32,13 +37,13 @@ describe('BondsService', () => {
       providers: [
         BondsService,
         { provide: ContractService, useValue: {} },
-        { provide: StellarService, useValue: {} },
-        {
-          provide: NonceService,
-          useValue: { next: jest.fn().mockResolvedValue(0) },
-        },
-      ],
-    }).compile();
+        { provide: StellarService, useValue: {} },          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
 
     service = moduleRef.get(BondsService);
   });
@@ -112,6 +117,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
@@ -280,6 +286,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
@@ -320,6 +327,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
@@ -360,6 +368,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
       return moduleRef.get(BondsService);
@@ -448,6 +457,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
@@ -518,6 +528,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
       return moduleRef.get(BondsService);
@@ -564,6 +575,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
       return moduleRef.get(BondsService);
@@ -653,10 +665,38 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
       return moduleRef.get(BondsService);
     };
+
+    it('gates subscription on KYC eligibility', async () => {
+      const kycService = {
+        isEligible: jest.fn().mockResolvedValue(false),
+      };
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: {} },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycService },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      await expect(
+        svc.subscribe(1, { investorAddress: 'GABC', amount: 100 }),
+      ).rejects.toMatchObject({
+        status: 403,
+        message: 'KYC verification required before subscribing to a bond',
+      });
+      expect(kycService.isEligible).toHaveBeenCalledWith('GABC', 'verified');
+    });
 
     it('reads one page per-call via get_period_info_range and returns paginated meta', async () => {
       const simulateCall = jest.fn(({ method }: { method: string }) => {
