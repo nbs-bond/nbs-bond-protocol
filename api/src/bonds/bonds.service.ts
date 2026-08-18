@@ -1,7 +1,9 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
+import { KycService } from '../auth/kyc.service';
+import { KycStatus } from '../common/interfaces/authenticated-request.interface';
 import { toBytes32 } from '../stellar/bytes32';
 import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { createClient, RedisClientType } from '@redis/client';
@@ -55,6 +57,7 @@ export class BondsService {
     private readonly contractService: ContractService,
     private readonly stellarService: StellarService,
     private readonly nonceService: NonceService,
+    private readonly kycService: KycService,
   ) {
     this.redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
     this.redis.connect().catch(() => {});
@@ -130,6 +133,19 @@ export class BondsService {
   }
 
   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+    // Gate subscription on KYC: the cached status check makes this resilient
+    // to KYC provider outages (see KycService) instead of a synchronous live
+    // call on every request.
+    const eligible = await this.kycService.isEligible(
+      dto.investorAddress,
+      KycStatus.VERIFIED,
+    );
+    if (!eligible) {
+      throw new ForbiddenException(
+        'KYC verification required before subscribing to a bond',
+      );
+    }
+
     const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
     const { transactionHash } = await this.contractService.invokeContractMethod(
