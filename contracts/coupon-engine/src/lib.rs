@@ -101,6 +101,11 @@ impl CouponEngine {
             &Symbol::new(&env, "get_bond"),
             vec![&env, bond_id.into_val(&env)],
         );
+
+        if config.project_id != project_id {
+            return Err(BondError::BondNotFound);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::BondCreditType(bond_id), &config.credit_type);
@@ -779,6 +784,23 @@ mod test {
         let project_id = create_project_id(&t._env, 42);
         let result = t.client.try_register_bond(&t.admin, &1, &project_id, &1);
         assert_eq!(result, Err(Ok(BondError::InvalidNonce)));
+    }
+
+    #[test]
+    fn test_register_bond_project_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin.clone());
+
+        let project_id = create_project_id(&t._env, 42);
+        let wrong_project_id = create_project_id(&t._env, 43);
+        let holder = Address::generate(&t._env);
+        
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 1000);
+        let result = t.client.try_register_bond(&t.admin, &bond_id, &wrong_project_id, &0);
+        assert_eq!(result, Err(Ok(BondError::BondNotFound)));
     }
 
     #[test]
