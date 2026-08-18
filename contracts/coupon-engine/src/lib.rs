@@ -24,6 +24,7 @@ pub enum DataKey {
     Precision,
     BondIssuerAddress,
     OracleConsumerAddress,
+    ProjectRegistryAddress,
     Nonce(Address),
 }
 
@@ -59,6 +60,7 @@ impl CouponEngine {
         admin: Address,
         bond_issuer_address: Address,
         oracle_consumer_address: Address,
+        project_registry_address: Address,
     ) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -67,6 +69,9 @@ impl CouponEngine {
         env.storage()
             .instance()
             .set(&DataKey::OracleConsumerAddress, &oracle_consumer_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProjectRegistryAddress, &project_registry_address);
         env.storage().instance().set(&DataKey::Precision, &FIXED_POINT);
     }
 
@@ -101,6 +106,27 @@ impl CouponEngine {
             &Symbol::new(&env, "get_bond"),
             vec![&env, bond_id.into_val(&env)],
         );
+
+        if config.project_id != project_id {
+            return Err(BondError::BondNotFound);
+        }
+
+        let project_registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectRegistryAddress)
+            .ok_or(BondError::NotInitialized)?;
+
+        let status: nbbs_shared::ProjectStatus = env.invoke_contract(
+            &project_registry,
+            &Symbol::new(&env, "get_project_status_by_hash"),
+            vec![&env, project_id.into_val(&env)],
+        );
+
+        if status != nbbs_shared::ProjectStatus::Approved {
+            return Err(BondError::ProjectNotApproved);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::BondCreditType(bond_id), &config.credit_type);
@@ -586,10 +612,24 @@ mod test {
         testutils::Address as _, vec, BytesN, Env, Symbol,
     };
 
-    fn create_project_id(env: &Env, value: u8) -> BytesN<32> {
+    fn setup_project(env: &Env, t: &TestEnv, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
         arr[31] = value;
-        BytesN::from_array(env, &arr)
+        let hash = BytesN::from_array(env, &arr);
+
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &t.registry_id);
+        let user = Address::generate(env);
+        let pid = registry.register_project(
+            &user,
+            &hash,
+            &Symbol::new(env, "VCS"),
+            &Symbol::new(env, "US"),
+            &0,
+        );
+        let admin_nonce = t.registry_admin_nonce.get();
+        registry.approve_project(&t.admin, &pid, &admin_nonce);
+        t.registry_admin_nonce.set(admin_nonce + 1);
+        hash
     }
 
     fn make_ipfs_hash(env: &Env, value: u8) -> BytesN<32> {
@@ -626,6 +666,8 @@ mod test {
         issuer_id: Address,
         issuer_admin: Address,
         oracle_id: Address,
+        registry_id: Address,
+        registry_admin_nonce: core::cell::Cell<u64>,
         client: CouponEngineClient<'static>,
     }
 
@@ -639,9 +681,13 @@ mod test {
             nbbs_oracle_consumer::OracleConsumer,
             (admin.clone(),),
         );
+        let registry_id = env.register(
+            nbbs_project_registry::ProjectRegistry,
+            (admin.clone(),),
+        );
         let ce_id = env.register(
             CouponEngine,
-            (admin.clone(), issuer_id.clone(), oracle_id.clone()),
+            (admin.clone(), issuer_id.clone(), oracle_id.clone(), registry_id.clone()),
         );
         let client = CouponEngineClient::new(&env, &ce_id);
 
@@ -651,6 +697,8 @@ mod test {
             issuer_id,
             issuer_admin,
             oracle_id,
+            registry_id,
+            registry_admin_nonce: core::cell::Cell::new(0),
             client,
         }
     }
@@ -742,7 +790,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin.clone());
 
-        let project_id = create_project_id(&t._env, 42);
+        let project_id = setup_project(&t._env, &t, 42);
         let holder = Address::generate(&t._env);
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 1000);
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
@@ -763,7 +811,7 @@ mod test {
         let user = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 42);
+        let project_id = setup_project(&t._env, &t, 42);
         let result = t.client.try_register_bond(&user, &1, &project_id, &0);
         assert_eq!(result, Err(Ok(BondError::Unauthorized)));
     }
@@ -776,9 +824,55 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 42);
+        let project_id = setup_project(&t._env, &t, 42);
         let result = t.client.try_register_bond(&t.admin, &1, &project_id, &1);
         assert_eq!(result, Err(Ok(BondError::InvalidNonce)));
+    }
+
+    #[test]
+    fn test_register_bond_project_unapproved() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let mut arr = [0u8; 32];
+        arr[31] = 42;
+        let project_id = BytesN::from_array(&t._env, &arr);
+
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(&t._env, &t.registry_id);
+        let user = Address::generate(&t._env);
+        registry.register_project(
+            &user,
+            &project_id,
+            &Symbol::new(&t._env, "VCS"),
+            &Symbol::new(&t._env, "US"),
+            &0,
+        );
+
+        let holder = Address::generate(&t._env);
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 1000);
+        let result = t.client.try_register_bond(&t.admin, &bond_id, &project_id, &0);
+        assert_eq!(result, Err(Ok(BondError::ProjectNotApproved)));
+    }
+
+    #[test]
+    fn test_register_bond_project_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 42);
+        let wrong_project_id = setup_project(&t._env, &t, 43);
+
+        let holder = Address::generate(&t._env);
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 1000);
+        
+        let result = t.client.try_register_bond(&t.admin, &bond_id, &wrong_project_id, &0);
+        assert_eq!(result, Err(Ok(BondError::BondNotFound)));
     }
 
     #[test]
@@ -789,7 +883,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -830,7 +924,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 2);
+        let project_id = setup_project(&t._env, &t, 2);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe_with_type(
@@ -886,7 +980,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 3);
+        let project_id = setup_project(&t._env, &t, 3);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe_with_type(
@@ -943,7 +1037,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 4);
+        let project_id = setup_project(&t._env, &t, 4);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe_with_type(
@@ -985,7 +1079,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder1 = Address::generate(&t._env);
         let holder2 = Address::generate(&t._env);
 
@@ -1028,7 +1122,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1062,7 +1156,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1093,8 +1187,8 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
-        let other_project = create_project_id(&t._env, 2);
+        let project_id = setup_project(&t._env, &t, 1);
+        let other_project = setup_project(&t._env, &t, 2);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1122,7 +1216,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1152,7 +1246,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
         let holders = vec![&t._env];
 
@@ -1175,7 +1269,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1200,7 +1294,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1234,7 +1328,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1261,7 +1355,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
 
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
@@ -1310,7 +1404,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder_a = Address::generate(&t._env);
         let holder_b = Address::generate(&t._env);
         let holder_c = Address::generate(&t._env);
@@ -1355,7 +1449,7 @@ mod test {
         let admin = Address::generate(&env);
         let t = deploy(env, admin);
 
-        let project_id = create_project_id(&t._env, 1);
+        let project_id = setup_project(&t._env, &t, 1);
         let holder = Address::generate(&t._env);
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
@@ -1377,8 +1471,9 @@ mod test {
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
         let oracle = Address::generate(&env);
+        let registry = Address::generate(&env);
 
-        let contract_id = env.register(CouponEngine, (admin, issuer, oracle));
+        let contract_id = env.register(CouponEngine, (admin, issuer, oracle, registry));
         let client = CouponEngineClient::new(&env, &contract_id);
 
         let holder = Address::generate(&env);
@@ -1394,8 +1489,9 @@ mod test {
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
         let oracle = Address::generate(&env);
+        let registry = Address::generate(&env);
 
-        let contract_id = env.register(CouponEngine, (admin, issuer, oracle));
+        let contract_id = env.register(CouponEngine, (admin, issuer, oracle, registry));
         let client = CouponEngineClient::new(&env, &contract_id);
 
         let holder = Address::generate(&env);
@@ -1423,7 +1519,7 @@ mod test {
             balances: &[i128],
         ) -> (TestEnv, std::vec::Vec<Address>, u64, i128) {
             let t = deploy(env, admin);
-            let project_id = create_project_id(&t._env, 7);
+            let project_id = setup_project(&t._env, &t, 7);
             let total_subscribed: i128 = balances.iter().sum();
 
             let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
@@ -1451,7 +1547,7 @@ mod test {
         ) -> (TestEnv, std::vec::Vec<Address>, u64, i128, u64) {
             let (t, holders, bond_id, total_subscribed) =
                 deploy_with_holders(env, admin, balances);
-            let project_id = create_project_id(&t._env, 7);
+            let project_id = setup_project(&t._env, &t, 7);
             let report_id = submit_verified_report(&t._env, &t, &project_id, carbon, BiodiversityMetrics::Absent, 0);
             (t, holders, bond_id, total_subscribed, report_id)
         }
@@ -1570,7 +1666,7 @@ mod test {
                     let report_id = submit_verified_report(
                         &t._env,
                         &t,
-                        &create_project_id(&t._env, 7),
+                        &setup_project(&t._env, &t, 7),
                         carbon,
                         BiodiversityMetrics::Absent,
                         (period as u64) * 2,

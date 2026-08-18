@@ -14,6 +14,7 @@ nbbs-oracle-consumer = { path = "../oracle-consumer" }
 [dev-dependencies]
 soroban-sdk = { version = "26.0.1", features = ["testutils"] }
 nbbs-bond-issuer = { path = "../bond-issuer", features = ["testutils"] }
+nbbs-project-registry = { path = "../project-registry", features = ["testutils"] }
 proptest = "1"
 
 [features]

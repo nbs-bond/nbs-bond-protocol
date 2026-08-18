@@ -214,6 +214,28 @@ impl ProjectRegistry {
             .ok_or(RegistryError::ProjectNotFound)
     }
 
+    pub fn get_project_status_by_hash(env: Env, hash: BytesN<32>) -> Result<ProjectStatus, RegistryError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectCount)
+            .unwrap_or(0);
+
+        for i in 1..=count {
+            let key = project_id_to_bytes(&env, i);
+            if let Some(project) = env
+                .storage()
+                .instance()
+                .get::<_, Project>(&DataKey::Project(key))
+            {
+                if project.metadata_ipfs_hash == hash {
+                    return Ok(project.status);
+                }
+            }
+        }
+        Err(RegistryError::ProjectNotFound)
+    }
+
     pub fn list_projects(env: Env, page: u32, page_size: u32) -> Vec<ProjectSummary> {
         let count: u64 = env
             .storage()
