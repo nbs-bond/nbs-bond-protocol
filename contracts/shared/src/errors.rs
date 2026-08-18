@@ -30,6 +30,7 @@ pub enum OracleError {
     InsufficientStake = 9,
     InvalidSignature = 10,
     InvalidResolution = 11,
+    SelfChallenge = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]

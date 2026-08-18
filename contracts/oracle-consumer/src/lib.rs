@@ -433,6 +433,10 @@ impl OracleConsumer {
             return Err(OracleError::ReportAlreadyVerified);
         }
 
+        if challenger == report.provider {
+            return Err(OracleError::SelfChallenge);
+        }
+
         let now = env.ledger().timestamp();
         let window: u64 = env
             .storage()
@@ -1001,6 +1005,51 @@ mod test {
         let stored_challenge = client.get_challenge(&report_id);
         assert!(stored_challenge.resolved);
         assert_eq!(stored_challenge.resolution, ReportStatus::Verified as u32);
+    }
+
+    #[test]
+    fn test_provider_cannot_challenge_own_report() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        env.ledger()
+            .set_timestamp(1_000_000 + CHALLENGE_WINDOW_SECONDS + 1);
+
+        let result = client.try_challenge_report(
+            &provider,
+            &report_id,
+            &make_ipfs_hash(&env, 2),
+            &1,
+        );
+
+        assert_eq!(result, Err(Ok(OracleError::SelfChallenge)));
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
+        assert!(matches!(
+            client.try_get_challenge(&report_id),
+            Err(Ok(OracleError::ReportNotFound))
+        ));
     }
 
     #[test]
