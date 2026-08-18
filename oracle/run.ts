@@ -51,6 +51,8 @@ export class FileHttpClient implements HttpClient {
   }
 }
 
+import { classifyAdapterError, isTransientAdapterError } from './failure';
+import { DeadLetterStore } from './dead-letter';
 import {
   pollVerraProject,
 } from './verra-adapter';
@@ -129,6 +131,57 @@ async function runMonitor(): Promise<void> {
   startMonitorServer(resolveAdapters());
 }
 
+interface RunOutcome {
+  adapter: string;
+  ok: boolean;
+  error?: Error;
+}
+
+/**
+ * Run a single adapter with full error isolation. A throwing adapter is
+ * recorded to the bounded dead-letter store and reported in the summary;
+ * it never aborts the remaining adapters in the cycle.
+ */
+async function runAdapter(name: string, run: () => Promise<void>): Promise<RunOutcome> {
+  try {
+    await run();
+    return { adapter: name, ok: true };
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    const deadLetter = new DeadLetterStore();
+    deadLetter.record({
+      id: `${name}:${new Date().toISOString()}`,
+      adapter: name,
+      kind: classifyAdapterError(err),
+      error: err.message,
+      failedAt: new Date().toISOString(),
+    });
+    return { adapter: name, ok: false, error: err };
+  }
+}
+
+function printSummary(outcomes: RunOutcome[]): number {
+  const failed = outcomes.filter((outcome) => !outcome.ok);
+  const transient = failed.filter((outcome) =>
+    isTransientAdapterError(outcome.error),
+  ).length;
+  const permanent = failed.length - transient;
+
+  if (failed.length > 0) {
+    console.error(
+      `\n${failed.length} of ${outcomes.length} adapter run(s) failed ` +
+        `(${transient} transient, ${permanent} permanent — permanent failures require human review, transient ones retry next cycle).`,
+    );
+    for (const outcome of failed) {
+      const kind = isTransientAdapterError(outcome.error) ? 'transient' : 'permanent';
+      console.error(`  [${kind}] ${outcome.adapter}: ${outcome.error?.message}`);
+    }
+  } else {
+    console.log(`\nAll ${outcomes.length} adapter run(s) completed successfully.`);
+  }
+  return failed.length;
+}
+
 async function main(): Promise<void> {
   const target = process.argv[2] ?? 'all';
 
@@ -137,19 +190,42 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (target === 'dead-letter') {
+    const store = new DeadLetterStore();
+    const records = store.list();
+    if (records.length === 0) {
+      console.log('Dead-letter store is empty.');
+      return;
+    }
+    console.log(`${records.length} dead-letter record(s) (newest first):`);
+    for (const record of records) {
+      console.log(JSON.stringify(record));
+    }
+    return;
+  }
+
   if (target === 'all') {
-    for (const run of Object.values(ADAPTERS)) {
-      await run();
+    const outcomes: RunOutcome[] = [];
+    for (const [name, run] of Object.entries(ADAPTERS)) {
+      outcomes.push(await runAdapter(name, run));
       console.log('\n' + '─'.repeat(60) + '\n');
+    }
+    const failed = printSummary(outcomes);
+    if (failed > 0) {
+      process.exitCode = 1;
     }
     return;
   }
   const run = ADAPTERS[target as keyof typeof ADAPTERS];
   if (!run) {
-    console.error(`Unknown adapter '${target}'. Expected one of: ${Object.keys(ADAPTERS).join(', ')}, all, monitor`);
+    console.error(`Unknown adapter '${target}'. Expected one of: ${Object.keys(ADAPTERS).join(', ')}, all, monitor, dead-letter`);
     process.exit(1);
   }
-  await run();
+  const outcome = await runAdapter(target, run);
+  if (!outcome.ok) {
+    printSummary([outcome]);
+    process.exitCode = 1;
+  }
 }
 
 main().catch((error) => {
