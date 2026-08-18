@@ -201,6 +201,7 @@ describe('BondsService', () => {
             },
           },
           { provide: NonceService, useValue: { next: jest.fn().mockResolvedValue(0) } },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
