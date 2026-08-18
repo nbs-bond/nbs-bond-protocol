@@ -561,11 +561,10 @@ fn clear_accrued(env: &Env, bond_id: u64, holder: &Address, credit_type: CreditT
 
 #[cfg(test)]
 mod test {
-    extern crate std;
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events as _},
-        vec, BytesN, Env, Symbol, Val,
+        testutils::Address as _,
+        vec, BytesN, Env, Symbol,
     };
 
     fn create_project_id(env: &Env, value: u8) -> BytesN<32> {
@@ -1206,12 +1205,9 @@ mod test {
         let holders = vec![&t._env, holder.clone()];
         t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
         
-        t.client.claim_credits(&holder, &bond_id, &0);
-        
+        let claimed = t.client.claim_credits(&holder, &bond_id, &0);
         let carbon_total = 100i128;
-        
-        let events = env.events().all();
-        let _ = events.events();
+        assert_eq!(claimed, carbon_total);
     }
 
     #[test]
@@ -1246,12 +1242,10 @@ mod test {
         let holders = vec![&t._env, holder.clone()];
         t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
         
-        t.client.claim_credits(&holder, &bond_id, &0);
-        
+        let claimed = t.client.claim_credits(&holder, &bond_id, &0);
         let bio_total = 500 + 125 * SPECIES_CREDIT_RATE / HABITAT_CREDIT_RATE + 1_000;
         let carbon_total = 100i128;
-        
-        let _ = env.events().all();
+        assert_eq!(claimed, carbon_total + bio_total);
     }
 
     #[test]
