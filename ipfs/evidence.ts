@@ -13,9 +13,79 @@ import { createAxiosHttpClient, HttpClient } from '../oracle/http';
 
 const ALPHABET_BASE58 =
   '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const ALPHABET_BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
 
 /** SHA-256 multihash code (0x12) + digest length (0x20). */
 const MULTIHASH_SHA2_256 = Buffer.from([0x12, 0x20]);
+
+/** Multibase prefix for CIDv1 base32 (lowercase, unpadded). */
+const MULTIBASE_BASE32_LOWER = 'b';
+
+/** Decode a multibase base32-lower (RFC 4648, unpadded) payload. */
+export function decodeBase32Lower(input: string): Buffer {
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const char of input.toLowerCase()) {
+    const index = ALPHABET_BASE32.indexOf(char);
+    if (index < 0) {
+      throw new Error(`invalid base32 character: ${char}`);
+    }
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+/**
+ * Convert a CIDv1 to the equivalent CIDv0 when its multihash is
+ * sha2-256/32 (the only digest CIDv0 can carry). Returns null when the
+ * multihash is not CIDv0-compatible.
+ */
+export function cidV1ToCidV0(cid: string): string | null {
+  if (!cid.startsWith(MULTIBASE_BASE32_LOWER)) return null;
+  let payload: Buffer;
+  try {
+    payload = decodeBase32Lower(cid.slice(1));
+  } catch {
+    return null;
+  }
+  // CIDv1 layout: varint codec, then the multihash. Skip the codec varint
+  // (1 byte for common codecs, more for multi-byte varints).
+  let codecLen = 1;
+  while (codecLen < payload.length && (payload[codecLen - 1] & 0x80) !== 0) {
+    codecLen += 1;
+  }
+  const multihash = payload.subarray(codecLen);
+  // sha2-256/32 is encoded as code 0x12 + length 0x20; it is the only
+  // multihash CIDv0 can represent.
+  if (
+    multihash.length < 3 ||
+    multihash[0] !== MULTIHASH_SHA2_256[0] ||
+    multihash[1] !== MULTIHASH_SHA2_256[1]
+  ) {
+    return null;
+  }
+  return encodeBase58btc(multihash);
+}
+
+/**
+ * Normalise a returned IPFS CID to CIDv0 form so it can be compared with a
+ * locally computed CIDv0. Accepts CIDv0 (`Qm...`) or multibase base32 CIDv1;
+ * throws for anything else.
+ */
+export function normalizeCidV0(cid: string): string {
+  if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(cid)) {
+    return cid;
+  }
+  const converted = cidV1ToCidV0(cid);
+  if (converted) return converted;
+  throw new Error(`unsupported IPFS CID: ${cid}`);
+}
 
 const GATEWAY = process.env.IPFS_GATEWAY || 'https://gateway.pinata.cloud/ipfs/';
 
@@ -150,7 +220,24 @@ export async function uploadEvidence(
   }
 
   const result = data as { IpfsHash?: string; PinSize?: number };
-  const hash = result.IpfsHash || evidence.ipfs_evidence_hash;
+  const hash = result.IpfsHash;
+  if (!hash) {
+    throw new Error('IPFS upload response did not include an IpfsHash');
+  }
+
+  // Verify the provider pinned exactly what we hashed. The returned CID may
+  // be CIDv1 while the local computation is CIDv0, so normalise both to the
+  // same version before comparing; a mismatch means the content that got
+  // pinned differs from the locally computed evidence hash and must not be
+  // stored as `ipfs_evidence_hash`.
+  const returnedCid = normalizeCidV0(hash);
+  const computedCid = normalizeCidV0(evidence.ipfs_evidence_hash);
+  if (returnedCid !== computedCid) {
+    throw new Error(
+      `IPFS upload returned CID ${hash} which does not match the locally computed evidence hash ${evidence.ipfs_evidence_hash}`,
+    );
+  }
+
   return {
     hash,
     gatewayUrl: `${config.gateway}${hash}`,
