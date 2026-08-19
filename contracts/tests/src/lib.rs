@@ -16,7 +16,7 @@ mod integration {
 
     fn make_project_id(env: &Env, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
-        arr[31] = value;
+        arr[0] = value;
         BytesN::from_array(env, &arr)
     }
 
@@ -62,7 +62,7 @@ mod integration {
 
         let ce_addr = env.register(
             CouponEngine,
-            (admin.clone(), bi_addr.clone(), oc_addr.clone()),
+            (admin.clone(), bi_addr.clone(), oc_addr.clone(), pr_addr.clone()),
         );
         let ce_client = CouponEngineClient::new(env, &ce_addr);
 

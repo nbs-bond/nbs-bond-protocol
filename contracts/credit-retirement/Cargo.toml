@@ -16,6 +16,7 @@ soroban-sdk = { version = "26.0.1", features = ["testutils"] }
 nbbs-bond-issuer = { path = "../bond-issuer", features = ["testutils"] }
 nbbs-coupon-engine = { path = "../coupon-engine", features = ["testutils"] }
 nbbs-oracle-consumer = { path = "../oracle-consumer", features = ["testutils"] }
+nbbs-project-registry = { path = "../project-registry", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

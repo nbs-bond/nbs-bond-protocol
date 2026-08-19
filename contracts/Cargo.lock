@@ -1031,6 +1031,7 @@ dependencies = [
  "nbbs-bond-issuer",
  "nbbs-coupon-engine",
  "nbbs-oracle-consumer",
+ "nbbs-project-registry",
  "nbbs-shared",
  "soroban-sdk",
 ]

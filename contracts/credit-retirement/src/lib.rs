@@ -550,9 +550,21 @@ mod test {
         let report_id =
             submit_verified_report(&env, &admin, &oracle_id, &project_id, 100_000);
 
+        let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(&env, &registry_id);
+        let user = Address::generate(&env);
+        let pid = registry.register_project(
+            &user,
+            &project_id,
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        registry.approve_project(&admin, &pid, &0);
+
         let ce_id = env.register(
             CouponEngine,
-            (admin.clone(), issuer_id.clone(), oracle_id.clone()),
+            (admin.clone(), issuer_id.clone(), oracle_id.clone(), registry_id.clone()),
         );
         let ce_client = CouponEngineClient::new(&env, &ce_id);
         ce_client.register_bond(&admin, &bond_id, &project_id, &0);
@@ -798,9 +810,21 @@ mod test {
         let report_id =
             submit_verified_report(&env, &admin, &oracle_id, &project_id, 100_000);
 
+        let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(&env, &registry_id);
+        let user = Address::generate(&env);
+        let pid = registry.register_project(
+            &user,
+            &project_id,
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        registry.approve_project(&admin, &pid, &0);
+
         let ce_id = env.register(
             CouponEngine,
-            (admin.clone(), issuer_id.clone(), oracle_id.clone()),
+            (admin.clone(), issuer_id.clone(), oracle_id.clone(), registry_id.clone()),
         );
         let ce_client = CouponEngineClient::new(&env, &ce_id);
         ce_client.register_bond(&admin, &bond_id, &project_id, &0);
