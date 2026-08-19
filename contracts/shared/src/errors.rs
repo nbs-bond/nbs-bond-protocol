@@ -14,6 +14,16 @@ pub enum BondError {
     Overflow = 9,
     ReportNotVerified = 10,
     InvalidReport = 11,
+    /// The period has already been fully distributed.  Replaces the previous
+    /// overloaded use of `Overflow` (= 9) for this guard so callers can
+    /// distinguish a real arithmetic overflow from a duplicate distribution
+    /// attempt.  The old numeric value is intentionally *not* reused.
+    PeriodAlreadyDistributed = 12,
+    /// A batch call supplied a holder that was already paid in a previous
+    /// batch for the same period.  The holder is silently skipped; this
+    /// variant is returned only when the *entire* batch consists of already-
+    /// paid addresses, so callers can detect a fully-redundant call.
+    AlreadyProcessed = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]

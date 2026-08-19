@@ -48,6 +48,8 @@ export interface CouponDistributionResponse {
   periodIndex: number;
   totalCredits: number;
   holderCount: number;
+  /** Total number of batches submitted for this period. */
+  batchCount: number;
 }
 
 export interface ClaimCreditsResponse {

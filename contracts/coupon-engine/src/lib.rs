@@ -27,9 +27,18 @@ pub enum DataKey {
     ProjectRegistryAddress,
     Nonce(Address),
     DeductCaller,
+    /// Tracks intermediate state for a period that is being distributed in
+    /// multiple batches.  Cleared (removed) once the period is fully settled
+    /// and `PeriodInfo.distributed` is set to `true`.
+    BatchState(u64, u32),
+    /// Per-holder flag set after a holder has received their credit
+    /// allocation for a given period.  Consulted at the start of each batch
+    /// item so a holder that already appeared in a previous batch is
+    /// silently skipped and never double-paid.
+    HolderDistributed(u64, u32, Address),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
 pub struct PeriodInfo {
     pub period_index: u32,
@@ -39,6 +48,30 @@ pub struct PeriodInfo {
     pub distributed: bool,
     pub report_id: u64,
     pub undistributed: i128,
+}
+
+/// Persisted between batched `distribute_coupon` calls for a single period.
+/// Removed once the period is fully distributed.
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchState {
+    /// The oracle report anchoring this distribution.  Every batch for the
+    /// same period *must* reference the same report.
+    pub report_id: u64,
+    /// Running sum of credits distributed to holders so far.
+    pub distributed_so_far: i128,
+    /// Running count of holders that received a non-zero allocation.
+    pub holder_count_so_far: u32,
+    /// Pre-computed total credits for the period (derived from the oracle
+    /// report on the first batch call and stored so subsequent batches do
+    /// not need to re-invoke the oracle consumer).
+    pub total_credits: i128,
+    /// Fixed-point rate for Carbon (or combined) credits per token.
+    pub credits_per_token: i128,
+    /// Fixed-point rate for Carbon-only allocation (Basket bonds).
+    pub carbon_per_token: i128,
+    /// Fixed-point rate for Biodiversity-only allocation (Basket bonds).
+    pub biodiversity_per_token: i128,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,14 +173,23 @@ impl CouponEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn distribute_coupon(
         env: Env,
         caller: Address,
         bond_id: u64,
         period_index: u32,
-        holders: Vec<Address>,
+        // Pre-fetched (holder_address, bond_token_balance) pairs for this batch.
+        // Passing balances from the API layer removes the per-holder cross-contract
+        // call to BondIssuer.get_holder_balance that caused instruction-budget
+        // exhaustion on large tranches.
+        // Idempotency: holders already paid in a previous batch are silently skipped.
+        holders: Vec<(Address, i128)>,
         report_id: u64,
         nonce: u64,
+        // Set to `true` in the last (or only) batch call to finalise the period,
+        // emit the coupon_distributed event, and clean up transient BatchState.
+        is_final_batch: bool,
     ) -> Result<CouponResult, BondError> {
         caller.require_auth();
 
@@ -159,46 +201,22 @@ impl CouponEngine {
 
         require_admin(&env, &caller)?;
 
+        // ── Guard: reject any call once the period is fully distributed ──────
+        let existing: Option<PeriodInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodInfo(bond_id, period_index));
+        if let Some(ref info) = existing {
+            if info.distributed {
+                return Err(BondError::PeriodAlreadyDistributed);
+            }
+        }
+
         let project_id: BytesN<32> = env
             .storage()
             .instance()
             .get(&DataKey::BondProject(bond_id))
             .ok_or(BondError::BondNotFound)?;
-
-        let oracle_consumer: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::OracleConsumerAddress)
-            .ok_or(BondError::NotInitialized)?;
-
-        let report: Report = env.invoke_contract(
-            &oracle_consumer,
-            &Symbol::new(&env, "get_report"),
-            vec![&env, report_id.into_val(&env)],
-        );
-
-        if report.status != ReportStatus::Verified {
-            return Err(BondError::ReportNotVerified);
-        }
-        if report.project_id != project_id {
-            return Err(BondError::BondNotFound);
-        }
-
-        let existing: Option<PeriodInfo> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PeriodInfo(bond_id, period_index));
-        if let Some(info) = existing {
-            if info.distributed {
-                return Err(BondError::Overflow);
-            }
-        }
-
-        let bond_issuer: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::BondIssuerAddress)
-            .expect("bond issuer not set");
 
         let credit_type: CreditType = env
             .storage()
@@ -206,58 +224,118 @@ impl CouponEngine {
             .get(&DataKey::BondCreditType(bond_id))
             .ok_or(BondError::BondNotFound)?;
 
-        let carbon_total = report.carbon_sequestered / CREDIT_DIVISOR;
-        let (carbon_total, biodiversity_total) = match credit_type {
-            CreditType::Carbon | CreditType::BlueCarbon => (carbon_total, 0),
-            CreditType::Biodiversity => match report.biodiversity {
-                BiodiversityMetrics::Absent => return Err(BondError::InvalidReport),
-                ref metrics => (0, compute_biodiversity_credits(metrics)),
-            },
-            CreditType::Basket => match report.biodiversity {
-                BiodiversityMetrics::Absent => return Err(BondError::InvalidReport),
-                ref metrics => (carbon_total, compute_biodiversity_credits(metrics)),
-            },
+        // ── Batch state: initialise on first call, resume on subsequent ──────
+        let batch_key = DataKey::BatchState(bond_id, period_index);
+        let mut state: BatchState = match env.storage().persistent().get(&batch_key) {
+            Some(s) => {
+                // Subsequent batch: verify that the same report is being used.
+                let s: BatchState = s;
+                if s.report_id != report_id {
+                    return Err(BondError::InvalidReport);
+                }
+                s
+            }
+            None => {
+                // First batch: validate the report and compute per-token rates.
+                let oracle_consumer: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::OracleConsumerAddress)
+                    .ok_or(BondError::NotInitialized)?;
+
+                let report: Report = env.invoke_contract(
+                    &oracle_consumer,
+                    &Symbol::new(&env, "get_report"),
+                    vec![&env, report_id.into_val(&env)],
+                );
+
+                if report.status != ReportStatus::Verified {
+                    return Err(BondError::ReportNotVerified);
+                }
+                if report.project_id != project_id {
+                    return Err(BondError::BondNotFound);
+                }
+
+                let bond_issuer: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::BondIssuerAddress)
+                    .expect("bond issuer not set");
+
+                let total_subscribed: i128 = env.invoke_contract(
+                    &bond_issuer,
+                    &Symbol::new(&env, "total_subscribed"),
+                    vec![&env, bond_id.into_val(&env)],
+                );
+
+                let carbon_total = report.carbon_sequestered / CREDIT_DIVISOR;
+                let (carbon_total, biodiversity_total) = match credit_type {
+                    CreditType::Carbon | CreditType::BlueCarbon => (carbon_total, 0),
+                    CreditType::Biodiversity => match report.biodiversity {
+                        BiodiversityMetrics::Absent => return Err(BondError::InvalidReport),
+                        ref metrics => (0, compute_biodiversity_credits(metrics)),
+                    },
+                    CreditType::Basket => match report.biodiversity {
+                        BiodiversityMetrics::Absent => return Err(BondError::InvalidReport),
+                        ref metrics => (carbon_total, compute_biodiversity_credits(metrics)),
+                    },
+                };
+                let total_credits = carbon_total
+                    .checked_add(biodiversity_total)
+                    .ok_or(BondError::Overflow)?;
+
+                let credits_per_token = if total_subscribed > 0 && total_credits > 0 {
+                    total_credits * FIXED_POINT / total_subscribed
+                } else {
+                    0
+                };
+                let carbon_per_token = if total_subscribed > 0 && carbon_total > 0 {
+                    carbon_total * FIXED_POINT / total_subscribed
+                } else {
+                    0
+                };
+                let biodiversity_per_token =
+                    if total_subscribed > 0 && biodiversity_total > 0 {
+                        biodiversity_total * FIXED_POINT / total_subscribed
+                    } else {
+                        0
+                    };
+
+                // Persist BatchState so the period's start/end timestamps are
+                // available when we write the final PeriodInfo.
+                let s = BatchState {
+                    report_id,
+                    distributed_so_far: 0,
+                    holder_count_so_far: 0,
+                    total_credits,
+                    credits_per_token,
+                    carbon_per_token,
+                    biodiversity_per_token,
+                };
+                // Store immediately so it is visible to the loop below even
+                // if the first batch is also the final batch.
+                env.storage().persistent().set(&batch_key, &s);
+                s
+            }
         };
-        let total_credits = carbon_total
-            .checked_add(biodiversity_total)
-            .ok_or(BondError::Overflow)?;
 
-        let total_subscribed: i128 = env.invoke_contract(
-            &bond_issuer,
-            &Symbol::new(&env, "total_subscribed"),
-            vec![&env, bond_id.into_val(&env)],
-        );
-
+        // ── Process holders in this batch ────────────────────────────────────
         let mut total_holder_credits: i128 = 0;
         let mut holder_count: u32 = 0;
 
-        let credits_per_token = if total_subscribed > 0 && total_credits > 0 {
-            total_credits * FIXED_POINT / total_subscribed
-        } else {
-            0
-        };
-        let carbon_per_token = if total_subscribed > 0 && carbon_total > 0 {
-            carbon_total * FIXED_POINT / total_subscribed
-        } else {
-            0
-        };
-        let biodiversity_per_token = if total_subscribed > 0 && biodiversity_total > 0 {
-            biodiversity_total * FIXED_POINT / total_subscribed
-        } else {
-            0
-        };
-
-        for holder in holders.iter() {
-            let balance: i128 = env.invoke_contract(
-                &bond_issuer,
-                &Symbol::new(&env, "get_holder_balance"),
-                vec![&env, bond_id.into_val(&env), holder.clone().into_val(&env)],
-            );
+        for (holder, balance) in holders.iter() {
+            // Skip holders already processed in a prior batch (idempotent).
+            let processed_key =
+                DataKey::HolderDistributed(bond_id, period_index, holder.clone());
+            if env.storage().persistent().has(&processed_key) {
+                continue;
+            }
 
             if balance > 0 {
                 match credit_type {
                     CreditType::Carbon | CreditType::BlueCarbon => {
-                        let holder_credits = credits_per_token * balance / FIXED_POINT;
+                        let holder_credits =
+                            state.credits_per_token * balance / FIXED_POINT;
                         if holder_credits > 0 {
                             total_holder_credits = total_holder_credits
                                 .checked_add(holder_credits)
@@ -273,7 +351,8 @@ impl CouponEngine {
                         }
                     }
                     CreditType::Biodiversity => {
-                        let holder_credits = credits_per_token * balance / FIXED_POINT;
+                        let holder_credits =
+                            state.credits_per_token * balance / FIXED_POINT;
                         if holder_credits > 0 {
                             total_holder_credits = total_holder_credits
                                 .checked_add(holder_credits)
@@ -289,9 +368,10 @@ impl CouponEngine {
                         }
                     }
                     CreditType::Basket => {
-                        let carbon_holder = carbon_per_token * balance / FIXED_POINT;
+                        let carbon_holder =
+                            state.carbon_per_token * balance / FIXED_POINT;
                         let biodiversity_holder =
-                            biodiversity_per_token * balance / FIXED_POINT;
+                            state.biodiversity_per_token * balance / FIXED_POINT;
                         let holder_credits = carbon_holder
                             .checked_add(biodiversity_holder)
                             .ok_or(BondError::Overflow)?;
@@ -321,56 +401,103 @@ impl CouponEngine {
                         }
                     }
                 }
+
+                // Mark this holder as processed so subsequent batch calls
+                // (or a retry of this one) skip them.
+                env.storage().persistent().set(&processed_key, &true);
             }
         }
 
-        let period_info = PeriodInfo {
-            period_index,
-            start_time: report.period_start,
-            end_time: report.period_end,
-            total_credits_earned: total_holder_credits,
-            distributed: true,
-            report_id,
-            undistributed: total_credits.saturating_sub(total_holder_credits),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::PeriodInfo(bond_id, period_index), &period_info);
+        // ── Accumulate into persistent BatchState ─────────────────────────
+        state.distributed_so_far = state
+            .distributed_so_far
+            .checked_add(total_holder_credits)
+            .ok_or(BondError::Overflow)?;
+        state.holder_count_so_far += holder_count;
+        env.storage().persistent().set(&batch_key, &state);
 
-        if period_info.undistributed > 0 {
-            let undistributed_total: i128 = env
+        // ── Finalise if this is the last batch ───────────────────────────────
+        if is_final_batch {
+            // Re-fetch the report for timestamps (already validated above).
+            let oracle_consumer: Address = env
                 .storage()
-                .persistent()
-                .get(&DataKey::UndistributedTotal(bond_id))
-                .unwrap_or(0);
-            let new_total = undistributed_total
-                .checked_add(period_info.undistributed)
-                .ok_or(BondError::Overflow)?;
+                .instance()
+                .get(&DataKey::OracleConsumerAddress)
+                .ok_or(BondError::NotInitialized)?;
+            let report: Report = env.invoke_contract(
+                &oracle_consumer,
+                &Symbol::new(&env, "get_report"),
+                vec![&env, report_id.into_val(&env)],
+            );
+
+            let total_distributed = state.distributed_so_far;
+            let undistributed = state.total_credits.saturating_sub(total_distributed);
+
+            let period_info = PeriodInfo {
+                period_index,
+                start_time: report.period_start,
+                end_time: report.period_end,
+                total_credits_earned: total_distributed,
+                distributed: true,
+                report_id,
+                undistributed,
+            };
             env.storage()
                 .persistent()
-                .set(&DataKey::UndistributedTotal(bond_id), &new_total);
+                .set(&DataKey::PeriodInfo(bond_id, period_index), &period_info);
+
+            if undistributed > 0 {
+                let undistributed_total: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::UndistributedTotal(bond_id))
+                    .unwrap_or(0);
+                let new_total = undistributed_total
+                    .checked_add(undistributed)
+                    .ok_or(BondError::Overflow)?;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::UndistributedTotal(bond_id), &new_total);
+            }
+
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PeriodCount(bond_id))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PeriodCount(bond_id), &(count + 1));
+
+            // Clean up the transient BatchState now that the period is closed.
+            env.storage().persistent().remove(&batch_key);
+
+            env.events().publish(
+                (Symbol::new(&env, "coupon_distributed"),),
+                (
+                    bond_id,
+                    period_index,
+                    total_distributed,
+                    state.holder_count_so_far,
+                ),
+            );
+
+            return Ok(CouponResult {
+                bond_id,
+                period_index,
+                total_credits: total_distributed,
+                holder_count: state.holder_count_so_far,
+                credits_per_token: state.credits_per_token,
+            });
         }
 
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PeriodCount(bond_id))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::PeriodCount(bond_id), &(count + 1));
-
-        env.events().publish(
-            (Symbol::new(&env, "coupon_distributed"),),
-            (bond_id, period_index, total_holder_credits, holder_count),
-        );
-
+        // ── Intermediate batch: return a partial result ───────────────────────
         Ok(CouponResult {
             bond_id,
             period_index,
-            total_credits: total_holder_credits,
-            holder_count,
-            credits_per_token,
+            total_credits: state.distributed_so_far,
+            holder_count: state.holder_count_so_far,
+            credits_per_token: state.credits_per_token,
         })
     }
 
@@ -712,6 +839,8 @@ fn clear_accrued(env: &Env, bond_id: u64, holder: &Address, credit_type: CreditT
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::{
         testutils::Address as _,
@@ -888,6 +1017,25 @@ mod test {
         )
     }
 
+    /// Build a `Vec<(Address, i128)>` from a plain list of addresses by
+    /// fetching each holder's on-chain balance from `BondIssuer`.  Used in
+    /// tests that don't care about the holder/balance distinction and just
+    /// want to call `distribute_coupon` with the new signature.
+    fn holders_with_balances(
+        env: &Env,
+        t: &TestEnv,
+        bond_id: u64,
+        addrs: &[&Address],
+    ) -> Vec<(Address, i128)> {
+        let issuer = nbbs_bond_issuer::BondIssuerClient::new(env, &t.issuer_id);
+        let mut v: Vec<(Address, i128)> = Vec::new(env);
+        for &addr in addrs {
+            let bal = issuer.get_holder_balance(&bond_id, addr);
+            v.push_back((addr.clone(), bal));
+        }
+        v
+    }
+
     #[test]
     fn test_constructor_and_register_bond() {
         let env = Env::default();
@@ -996,7 +1144,7 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
         let result = t.client.distribute_coupon(
             &t.admin,
@@ -1005,6 +1153,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
 
         assert_eq!(result.bond_id, bond_id);
@@ -1054,7 +1203,7 @@ mod test {
             BiodiversityMetrics::Present((500, 125, 1_000)),
             0,
         );
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
         let result = t.client.distribute_coupon(
             &t.admin,
@@ -1063,6 +1212,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
 
         let total = 500 + 125 * SPECIES_CREDIT_RATE / HABITAT_CREDIT_RATE + 1_000;
@@ -1107,7 +1257,7 @@ mod test {
             BiodiversityMetrics::Present((500, 125, 1_000)),
             0,
         );
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
         let result = t.client.distribute_coupon(
             &t.admin,
@@ -1116,6 +1266,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
 
         let bio_total = 500 + 125 * SPECIES_CREDIT_RATE / HABITAT_CREDIT_RATE + 1_000;
@@ -1164,7 +1315,7 @@ mod test {
             BiodiversityMetrics::Absent,
             0,
         );
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
         let result = t.client.try_distribute_coupon(
             &t.admin,
@@ -1173,6 +1324,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
         assert_eq!(result, Err(Ok(BondError::InvalidReport)));
     }
@@ -1196,7 +1348,7 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder1.clone(), holder2.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder1, &holder2]);
 
         let result = t.client.distribute_coupon(
             &t.admin,
@@ -1205,6 +1357,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
 
         assert_eq!(result.total_credits, 100);
@@ -1235,7 +1388,7 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 0, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
         let result = t.client.distribute_coupon(
             &t.admin,
@@ -1244,6 +1397,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
 
         assert_eq!(result.total_credits, 0);
@@ -1269,7 +1423,7 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_unverified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
         let result = t.client.try_distribute_coupon(
             &t.admin,
@@ -1278,6 +1432,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
         assert_eq!(result, Err(Ok(BondError::ReportNotVerified)));
 
@@ -1301,7 +1456,7 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &other_project, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
         let result = t.client.try_distribute_coupon(
             &t.admin,
@@ -1310,6 +1465,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
         assert_eq!(result, Err(Ok(BondError::BondNotFound)));
     }
@@ -1329,10 +1485,12 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
-        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
 
+        // After a successful final-batch call the period is locked.  A second
+        // attempt on the same period must return PeriodAlreadyDistributed.
         let result = t.client.try_distribute_coupon(
             &t.admin,
             &bond_id,
@@ -1340,8 +1498,9 @@ mod test {
             &holders,
             &report_id,
             &2,
+            &true,
         );
-        assert_eq!(result, Err(Ok(BondError::Overflow)));
+        assert_eq!(result, Err(Ok(BondError::PeriodAlreadyDistributed)));
     }
 
     #[test]
@@ -1354,7 +1513,7 @@ mod test {
 
         let project_id = setup_project(&t._env, &t, 1);
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env];
+        let holders: Vec<(Address, i128)> = Vec::new(&t._env);
 
         let result = t.client.try_distribute_coupon(
             &t.admin,
@@ -1363,6 +1522,7 @@ mod test {
             &holders,
             &report_id,
             &0,
+            &true,
         );
         assert_eq!(result, Err(Ok(BondError::BondNotFound)));
     }
@@ -1382,8 +1542,8 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
-        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
 
         let claimed = t.client.claim_credits(&holder, &bond_id, &0);
         assert_eq!(claimed, 100);
@@ -1421,8 +1581,8 @@ mod test {
             BiodiversityMetrics::Absent,
             0,
         );
-        let holders = vec![&t._env, holder.clone()];
-        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
 
         let claimed = t.client.claim_credits(&holder, &bond_id, &0);
         let carbon_total = 100i128;
@@ -1458,8 +1618,8 @@ mod test {
             BiodiversityMetrics::Present((500, 125, 1_000)),
             0,
         );
-        let holders = vec![&t._env, holder.clone()];
-        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
 
         let claimed = t.client.claim_credits(&holder, &bond_id, &0);
         let bio_total = 500 + 125 * SPECIES_CREDIT_RATE / HABITAT_CREDIT_RATE + 1_000;
@@ -1482,7 +1642,7 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env];
+        let holders: Vec<(Address, i128)> = Vec::new(&t._env);
 
         let result = t.client.distribute_coupon(
             &t.admin,
@@ -1491,6 +1651,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
 
         assert_eq!(result.total_credits, 0);
@@ -1518,13 +1679,14 @@ mod test {
         assert_eq!(t.client.get_period_count(&bond_id), 0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
 
-        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
         assert_eq!(t.client.get_period_count(&bond_id), 1);
 
         let report_id2 = submit_verified_report(&t._env, &t, &project_id, 200_000, BiodiversityMetrics::Absent, 2);
-        t.client.distribute_coupon(&t.admin, &bond_id, &1, &holders, &report_id2, &2);
+        let holders2 = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        t.client.distribute_coupon(&t.admin, &bond_id, &1, &holders2, &report_id2, &2, &true);
         assert_eq!(t.client.get_period_count(&bond_id), 2);
     }
 
@@ -1551,7 +1713,7 @@ mod test {
                 BiodiversityMetrics::Absent,
                 (period as u64) * 2,
             );
-            let holders = vec![&t._env, holder.clone()];
+            let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
             t.client.distribute_coupon(
                 &t.admin,
                 &bond_id,
@@ -1559,6 +1721,7 @@ mod test {
                 &holders,
                 &report_id,
                 &((period as u64) + 1),
+                &true,
             );
         }
 
@@ -1598,7 +1761,7 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder_a.clone(), holder_b.clone(), holder_c.clone()];
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder_a, &holder_b, &holder_c]);
 
         let result = t.client.distribute_coupon(
             &t.admin,
@@ -1607,6 +1770,7 @@ mod test {
             &holders,
             &report_id,
             &1,
+            &true,
         );
 
         assert_eq!(result.total_credits, 99);
@@ -1636,8 +1800,8 @@ mod test {
         t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
 
         let report_id = submit_verified_report(&t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0);
-        let holders = vec![&t._env, holder.clone()];
-        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
 
         let user = Address::generate(&t._env);
         let result = t.client.try_sweep_undistributed(&user, &bond_id, &0);
@@ -1782,9 +1946,9 @@ mod test {
                 let (t, holders, bond_id, total_subscribed, report_id) =
                     setup_with_balances(env, admin.clone(), &balances, carbon);
 
-                let mut holders_vec: Vec<Address> = Vec::new(&t._env);
-                for h in &holders {
-                    holders_vec.push_back(h.clone());
+                let mut holders_vec: Vec<(Address, i128)> = Vec::new(&t._env);
+                for (h, &bal) in holders.iter().zip(balances.iter()) {
+                    holders_vec.push_back((h.clone(), bal));
                 }
 
                 let total_credits = carbon / 1000;
@@ -1795,6 +1959,7 @@ mod test {
                     &holders_vec,
                     &report_id,
                     &1,
+                    &true,
                 );
 
                 let distributed =
@@ -1837,9 +2002,9 @@ mod test {
                 let (t, holders, bond_id, total_subscribed) =
                     deploy_with_holders(env, admin.clone(), &balances);
 
-                let mut holders_vec: Vec<Address> = Vec::new(&t._env);
-                for h in &holders {
-                    holders_vec.push_back(h.clone());
+                let mut holders_vec: Vec<(Address, i128)> = Vec::new(&t._env);
+                for (h, &bal) in holders.iter().zip(balances.iter()) {
+                    holders_vec.push_back((h.clone(), bal));
                 }
 
                 let mut sum_undistributed = 0i128;
@@ -1859,6 +2024,7 @@ mod test {
                         &holders_vec,
                         &report_id,
                         &(1 + period as u64),
+                        &true,
                     );
                     let total_credits = carbon / 1000;
                     let distributed =
@@ -1890,5 +2056,203 @@ mod test {
                 );
             }
         }
+    }
+
+    // ── Batch-distribution unit tests ────────────────────────────────────────
+
+    #[test]
+    fn test_batch_two_non_overlapping_batches_distribute_all_holders() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 5);
+        let holder_a = Address::generate(&t._env);
+        let holder_b = Address::generate(&t._env);
+        let holder_c = Address::generate(&t._env);
+
+        // Each holder subscribes for equal amounts.
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder_a, 3_000);
+        let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
+        issuer.subscribe(&holder_b, &bond_id, &3_000, &0);
+        issuer.subscribe(&holder_c, &bond_id, &4_000, &0);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        let report_id = submit_verified_report(
+            &t._env, &t, &project_id, 30_000_000, BiodiversityMetrics::Absent, 0,
+        );
+
+        // Batch 1 – only holder_a and holder_b, NOT the final batch.
+        let batch1 = holders_with_balances(&t._env, &t, bond_id, &[&holder_a, &holder_b]);
+        let partial = t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &batch1, &report_id, &1, &false,
+        );
+        // Period must NOT be marked distributed yet.
+        assert_eq!(
+            t.client.try_get_period_info(&bond_id, &0),
+            Err(Ok(BondError::BondNotFound)),
+            "period must not be finalised after partial batch"
+        );
+        assert_eq!(partial.holder_count, 2);
+
+        // Batch 2 – only holder_c, is the final batch.
+        let batch2 = holders_with_balances(&t._env, &t, bond_id, &[&holder_c]);
+        let final_result = t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &batch2, &report_id, &2, &true,
+        );
+        assert_eq!(final_result.holder_count, 3);
+        assert!(final_result.total_credits > 0);
+
+        let period_info = t.client.get_period_info(&bond_id, &0);
+        assert!(period_info.distributed);
+
+        // Credit conservation: sum of holder credits + undistributed == total.
+        let total_credits = 30_000_000i128 / 1000; // 30_000
+        let a = t.client.accrued_credits(&bond_id, &holder_a);
+        let b = t.client.accrued_credits(&bond_id, &holder_b);
+        let c = t.client.accrued_credits(&bond_id, &holder_c);
+        let undistributed = t.client.get_undistributed_total(&bond_id);
+        assert_eq!(a + b + c + undistributed, total_credits);
+    }
+
+    #[test]
+    fn test_batch_already_distributed_holder_is_no_op() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 6);
+        let holder = Address::generate(&t._env);
+
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        let report_id = submit_verified_report(
+            &t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0,
+        );
+
+        // First batch pays the holder.
+        let batch = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &batch, &report_id, &1, &false,
+        );
+        let after_first = t.client.accrued_credits(&bond_id, &holder);
+        assert!(after_first > 0);
+
+        // Second batch includes the same holder again (duplicate) – must be a no-op.
+        let batch_dup = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        let result = t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &batch_dup, &report_id, &2, &true,
+        );
+        // The holder must NOT have received extra credits.
+        assert_eq!(t.client.accrued_credits(&bond_id, &holder), after_first);
+        // The result's total must not be inflated by the duplicate.
+        assert_eq!(result.total_credits, after_first);
+    }
+
+    #[test]
+    fn test_batch_period_already_distributed_rejects_new_batches() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 7);
+        let holder = Address::generate(&t._env);
+
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 10_000);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        let report_id = submit_verified_report(
+            &t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0,
+        );
+
+        // Complete the period in one shot.
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+        t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &holders, &report_id, &1, &true,
+        );
+
+        // Any further call must be rejected.
+        let result = t.client.try_distribute_coupon(
+            &t.admin, &bond_id, &0, &holders, &report_id, &2, &true,
+        );
+        assert_eq!(result, Err(Ok(BondError::PeriodAlreadyDistributed)));
+    }
+
+    #[test]
+    fn test_three_batch_credit_conservation() {
+        // Three equal-size batches; credit conservation must hold after each
+        // intermediate batch and after the final batch.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 8);
+
+        let holders_std: std::vec::Vec<Address> =
+            (0..9).map(|_| Address::generate(&t._env)).collect();
+        let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
+        let mut config = make_bond_config(&t._env, &project_id);
+        config.total_supply = 9_000;
+        let bond_id = issuer.issue_bond(&t.issuer_admin, &config, &0);
+        for h in &holders_std {
+            issuer.subscribe(h, &bond_id, &1_000, &0);
+        }
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        // 9_000_000 kg  → 9_000 credits (1 per tonne = 1 per holder at 1_000 tokens each)
+        let report_id = submit_verified_report(
+            &t._env, &t, &project_id, 9_000_000, BiodiversityMetrics::Absent, 0,
+        );
+        let total_credits = 9_000i128;
+
+        // Batch 1: holders 0-2 (not final).
+        let b1_refs: std::vec::Vec<&Address> = holders_std[0..3].iter().collect();
+        let b1 = holders_with_balances(&t._env, &t, bond_id, &b1_refs);
+        let r1 = t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &b1, &report_id, &1, &false,
+        );
+        assert_eq!(r1.holder_count, 3);
+        // Period must NOT be finalised yet.
+        assert_eq!(
+            t.client.try_get_period_info(&bond_id, &0),
+            Err(Ok(BondError::BondNotFound))
+        );
+
+        // Batch 2: holders 3-5 (not final).
+        let b2_refs: std::vec::Vec<&Address> = holders_std[3..6].iter().collect();
+        let b2 = holders_with_balances(&t._env, &t, bond_id, &b2_refs);
+        let r2 = t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &b2, &report_id, &2, &false,
+        );
+        assert_eq!(r2.holder_count, 6);
+
+        // Batch 3: holders 6-8 (final).
+        let b3_refs: std::vec::Vec<&Address> = holders_std[6..9].iter().collect();
+        let b3 = holders_with_balances(&t._env, &t, bond_id, &b3_refs);
+        let r3 = t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &b3, &report_id, &3, &true,
+        );
+        assert_eq!(r3.holder_count, 9);
+
+        let period_info = t.client.get_period_info(&bond_id, &0);
+        assert!(period_info.distributed);
+
+        let sum_accrued: i128 = holders_std
+            .iter()
+            .map(|h| t.client.accrued_credits(&bond_id, h))
+            .sum();
+        let undistributed = t.client.get_undistributed_total(&bond_id);
+        assert_eq!(sum_accrued + undistributed, total_credits,
+            "credit conservation violated: {} + {} != {}",
+            sum_accrued, undistributed, total_credits);
     }
 }

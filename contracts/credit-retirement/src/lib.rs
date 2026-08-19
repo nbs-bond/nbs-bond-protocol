@@ -617,8 +617,8 @@ mod test {
         ce_client.register_deduct_caller(&admin, &contract_id, &0);
         ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-        let holders = svec![&env, holder.clone()];
-        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2);
+        let holders = svec![&env, (holder.clone(), 10_000i128)];
+        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2, &true);
         let accrued = ce_client.accrued_credits(&bond_id, &holder);
         assert!(accrued > 0);
 
@@ -879,8 +879,8 @@ mod test {
         ce_client.register_deduct_caller(&admin, &cr_id, &0);
         ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-        let holders = svec![&env, holder1.clone(), holder2.clone()];
-        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2);
+        let holders = svec![&env, (holder1.clone(), 3_000i128), (holder2.clone(), 7_000i128)];
+        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2, &true);
 
         let accrued1 = ce_client.accrued_credits(&bond_id, &holder1);
         let accrued2 = ce_client.accrued_credits(&bond_id, &holder2);
@@ -1117,9 +1117,10 @@ mod test {
             &s.admin,
             &s.bond_id,
             &1u32,
-            &svec![&s._env, s.holder.clone()],
+            &svec![&s._env, (s.holder.clone(), 10_000i128)],
             &report_id,
             &3,
+            &true,
         );
 
         let hash = make_certificate_hash(&s._env, 1);

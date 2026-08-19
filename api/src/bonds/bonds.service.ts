@@ -250,32 +250,67 @@ export class BondsService {
   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
-    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
 
-    // Reconcile the off-chain holder set against on-chain state before
-    // calling distribute_coupon: include holders the DB missed (e.g. after a
-    // peer-to-peer transfer that bypassed the API) and drop zero-balance
-    // addresses so stale rows are never forwarded to the contract.
+    // Reconcile the off-chain holder set against on-chain state, then fetch
+    // each holder's balance so the contract doesn't need to call
+    // BondIssuer.get_holder_balance for every address in the transaction.
     const holderAddresses = await this.resolveOnChainHolders(id);
+    const holderBalances: Array<{ address: string; balance: bigint }> = [];
+    for (const address of holderAddresses) {
+      const balance = await this.getHolderBalance(id, address);
+      if (balance > 0) {
+        holderBalances.push({ address, balance: BigInt(balance) });
+      }
+    }
 
-    const { result } = await this.contractService.invokeContractMethod(
-      COUPON_ENGINE(), 'distribute_coupon', adminSecret,
-      [
-        Address.fromString(adminAddress).toScVal(),
-        nativeToScVal(BigInt(id), { type: 'u64' }),
-        nativeToScVal(dto.periodIndex, { type: 'u32' }),
-        xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
-        nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
-      ],
-      nonce,
-    );
+    const BATCH_SIZE = dto.batchSize ?? 50;
+    let lastResult: any = null;
+    let batchCount = 0;
 
-    const parsed = scValToNative(result) as any[];
+    for (let start = 0; start < holderBalances.length || batchCount === 0; start += BATCH_SIZE) {
+      const slice = holderBalances.slice(start, start + BATCH_SIZE);
+      const isFinalBatch = start + BATCH_SIZE >= holderBalances.length;
+      batchCount += 1;
+
+      const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
+
+      // Encode Vec<(Address, i128)> as an ScVal vec of 2-element vecs.
+      const holdersScVal = xdr.ScVal.scvVec(
+        slice.map(({ address, balance }) =>
+          xdr.ScVal.scvVec([
+            Address.fromString(address).toScVal(),
+            nativeToScVal(balance, { type: 'i128' }),
+          ]),
+        ),
+      );
+
+      const { result } = await this.contractService.invokeContractMethod(
+        COUPON_ENGINE(), 'distribute_coupon', adminSecret,
+        [
+          Address.fromString(adminAddress).toScVal(),
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          nativeToScVal(dto.periodIndex, { type: 'u32' }),
+          holdersScVal,
+          nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
+          nativeToScVal(isFinalBatch, { type: 'bool' }),
+        ],
+        nonce,
+      );
+
+      lastResult = result;
+
+      // If there are no holders at all we still need a single final-batch call
+      // to finalise the period; break after the first iteration in that case.
+      if (holderBalances.length === 0) break;
+    }
+
+    const parsed = scValToNative(lastResult) as any[];
     return {
       bondId: id,
       periodIndex: dto.periodIndex,
       totalCredits: Number(parsed?.[2] ?? 0),
       holderCount: Number(parsed?.[3] ?? 0),
+      batchCount,
     };
   }
 

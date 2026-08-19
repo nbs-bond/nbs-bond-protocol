@@ -2,6 +2,15 @@ import { Test } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
 import { xdr, scValToNative, nativeToScVal, Address, Keypair } from '@stellar/stellar-sdk';
 
+// BigInt is not JSON-serializable by default.  Jest workers use JSON.stringify
+// to communicate mock call data back to the parent process; XDR objects stored
+// in mock histories can contain BigInt values.  This polyfill prevents the
+// "Do not know how to serialize a BigInt" error without affecting test
+// assertions (toJSON is only invoked by JSON.stringify).
+(BigInt.prototype as any).toJSON = function () {
+  return this.toString();
+};
+
 jest.mock('@redis/client', () => {
   const mockClient = {
     connect: jest.fn().mockResolvedValue(undefined),
@@ -129,7 +138,8 @@ describe('BondsService', () => {
 
       expect(contractAddress).toBe('');
       expect(method).toBe('distribute_coupon');
-      expect(args.length).toBe(5);
+      // args: caller, bond_id, period_index, holders, report_id, is_final_batch
+      expect(args.length).toBe(6);
       expect(scValToNative(args[0])).toBe(
         'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
       );
@@ -209,7 +219,7 @@ describe('BondsService', () => {
     };
 
     const passedHolders = (invokeContractMethod: jest.Mock): string[] =>
-      scValToNative(invokeContractMethod.mock.calls[0][3][3]) as string[];
+      (scValToNative(invokeContractMethod.mock.calls[0][3][3]) as [string, bigint][]).map(([addr]) => addr);
 
     it('includes on-chain holders missing from the off-chain DB set', async () => {
       const dbHolder = Keypair.random().publicKey();

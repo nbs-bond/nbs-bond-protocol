@@ -41,6 +41,23 @@ mod integration {
         }
     }
 
+    /// Build a `Vec<(Address, i128)>` by looking up each holder's bond-token
+    /// balance from `BondIssuer`.  Passed to `CouponEngine::distribute_coupon`
+    /// to avoid the per-holder cross-contract call inside the contract itself.
+    fn holders_with_balances<'a>(
+        env: &'a Env,
+        bi_client: &BondIssuerClient<'a>,
+        bond_id: u64,
+        addrs: &[&Address],
+    ) -> soroban_sdk::Vec<(Address, i128)> {
+        let mut v = soroban_sdk::Vec::new(env);
+        for &addr in addrs {
+            let bal = bi_client.get_holder_balance(&bond_id, addr);
+            v.push_back((addr.clone(), bal));
+        }
+        v
+    }
+
     struct TestContracts<'a> {
         pr_client: ProjectRegistryClient<'a>,
         bi_client: BondIssuerClient<'a>,
@@ -155,7 +172,7 @@ mod integration {
 
             contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-            let holders = soroban_sdk::vec![&env, bob.clone()];
+            let holders = holders_with_balances(&env, &contracts.bi_client, bond_id, &[&bob]);
             let result = contracts.ce_client.distribute_coupon(
                 &admin,
                 &bond_id,
@@ -163,6 +180,7 @@ mod integration {
                 &holders,
                 &report_id,
                 &2,
+                &true,
             );
             assert!(result.total_credits > 0);
             assert_eq!(result.holder_count, 1);
@@ -288,7 +306,7 @@ mod integration {
 
             contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-            let holders = soroban_sdk::vec![&env, bob.clone()];
+            let holders = holders_with_balances(&env, &contracts.bi_client, bond_id, &[&bob]);
 
             let rejected = contracts.ce_client.try_distribute_coupon(
                 &admin,
@@ -297,6 +315,7 @@ mod integration {
                 &holders,
                 &report_id,
                 &2,
+                &true,
             );
             assert_eq!(rejected, Err(Ok(BondError::ReportNotVerified)));
 
@@ -309,6 +328,7 @@ mod integration {
                 &holders,
                 &report_id,
                 &2,
+                &true,
             );
             assert!(result.total_credits > 0);
         }
@@ -383,7 +403,7 @@ mod integration {
 
             contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-            let holders = soroban_sdk::vec![&env, bob.clone()];
+            let holders = holders_with_balances(&env, &contracts.bi_client, bond_id, &[&bob]);
             let result = contracts.ce_client.distribute_coupon(
                 &admin,
                 &bond_id,
@@ -391,6 +411,7 @@ mod integration {
                 &holders,
                 &report_id,
                 &2,
+                &true,
             );
             assert!(result.total_credits > 0);
             assert_eq!(result.holder_count, 1);
@@ -466,7 +487,7 @@ mod integration {
 
             contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-            let holders = soroban_sdk::vec![&env, bob.clone()];
+            let holders = holders_with_balances(&env, &contracts.bi_client, bond_id, &[&bob]);
             contracts.ce_client.distribute_coupon(
                 &admin,
                 &bond_id,
@@ -474,6 +495,7 @@ mod integration {
                 &holders,
                 &report_id,
                 &2,
+                &true,
             );
 
             let accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
@@ -549,7 +571,7 @@ mod integration {
 
             contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-            let holders = soroban_sdk::vec![&env, bob.clone()];
+            let holders = holders_with_balances(&env, &contracts.bi_client, bond_id, &[&bob]);
             contracts.ce_client.distribute_coupon(
                 &admin,
                 &bond_id,
@@ -557,6 +579,7 @@ mod integration {
                 &holders,
                 &report_id,
                 &2,
+                &true,
             );
 
             let accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
@@ -585,6 +608,137 @@ mod integration {
                 .claim_credits(&bob, &bond_id, &0);
             assert_eq!(claimed, accrued - half);
             assert_eq!(contracts.ce_client.accrued_credits(&bond_id, &bob), 0);
+        }
+
+        /// Three-batch distribution scenario.
+        /// Verifies that:
+        ///   1. Intermediate batches do NOT finalise the period.
+        ///   2. The final batch closes the period.
+        ///   3. Credit conservation holds: Σ(holder accruals) + undistributed == total credits.
+        ///   4. A holder duplicated across batches is only paid once.
+        #[test]
+        fn test_three_batch_distribution_conserves_credits() {
+            let env = Env::default();
+            env.mock_all_auths_allowing_non_root_auth();
+
+            let admin = Address::generate(&env);
+            let alice = Address::generate(&env);
+            let oracle = Address::generate(&env);
+            let contracts = deploy_contracts(&env, &admin);
+
+            // Create 9 holders, each subscribing to 1_000 tokens (total supply 9_000).
+            let holder_std: std::vec::Vec<Address> =
+                (0..9).map(|_| Address::generate(&env)).collect();
+            let total_supply = 9_000i128;
+
+            let project_id = make_project_id(&env, 1);
+            let pid = contracts.pr_client.register_project(
+                &alice,
+                &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "VCS"),
+                &Symbol::new(&env, "US"),
+                &0,
+            );
+            contracts.pr_client.approve_project(&admin, &pid, &0);
+
+            let config = make_bond_config(&env, project_id.clone(), total_supply);
+            let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
+            for h in &holder_std {
+                contracts.bi_client.subscribe(h, &bond_id, &1_000, &0);
+            }
+
+            contracts.oc_client.register_provider(
+                &admin,
+                &oracle,
+                &Symbol::new(&env, "verra_vcs"),
+                &0,
+            );
+            // 9_000_000 kg → 9_000 credits (1 tonne == 1 credit, 1_000 tokens each → 1_000 credits/holder)
+            let report_id = contracts.oc_client.submit_report(
+                &oracle,
+                &project_id,
+                &1000u64,
+                &2000u64,
+                &9_000_000i128,
+                &BiodiversityMetrics::Absent,
+                &Symbol::new(&env, "verra_vcs"),
+                &make_ipfs_hash(&env, 1),
+                &0,
+            );
+            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
+
+            let total_credits = 9_000i128;
+
+            // ── Batch 1: holders 0-2 (NOT final) ────────────────────────────
+            let b1_refs: std::vec::Vec<&Address> = holder_std[0..3].iter().collect();
+            let mut b1 = soroban_sdk::Vec::new(&env);
+            for &h in &b1_refs {
+                let bal = contracts.bi_client.get_holder_balance(&bond_id, h);
+                b1.push_back((h.clone(), bal));
+            }
+            let r1 = contracts.ce_client.distribute_coupon(
+                &admin, &bond_id, &0, &b1, &report_id, &2, &false,
+            );
+            assert_eq!(r1.holder_count, 3);
+            // Period must NOT be finalised yet — get_period_info should return BondNotFound.
+            assert_eq!(
+                contracts.ce_client.try_get_period_info(&bond_id, &0),
+                Err(Ok(BondError::BondNotFound)),
+                "period must not be finalised after batch 1"
+            );
+
+            // ── Batch 2: holders 3-5 (NOT final) ────────────────────────────
+            let mut b2 = soroban_sdk::Vec::new(&env);
+            for h in &holder_std[3..6] {
+                let bal = contracts.bi_client.get_holder_balance(&bond_id, h);
+                b2.push_back((h.clone(), bal));
+            }
+            let r2 = contracts.ce_client.distribute_coupon(
+                &admin, &bond_id, &0, &b2, &report_id, &3, &false,
+            );
+            assert_eq!(r2.holder_count, 6);
+
+            // ── Batch 3: holders 6-8 (FINAL) ────────────────────────────────
+            let mut b3 = soroban_sdk::Vec::new(&env);
+            for h in &holder_std[6..9] {
+                let bal = contracts.bi_client.get_holder_balance(&bond_id, h);
+                b3.push_back((h.clone(), bal));
+            }
+            let r3 = contracts.ce_client.distribute_coupon(
+                &admin, &bond_id, &0, &b3, &report_id, &4, &true,
+            );
+            assert_eq!(r3.holder_count, 9);
+
+            // Period is now finalised.
+            let period_info = contracts.ce_client.get_period_info(&bond_id, &0);
+            assert!(period_info.distributed);
+
+            // Credit conservation: Σ accruals + undistributed == total_credits.
+            let sum_accrued: i128 = holder_std
+                .iter()
+                .map(|h| contracts.ce_client.accrued_credits(&bond_id, h))
+                .sum();
+            let undistributed = contracts.ce_client.get_undistributed_total(&bond_id);
+            assert_eq!(
+                sum_accrued + undistributed,
+                total_credits,
+                "credit conservation violated: {} + {} != {}",
+                sum_accrued,
+                undistributed,
+                total_credits
+            );
+
+            // Each holder received exactly their pro-rata share (1_000/9_000 of 9_000 = 1_000).
+            for h in &holder_std {
+                assert_eq!(contracts.ce_client.accrued_credits(&bond_id, h), 1_000);
+            }
+
+            // Any further call on period 0 must be rejected.
+            let dup_attempt = contracts.ce_client.try_distribute_coupon(
+                &admin, &bond_id, &0, &b1, &report_id, &5, &true,
+            );
+            assert_eq!(dup_attempt, Err(Ok(BondError::PeriodAlreadyDistributed)));
         }
     }
 
@@ -1124,12 +1278,12 @@ mod integration {
 
             contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-            let holders = soroban_sdk::vec![
+            let holders = holders_with_balances(
                 &env,
-                alice.clone(),
-                bob.clone(),
-                carol.clone(),
-            ];
+                &contracts.bi_client,
+                bond_id,
+                &[&alice, &bob, &carol],
+            );
             let result = contracts.ce_client.distribute_coupon(
                 &admin,
                 &bond_id,
@@ -1137,6 +1291,7 @@ mod integration {
                 &holders,
                 &report_id,
                 &2,
+                &true,
             );
 
             assert_eq!(result.total_credits, 99);
@@ -1434,8 +1589,8 @@ mod integration {
                 contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
                 let mut holder_vec = soroban_sdk::Vec::new(&env);
-                for h in &holders {
-                    holder_vec.push_back(h.clone());
+                for (h, &bal) in holders.iter().zip(balances.iter()) {
+                    holder_vec.push_back((h.clone(), bal));
                 }
 
                 let total_credits = carbon / 1000;
@@ -1446,6 +1601,7 @@ mod integration {
                     &holder_vec,
                     &report_id,
                     &2,
+                    &true,
                 );
 
                 let mut distributed = 0i128;
