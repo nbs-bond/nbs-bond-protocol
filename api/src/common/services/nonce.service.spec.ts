@@ -231,6 +231,34 @@ describe('NonceService', () => {
 
   // ── Additional edge cases ──────────────────────────────────────────────────
 
+  // ── rollback() ─────────────────────────────────────────────────────────────
+
+  describe('rollback()', () => {
+    it('decrements the nonce key by 1 via a Lua script', async () => {
+      redisMock.eval.mockResolvedValueOnce(4); // DECR from 5 → 4
+
+      const result = await service.rollback(CONTRACT, ADDRESS);
+
+      expect(result).toBe(4);
+      expect(redisMock.eval).toHaveBeenCalledTimes(1);
+      // Verify the Lua script was called with the correct key and TTL.
+      const [script, { keys, arguments: args }] = redisMock.eval.mock.calls[0];
+      expect(script).toContain('DECR');
+      expect(keys).toEqual([`nonce:${CONTRACT}:${ADDRESS}`]);
+      expect(args).toEqual([String(30 * 24 * 60 * 60)]);
+    });
+
+    it('propagates Redis errors to the caller', async () => {
+      redisMock.eval.mockRejectedValueOnce(new Error('redis connection lost'));
+
+      await expect(service.rollback(CONTRACT, ADDRESS)).rejects.toThrow(
+        'redis connection lost',
+      );
+    });
+  });
+
+  // ── lock wait timeout ──────────────────────────────────────────────────────
+
   describe('next() — lock wait timeout', () => {
     it('throws InternalServerErrorException when lock holder never seeds the key', async () => {
       // Key is missing — both the initial EXISTS check and every poll during

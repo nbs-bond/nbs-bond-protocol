@@ -196,6 +196,43 @@ export class NonceService {
   }
 
   /**
+   * Roll back the most recent optimistic nonce increment for an address.
+   *
+   * Called when a transaction that consumed a nonce slot ultimately fails
+   * on-chain (FAILED status from getTransaction) or times out.  A simple
+   * DECR + EXPIRE Lua script is atomic and sufficient here — the nonce
+   * was incremented by exactly one INCR in the preceding next() call, so
+   * decrementing by one restores the correct baseline for the next retry.
+   *
+   * If the key does not exist (e.g. it expired between next() and the
+   * failed confirmation), DECR will create it at -1 which is harmless —
+   * the next call's sync() path will re-seed from on-chain state.
+   */
+  async rollback(contractAddress: string, address: string): Promise<number> {
+    const key = `nonce:${contractAddress}:${address}`;
+    const luaScript = `
+      local val = redis.call("DECR", KEYS[1])
+      redis.call("EXPIRE", KEYS[1], ARGV[1])
+      return val
+    `;
+    try {
+      const decremented = (await this.redis.eval(luaScript, {
+        keys: [key],
+        arguments: [String(NONCE_KEY_TTL_SECONDS)],
+      })) as number;
+      this.logger.debug(
+        `rollback(): ${key} decremented to ${decremented}`,
+      );
+      return decremented;
+    } catch (error) {
+      this.logger.warn(
+        `rollback(): failed to decrement nonce for ${address} on ${contractAddress}: ${error?.message ?? error}`,
+      );
+      throw error;
+    }
+  }
+
+  /**
    * Ensures sync() runs exactly once per missing (contractAddress, address)
    * pair, even under concurrent next() calls.
    *

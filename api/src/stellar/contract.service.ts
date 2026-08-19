@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import {
   rpc,
   TransactionBuilder,
@@ -12,6 +12,11 @@ import {
   xdr,
 } from '@stellar/stellar-sdk';
 import { StellarService } from './stellar.service';
+import { NonceService } from '../common/services/nonce.service';
+
+const POLL_INITIAL_INTERVAL_MS = 1_000;
+const POLL_MAX_INTERVAL_MS = 5_000;
+const TX_CONFIRM_TIMEOUT_MS = Number(process.env.TX_CONFIRM_TIMEOUT_MS) || 30_000;
 
 export interface ContractCallOptions {
   contractAddress: string;
@@ -29,8 +34,12 @@ export interface ContractCallResult {
 @Injectable()
 export class ContractService {
   private sorobanRpc: rpc.Server;
+  private readonly logger = new Logger(ContractService.name);
 
-  constructor(private readonly stellarService: StellarService) {
+  constructor(
+    private readonly stellarService: StellarService,
+    private readonly nonceService: NonceService,
+  ) {
     this.sorobanRpc = new rpc.Server(
       process.env.SOROBAN_RPC_URL || 'http://localhost:8000/soroban/rpc',
       { allowHttp: true },
@@ -124,19 +133,114 @@ export class ContractService {
         throw new BadRequestException(errorMessage);
       }
 
+      const hash = response.hash;
+
+      // Poll getTransaction until the transaction is included in a ledger
+      // or the timeout expires.  Without this confirmation step the nonce
+      // mirror in Redis can diverge from on-chain state: sendTransaction
+      // returns while the tx is still PENDING, the caller increments the
+      // nonce, and the next submission fails with InvalidNonce.
+      const retval = await this.pollTransactionConfirmation(hash, contractAddress, keypair, method);
+
       return {
-        result: simulation.result?.retval ?? xdr.ScVal.scvVoid(),
-        transactionHash: response.hash,
+        result: retval,
+        transactionHash: hash,
         successful: true,
       };
     } catch (error) {
-      if (error instanceof BadRequestException) {
+      if (error instanceof BadRequestException || error instanceof HttpException) {
         throw error;
       }
       throw new BadRequestException(
         `Failed to submit contract transaction: ${error.message}`,
       );
     }
+  }
+
+  /**
+   * Polls getTransaction with exponential backoff until the transaction
+   * is confirmed (SUCCESS or FAILED) or the timeout expires.
+   *
+   * On SUCCESS: extracts the return value from the transaction metadata.
+   * On FAILED: rolls back the Redis nonce and throws.
+   * On timeout: rolls back the Redis nonce and throws a 504 GatewayTimeout.
+   */
+  private async pollTransactionConfirmation(
+    hash: string,
+    contractAddress: string,
+    keypair: Keypair,
+    method: string,
+  ): Promise<xdr.ScVal> {
+    const address = keypair.publicKey();
+    const deadline = Date.now() + TX_CONFIRM_TIMEOUT_MS;
+    let interval = POLL_INITIAL_INTERVAL_MS;
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, interval));
+
+      let txStatus: rpc.Api.GetTransactionResponse;
+      try {
+        txStatus = await this.sorobanRpc.getTransaction(hash);
+      } catch (rpcError) {
+        this.logger.warn(
+          `pollTransactionConfirmation: getTransaction(${hash}) failed: ${rpcError?.message ?? rpcError}`,
+        );
+        interval = Math.min(interval * 2, POLL_MAX_INTERVAL_MS);
+        continue;
+      }
+
+      if (txStatus.status === 'SUCCESS') {
+        return this.extractReturnValue(txStatus);
+      }
+
+      if (txStatus.status === 'FAILED') {
+        await this.nonceService.rollback(contractAddress, address).catch((err) => {
+          this.logger.warn(
+            `pollTransactionConfirmation: nonce rollback failed after FAILED tx for ${address}: ${err?.message ?? err}`,
+          );
+        });
+        throw new BadRequestException(
+          `Contract error on ${contractAddress}.${method} (transaction ${hash} failed on-chain)`,
+        );
+      }
+
+      // NOT_FOUND — not yet included in a ledger; back off and retry.
+      interval = Math.min(interval * 2, POLL_MAX_INTERVAL_MS);
+    }
+
+    // Timed out — roll back the nonce so the caller can retry.
+    await this.nonceService.rollback(contractAddress, address).catch((err) => {
+      this.logger.warn(
+        `pollTransactionConfirmation: nonce rollback failed after timeout for ${address}: ${err?.message ?? err}`,
+      );
+    });
+    throw new HttpException(
+      `Transaction confirmation timed out after ${TX_CONFIRM_TIMEOUT_MS}ms (tx ${hash})`,
+      HttpStatus.GATEWAY_TIMEOUT,
+    );
+  }
+
+  /**
+   * Extracts the Soroban return value from a confirmed transaction's
+   * result metadata.  Falls back to scvVoid() when the meta does not
+   * contain a Soroban return value (e.g. non-Soroban transactions).
+   */
+  private extractReturnValue(txResponse: rpc.Api.GetTransactionResponse): xdr.ScVal {
+    try {
+      if (txResponse.status !== 'SUCCESS') {
+        return xdr.ScVal.scvVoid();
+      }
+      const meta = (txResponse as rpc.Api.GetSuccessfulTransactionResponse).resultMetaXdr;
+      const v3 = meta.v3();
+      const sorobanMeta = v3?.sorobanMeta();
+      const retval = sorobanMeta?.returnValue();
+      if (retval) {
+        return retval;
+      }
+    } catch {
+      // Meta extraction failed — fall through to void.
+    }
+    return xdr.ScVal.scvVoid();
   }
 
   encodeArg(value: unknown, type: string): xdr.ScVal {
