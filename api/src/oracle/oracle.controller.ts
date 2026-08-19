@@ -16,7 +16,6 @@ import {
   ProviderStatsWithHistory,
   OracleStalenessReport,
 } from './interfaces/oracle.interface';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
 
 @Controller('oracle')

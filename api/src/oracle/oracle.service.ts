@@ -1,4 +1,11 @@
-import { Injectable, BadRequestException, ConflictException, HttpException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  HttpException,
+  HttpStatus,
+} from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { toBytes32 } from '../stellar/bytes32';
 import { IpfsService } from '../projects/ipfs.service';

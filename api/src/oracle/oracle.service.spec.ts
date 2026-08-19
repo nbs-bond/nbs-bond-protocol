@@ -1,12 +1,23 @@
 import { Test } from '@nestjs/testing';
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  HttpStatus,
+} from '@nestjs/common';
 import { OracleService } from './oracle.service';
 import { ContractService } from '../stellar/contract.service';
 import { IpfsService } from '../projects/ipfs.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
 import { ReportStatus } from './interfaces/oracle.interface';
-import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+import {
+  xdr,
+  nativeToScVal,
+  scValToNative,
+  Address,
+  Keypair,
+} from '@stellar/stellar-sdk';
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -95,16 +106,19 @@ describe('OracleService', () => {
 
     it('signs with the configured investor key, never the admin key', async () => {
       process.env.ADMIN_SECRET_KEY = 'admin-secret-must-not-be-used';
+      try {
+        await service.challengeReport(7, dto, investorAddress);
 
-      await service.challengeReport(7, dto, investorAddress);
-
-      expect(contractService.invokeContractMethod).toHaveBeenCalledWith(
-        expect.any(String),
-        'challenge_report',
-        'test-investor-secret',
-        expect.any(Array),
-        0,
-      );
+        expect(contractService.invokeContractMethod).toHaveBeenCalledWith(
+          expect.any(String),
+          'challenge_report',
+          'test-investor-secret',
+          expect.any(Array),
+          0,
+        );
+      } finally {
+        delete process.env.ADMIN_SECRET_KEY;
+      }
     });
 
     it('rejects counter-evidence that is not CIDv0', async () => {
