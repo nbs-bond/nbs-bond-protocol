@@ -272,14 +272,30 @@ impl CreditRetirement {
             return Err(CreditError::PeriodNotDistributed);
         }
 
-        let retired_key = DataKey::RetiredPerBond(bond_id, holder.clone());
-        let already_retired: i128 = read(&env, &retired_key).unwrap_or(0);
-        let remaining = accrued
-            .checked_sub(already_retired)
-            .ok_or(CreditError::InsufficientCredits)?;
-        if amount > remaining {
+        if amount > accrued {
             return Err(CreditError::InsufficientCredits);
         }
+
+        // Atomically deduct from CouponEngine so retired credits cannot be
+        // claimed again via `claim_credits`.
+        let deducted = env.try_invoke_contract::<i128, BondError>(
+            &coupon_engine,
+            &Symbol::new(&env, "deduct_credits"),
+            vec![
+                &env,
+                bond_id.into_val(&env),
+                holder.clone().into_val(&env),
+                amount.into_val(&env),
+                credit_type.into_val(&env),
+            ],
+        );
+        match deducted {
+            Ok(Ok(_)) => {}
+            _ => return Err(CreditError::InsufficientCredits),
+        }
+
+        let retired_key = DataKey::RetiredPerBond(bond_id, holder.clone());
+        let already_retired: i128 = read(&env, &retired_key).unwrap_or(0);
         write(&env, &retired_key, &(already_retired + amount));
 
         let count: u64 = env
@@ -567,18 +583,20 @@ mod test {
             (admin.clone(), issuer_id.clone(), oracle_id.clone(), registry_id.clone()),
         );
         let ce_client = CouponEngineClient::new(&env, &ce_id);
-        ce_client.register_bond(&admin, &bond_id, &project_id, &0);
-
-        let holders = svec![&env, holder.clone()];
-        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
-        let accrued = ce_client.accrued_credits(&bond_id, &holder);
-        assert!(accrued > 0);
 
         let contract_id = env.register(
             CreditRetirement,
             (admin.clone(), issuer_id.clone(), ce_id.clone()),
         );
         let client = CreditRetirementClient::new(&env, &contract_id);
+
+        ce_client.register_deduct_caller(&admin, &contract_id, &0);
+        ce_client.register_bond(&admin, &bond_id, &project_id, &1);
+
+        let holders = svec![&env, holder.clone()];
+        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2);
+        let accrued = ce_client.accrued_credits(&bond_id, &holder);
+        assert!(accrued > 0);
 
         Setup {
             _env: env,
@@ -653,7 +671,7 @@ mod test {
             &s.project_id,
             &0u32,
             &second,
-            &CreditType::Biodiversity,
+            &CreditType::Carbon,
             &hash2,
             &1,
         );
@@ -827,21 +845,23 @@ mod test {
             (admin.clone(), issuer_id.clone(), oracle_id.clone(), registry_id.clone()),
         );
         let ce_client = CouponEngineClient::new(&env, &ce_id);
-        ce_client.register_bond(&admin, &bond_id, &project_id, &0);
+
+        let cr_id = env.register(
+            CreditRetirement,
+            (admin.clone(), issuer_id.clone(), ce_id.clone()),
+        );
+        let cr_client = CreditRetirementClient::new(&env, &cr_id);
+
+        ce_client.register_deduct_caller(&admin, &cr_id, &0);
+        ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
         let holders = svec![&env, holder1.clone(), holder2.clone()];
-        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
+        ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2);
 
         let accrued1 = ce_client.accrued_credits(&bond_id, &holder1);
         let accrued2 = ce_client.accrued_credits(&bond_id, &holder2);
         assert!(accrued1 > 0);
         assert!(accrued2 > 0);
-
-        let cr_id = env.register(
-            CreditRetirement,
-            (admin, issuer_id.clone(), ce_id.clone()),
-        );
-        let cr_client = CreditRetirementClient::new(&env, &cr_id);
 
         let hash1 = make_certificate_hash(&env, 1);
         cr_client.retire_credits(
@@ -862,7 +882,7 @@ mod test {
             &project_id,
             &0u32,
             &accrued2,
-            &CreditType::Biodiversity,
+            &CreditType::Carbon,
             &hash2,
             &0,
         );
@@ -1075,7 +1095,7 @@ mod test {
             &1u32,
             &svec![&s._env, s.holder.clone()],
             &report_id,
-            &2,
+            &3,
         );
 
         let hash = make_certificate_hash(&s._env, 1);
@@ -1161,5 +1181,58 @@ mod test {
         let s = setup();
         let result = s.client.try_extend_retirement_ttl(&404u64);
         assert_eq!(result, Err(Ok(CreditError::InsufficientCredits)));
+    }
+
+    #[test]
+    fn test_retire_then_claim_returns_zero() {
+        let s = setup();
+
+        let hash = make_certificate_hash(&s._env, 1);
+        s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &s.accrued,
+            &CreditType::Carbon,
+            &hash,
+            &0,
+        );
+
+        // CouponEngine balance must be zero after full retirement.
+        let remaining = s.ce_client.accrued_credits(&s.bond_id, &s.holder);
+        assert_eq!(remaining, 0);
+
+        // claim_credits must return 0 — no double-spend possible.
+        let claimed = s.ce_client.claim_credits(&s.holder, &s.bond_id, &0);
+        assert_eq!(claimed, 0);
+        assert_eq!(s.ce_client.accrued_credits(&s.bond_id, &s.holder), 0);
+    }
+
+    #[test]
+    fn test_partial_retire_then_claim_returns_remainder() {
+        let s = setup();
+        let half = s.accrued / 2;
+
+        let hash = make_certificate_hash(&s._env, 1);
+        s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &half,
+            &CreditType::Carbon,
+            &hash,
+            &0,
+        );
+
+        // CouponEngine balance must reflect the remaining credits.
+        let remaining = s.ce_client.accrued_credits(&s.bond_id, &s.holder);
+        assert_eq!(remaining, s.accrued - half);
+
+        // claim_credits must return only the unretired remainder.
+        let claimed = s.ce_client.claim_credits(&s.holder, &s.bond_id, &0);
+        assert_eq!(claimed, s.accrued - half);
+        assert_eq!(s.ce_client.accrued_credits(&s.bond_id, &s.holder), 0);
     }
 }

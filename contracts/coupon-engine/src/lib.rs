@@ -26,6 +26,7 @@ pub enum DataKey {
     OracleConsumerAddress,
     ProjectRegistryAddress,
     Nonce(Address),
+    DeductCaller,
 }
 
 #[derive(Clone)]
@@ -552,6 +553,94 @@ impl CouponEngine {
         );
 
         Ok(total)
+    }
+
+    pub fn register_deduct_caller(
+        env: Env,
+        caller: Address,
+        deduct_caller: Address,
+        nonce: u64,
+    ) -> Result<(), BondError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(BondError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DeductCaller, &deduct_caller);
+
+        Ok(())
+    }
+
+    pub fn deduct_credits(
+        env: Env,
+        bond_id: u64,
+        holder: Address,
+        amount: i128,
+        credit_type: CreditType,
+    ) -> Result<i128, BondError> {
+        let authorized: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeductCaller)
+            .ok_or(BondError::Unauthorized)?;
+        authorized.require_auth();
+
+        if amount <= 0 {
+            return Err(BondError::ZeroAmount);
+        }
+
+        let combined_key = DataKey::AccruedCredits(bond_id, holder.clone());
+        let combined: i128 = env
+            .storage()
+            .persistent()
+            .get(&combined_key)
+            .unwrap_or(0);
+        if amount > combined {
+            return Err(BondError::Overflow);
+        }
+
+        // BlueCarbon credits are accrued under Carbon, so resolve the storage
+        // key from the bond's registered credit type, not the caller-supplied
+        // retirement type.
+        let storage_type = match credit_type {
+            CreditType::BlueCarbon => CreditType::Carbon,
+            other => other,
+        };
+
+        let by_type_key = DataKey::AccruedCreditsByType(
+            bond_id,
+            holder.clone(),
+            storage_type,
+        );
+        let by_type: i128 = env
+            .storage()
+            .persistent()
+            .get(&by_type_key)
+            .unwrap_or(0);
+        if amount > by_type {
+            return Err(BondError::Overflow);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&combined_key, &(combined - amount));
+        env.storage()
+            .persistent()
+            .set(&by_type_key, &(by_type - amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "credits_deducted"),),
+            (bond_id, holder, amount, credit_type),
+        );
+
+        Ok(combined - amount)
     }
 }
 
