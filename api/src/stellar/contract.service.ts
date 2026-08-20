@@ -190,7 +190,7 @@ export class ContractService {
       }
 
       if (txStatus.status === 'SUCCESS') {
-        return this.extractReturnValue(txStatus);
+        return this.extractReturnValue(txStatus, contractAddress, method);
       }
 
       if (txStatus.status === 'FAILED') {
@@ -222,14 +222,23 @@ export class ContractService {
 
   /**
    * Extracts the Soroban return value from a confirmed transaction's
-   * result metadata.  Falls back to scvVoid() when the meta does not
-   * contain a Soroban return value (e.g. non-Soroban transactions).
+   * result metadata.  Returns scvVoid() when the meta does not contain a
+   * Soroban return value (e.g. a method that genuinely returns void, or a
+   * non-Soroban transaction).  If the metadata decoding itself fails
+   * (e.g. an SDK/ABI mismatch after a contract upgrade) a WARN is logged
+   * with the contract address and method so the failure is diagnosable
+   * rather than silently producing an empty response.
    */
-  private extractReturnValue(txResponse: rpc.Api.GetTransactionResponse): xdr.ScVal {
+  private extractReturnValue(
+    txResponse: rpc.Api.GetTransactionResponse,
+    contractAddress: string,
+    method: string,
+  ): xdr.ScVal {
+    if (txResponse.status !== 'SUCCESS') {
+      // Non-success / non-Soroban transaction: void is the expected result.
+      return xdr.ScVal.scvVoid();
+    }
     try {
-      if (txResponse.status !== 'SUCCESS') {
-        return xdr.ScVal.scvVoid();
-      }
       const meta = (txResponse as rpc.Api.GetSuccessfulTransactionResponse).resultMetaXdr;
       const v3 = meta.v3();
       const sorobanMeta = v3?.sorobanMeta();
@@ -237,10 +246,17 @@ export class ContractService {
       if (retval) {
         return retval;
       }
-    } catch {
-      // Meta extraction failed — fall through to void.
+      // No return value present in meta: the contract method returned void.
+      return xdr.ScVal.scvVoid();
+    } catch (error) {
+      this.logger.warn(
+        `extractReturnValue: failed to decode return value for ${contractAddress}.${method} ` +
+          `(possible SDK/ABI mismatch), falling back to scvVoid: ` +
+          `${error instanceof Error ? error.message : error}`,
+        { contractAddress, method, error },
+      );
+      return xdr.ScVal.scvVoid();
     }
-    return xdr.ScVal.scvVoid();
   }
 
   encodeArg(value: unknown, type: string): xdr.ScVal {
@@ -354,7 +370,13 @@ export class ContractService {
         }
         return Number(scError.contractCode());
       }
-    } catch {}
+    } catch (decodeError) {
+      this.logger.warn(
+        `extractContractErrorCode: failed to decode contract error code from diagnostic events: ` +
+          `${decodeError instanceof Error ? decodeError.message : decodeError}`,
+        { error, decodeError },
+      );
+    }
     return undefined;
   }
 
