@@ -70,6 +70,14 @@ export class MarketplaceController {
     return this.dexService.getQuoteBalance(address, query.asset ?? 'USDC');
   }
 
+  @Get('balance/:address')
+  async getQuoteBalanceByAddress(
+    @Param('address') address: string,
+    @Query() query: QuoteBalanceQueryDto,
+  ): Promise<QuoteBalanceResponse> {
+    return this.dexService.getQuoteBalance(address, query.asset ?? 'USDC');
+  }
+
   @Post('deposit')
   @HttpCode(HttpStatus.OK)
   async depositQuote(

@@ -378,11 +378,12 @@ describe('DexService', () => {
   describe('depositQuote', () => {
     const address = SELLER;
 
-    it('calls deposit_quote and returns a transaction response', async () => {
+    it('calls deposit_quote and returns the new balance', async () => {
       invokeContractMethodMock.mockResolvedValue({
         transactionHash: 'abc123',
         successful: true,
       });
+      simulateCallMock.mockResolvedValue(nativeToScVal(BigInt(11_000), { type: 'i128' }));
 
       await expect(
         service.depositQuote({ asset: 'USDC', amount: 1000 }, address),
@@ -390,6 +391,7 @@ describe('DexService', () => {
         address,
         asset: 'USDC',
         amount: 1000,
+        balance: 11000,
         transactionHash: 'abc123',
       });
 
@@ -410,11 +412,12 @@ describe('DexService', () => {
   describe('withdrawQuote', () => {
     const address = SELLER;
 
-    it('calls withdraw_quote and returns a transaction response', async () => {
+    it('calls withdraw_quote and returns the new balance', async () => {
       invokeContractMethodMock.mockResolvedValue({
         transactionHash: 'def456',
         successful: true,
       });
+      simulateCallMock.mockResolvedValue(nativeToScVal(BigInt(4_500), { type: 'i128' }));
 
       await expect(
         service.withdrawQuote({ asset: 'XLM', amount: 500 }, address),
@@ -422,6 +425,7 @@ describe('DexService', () => {
         address,
         asset: 'XLM',
         amount: 500,
+        balance: 4500,
         transactionHash: 'def456',
       });
 
@@ -591,6 +595,7 @@ describe('DexService', () => {
         transactionHash: 'abc123',
         successful: true,
       });
+      simulateCallMock.mockResolvedValue(nativeToScVal(BigInt(5000), { type: 'i128' }));
 
       await service.depositQuote({ asset: 'USDC', amount: 1000 }, SELLER);
 
@@ -609,6 +614,7 @@ describe('DexService', () => {
         transactionHash: 'def456',
         successful: true,
       });
+      simulateCallMock.mockResolvedValue(nativeToScVal(BigInt(3000), { type: 'i128' }));
 
       await service.withdrawQuote({ asset: 'XLM', amount: 500 }, SELLER);
 
@@ -640,6 +646,209 @@ describe('DexService', () => {
         expect.any(String),
         ADMIN_PUBLIC_KEY,
       );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Argument order regression — lock the exact ScVal arrays sent to DEXRouter
+  // ---------------------------------------------------------------------------
+
+  describe('argument order regression', () => {
+    /** Extract the args array (4th element) from the last invokeContractMethod call */
+    function getLastArgs(): any[] {
+      return invokeContractMethodMock.mock.calls[invokeContractMethodMock.mock.calls.length - 1][3];
+    }
+
+    it('execute_purchase sends [buyer, order_id, max_price, amount]', async () => {
+      jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
+      jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
+        address: SELLER,
+        asset: 'USDC',
+        balance: 10_000,
+      });
+      invokeContractMethodMock.mockResolvedValue({
+        result: nativeToScVal(true),
+        transactionHash: 'txhash',
+        successful: true,
+      });
+
+      const BUYER_ADDR = ADMIN_PUBLIC_KEY;
+      const dto = { orderId: 1, maxPrice: 15, amount: 50 };
+      await service.buyBondTokens(dto, BUYER_ADDR);
+
+      const args = getLastArgs();
+      expect(args).toHaveLength(4);
+
+      // args[0] = buyer (Address)
+      const buyerAddr = scValToNative(args[0]) as string;
+      expect(buyerAddr).toBe(BUYER_ADDR);
+
+      // args[1] = order_id (u64)
+      expect(scValToNative(args[1])).toBe(BigInt(1));
+
+      // args[2] = max_price (i128) — must come BEFORE amount
+      expect(scValToNative(args[2])).toBe(BigInt(15));
+
+      // args[3] = amount (i128)
+      expect(scValToNative(args[3])).toBe(BigInt(50));
+    });
+
+    it('deposit_quote sends [caller, quote_asset, amount]', async () => {
+      invokeContractMethodMock.mockResolvedValue({
+        transactionHash: 'abc123',
+        successful: true,
+      });
+      simulateCallMock.mockResolvedValue(nativeToScVal(BigInt(5000), { type: 'i128' }));
+
+      await service.depositQuote({ asset: 'USDC', amount: 2000 }, SELLER);
+
+      const args = getLastArgs();
+      expect(args).toHaveLength(3);
+
+      // args[0] = caller (Address)
+      const callerAddr = scValToNative(args[0]) as string;
+      expect(callerAddr).toBe(SELLER);
+
+      // args[1] = quote_asset (symbol)
+      expect(scValToNative(args[1])).toBe('USDC');
+
+      // args[2] = amount (i128)
+      expect(scValToNative(args[2])).toBe(BigInt(2000));
+    });
+
+    it('withdraw_quote sends [caller, quote_asset, amount]', async () => {
+      invokeContractMethodMock.mockResolvedValue({
+        transactionHash: 'def456',
+        successful: true,
+      });
+      simulateCallMock.mockResolvedValue(nativeToScVal(BigInt(3000), { type: 'i128' }));
+
+      await service.withdrawQuote({ asset: 'XLM', amount: 1500 }, SELLER);
+
+      const args = getLastArgs();
+      expect(args).toHaveLength(3);
+
+      // args[0] = caller (Address)
+      const callerAddr = scValToNative(args[0]) as string;
+      expect(callerAddr).toBe(SELLER);
+
+      // args[1] = quote_asset (symbol)
+      expect(scValToNative(args[1])).toBe('XLM');
+
+      // args[2] = amount (i128)
+      expect(scValToNative(args[2])).toBe(BigInt(1500));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Escrow cycle integration — deposit → list → buy → verify → withdraw
+  // ---------------------------------------------------------------------------
+
+  describe('escrow cycle integration', () => {
+    const BUYER = ADMIN_PUBLIC_KEY;
+
+    it('completes a full deposit → list → buy → verify balances → withdraw cycle', async () => {
+      // Spy on getQuoteBalance to control balance returns without touching simulateCallMock
+      const getBalanceSpy = jest.spyOn(service, 'getQuoteBalance');
+
+      // --- Step 1: Deposit 5000 USDC into escrow ---
+      invokeContractMethodMock.mockResolvedValue({
+        transactionHash: 'deposit-tx',
+        successful: true,
+      });
+      getBalanceSpy.mockResolvedValueOnce({ address: BUYER, asset: 'USDC', balance: 5000 });
+
+      const depositResult = await service.depositQuote(
+        { asset: 'USDC', amount: 5000 },
+        BUYER,
+      );
+      expect(depositResult.balance).toBe(5000);
+      expect(depositResult.transactionHash).toBe('deposit-tx');
+
+      // --- Step 2: Seller lists 100 bond tokens at 10 USDC each ---
+      invokeContractMethodMock.mockResolvedValue({
+        result: nativeToScVal(BigInt(1), { type: 'u64' }),
+        transactionHash: 'list-tx',
+        successful: true,
+      });
+      jest.spyOn(service, 'getOrder').mockResolvedValue({
+        ...STUB_ORDER,
+        id: 1,
+        seller: SELLER,
+        bondId: 1,
+        amount: 100,
+        pricePerToken: 10,
+        quoteAsset: 'USDC',
+        status: OrderStatus.Open,
+      });
+
+      const listResult = await service.listBondTokens(
+        { bondId: 1, amount: 100, pricePerToken: 10, quoteAsset: 'USDC' },
+        SELLER,
+      );
+      expect(listResult.id).toBe(1);
+
+      // --- Step 3: Buyer purchases 30 tokens → proceeds = 300 ---
+      jest.spyOn(service, 'getOrder').mockResolvedValue({
+        ...STUB_ORDER,
+        id: 1,
+        seller: SELLER,
+        bondId: 1,
+        amount: 100,
+        pricePerToken: 10,
+        quoteAsset: 'USDC',
+        status: OrderStatus.Open,
+      });
+
+      // Mock getQuoteBalance: buyer has 5000 USDC escrowed
+      getBalanceSpy.mockResolvedValueOnce({ address: BUYER, asset: 'USDC', balance: 5000 });
+
+      invokeContractMethodMock.mockResolvedValue({
+        result: nativeToScVal(true),
+        transactionHash: 'buy-tx',
+        successful: true,
+      });
+
+      const buyResult = await service.buyBondTokens(
+        { orderId: 1, amount: 30, maxPrice: 10 },
+        BUYER,
+      );
+      expect(buyResult.id).toBe(1);
+
+      // Verify execute_purchase was called with the correct method
+      expect(invokeContractMethodMock).toHaveBeenCalledWith(
+        expect.any(String),
+        'execute_purchase',
+        expect.any(String),
+        expect.any(Array),
+        0,
+      );
+
+      // --- Step 4: Verify buyer's balance decreased ---
+      getBalanceSpy.mockResolvedValueOnce({ address: BUYER, asset: 'USDC', balance: 4700 });
+
+      const buyerBalance = await service.getQuoteBalance(BUYER, 'USDC');
+      expect(buyerBalance.balance).toBe(4700);
+
+      // --- Step 5: Verify seller's balance increased ---
+      getBalanceSpy.mockResolvedValueOnce({ address: SELLER, asset: 'USDC', balance: 300 });
+
+      const sellerBalance = await service.getQuoteBalance(SELLER, 'USDC');
+      expect(sellerBalance.balance).toBe(300);
+
+      // --- Step 6: Seller withdraws 300 USDC proceeds ---
+      invokeContractMethodMock.mockResolvedValue({
+        transactionHash: 'withdraw-tx',
+        successful: true,
+      });
+      getBalanceSpy.mockResolvedValueOnce({ address: SELLER, asset: 'USDC', balance: 0 });
+
+      const withdrawResult = await service.withdrawQuote(
+        { asset: 'USDC', amount: 300 },
+        SELLER,
+      );
+      expect(withdrawResult.balance).toBe(0);
+      expect(withdrawResult.transactionHash).toBe('withdraw-tx');
     });
   });
 });

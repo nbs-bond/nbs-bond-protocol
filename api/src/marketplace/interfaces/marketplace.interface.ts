@@ -29,6 +29,7 @@ export interface QuoteTransactionResponse {
   address: string;
   asset: QuoteAsset;
   amount: number;
+  balance: number;
   transactionHash?: string;
 }
 

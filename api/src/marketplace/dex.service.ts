@@ -132,8 +132,8 @@ export class DexService {
     const escrowed = await this.getQuoteBalance(buyerAddress, order.quoteAsset);
     if (escrowed.balance < proceeds) {
       throw new BadRequestException(
-        `Insufficient escrowed ${order.quoteAsset}: required ${proceeds}, escrowed ${escrowed}. ` +
-        'Call POST /marketplace/escrow/deposit before purchasing.',
+        `Insufficient escrowed ${order.quoteAsset}: required ${proceeds}, escrowed ${escrowed.balance}. ` +
+        'Call POST /marketplace/deposit before purchasing.',
       );
     }
 
@@ -233,7 +233,9 @@ export class DexService {
       nonce,
     );
 
-    return { address: callerAddress, asset: dto.asset, amount: dto.amount, transactionHash };
+    const { balance } = await this.getQuoteBalance(callerAddress, dto.asset);
+
+    return { address: callerAddress, asset: dto.asset, amount: dto.amount, balance, transactionHash };
   }
 
   async withdrawQuote(
@@ -254,7 +256,9 @@ export class DexService {
       nonce,
     );
 
-    return { address: callerAddress, asset: dto.asset, amount: dto.amount, transactionHash };
+    const { balance } = await this.getQuoteBalance(callerAddress, dto.asset);
+
+    return { address: callerAddress, asset: dto.asset, amount: dto.amount, balance, transactionHash };
   }
 
   private decodeOrder(data: any[]): OrderResponse {
@@ -297,7 +301,7 @@ export class DexService {
 
     if (code === DEX_ERROR_CODE.InsufficientFunds) {
       return new HttpException(
-        'Insufficient escrowed funds. Call POST /marketplace/escrow/deposit before purchasing.',
+        'Insufficient escrowed funds. Call POST /marketplace/deposit before purchasing.',
         HttpStatus.PAYMENT_REQUIRED,
       );
     }
