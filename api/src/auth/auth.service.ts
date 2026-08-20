@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, UnauthorizedException } from '@nestjs/common';
+import { Injectable, BadRequestException, UnauthorizedException, Logger, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { createClient, RedisClientType } from '@redis/client';
 import { Keypair } from '@stellar/stellar-sdk';
@@ -9,7 +9,8 @@ import { VerifySignatureDto } from './dto/verify-signature.dto';
 import { ChallengeResponse, AuthTokenResponse, UserProfileResponse } from './interfaces/auth.interface';
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleDestroy {
+  private readonly logger = new Logger(AuthService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -78,5 +79,23 @@ export class AuthService {
       kycStatus,
       createdAt: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Gracefully close the Redis connection when the NestJS module is torn down.
+   * Called automatically by NestJS when app.enableShutdownHooks() is active
+   * and the process receives SIGTERM/SIGINT.
+   */
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isOpen) {
+        await this.redis.quit();
+        this.logger.log('AuthService: Redis connection closed gracefully');
+      }
+    } catch (error) {
+      this.logger.warn(
+        `AuthService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }
