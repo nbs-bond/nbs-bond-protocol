@@ -1,5 +1,6 @@
 import { Injectable, inject, signal, computed } from '@angular/core';
 import { BROWSER_WINDOW, FREIGHTER_API, FreighterApiError } from './freighter.tokens';
+import { environment } from '../../environments/environment';
 
 export type WalletErrorKind =
   /** No Freighter extension in this browser — the user needs an install prompt. */
@@ -87,7 +88,7 @@ export class WalletService {
       const { signedTxXdr, error } = await this.guard(
         () =>
           this.freighter.signTransaction(challenge, {
-            networkPassphrase: 'Test SDF Network ; September 2015',
+            networkPassphrase: environment.networkPassphrase,
           }),
         'Freighter could not sign the challenge.',
       );
