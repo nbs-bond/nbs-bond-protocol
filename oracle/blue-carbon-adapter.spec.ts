@@ -130,4 +130,50 @@ describe('aggregateBlueCarbonProject', () => {
       ),
     ).rejects.toThrow();
   });
+
+  it('throws BlueCarbonSchemaError when root_shoot_ratio is missing', async () => {
+    const http = new MockHttpClient([{ status: 200, data: { surveys: SURVEYS } }]);
+    const { root_shoot_ratio: _, ...projectWithoutRatio } = PROJECT;
+    await expect(
+      aggregateBlueCarbonProject(
+        projectWithoutRatio as any,
+        PERIOD,
+        { baseUrl: BASE_URL, http },
+      ),
+    ).rejects.toBeInstanceOf(BlueCarbonSchemaError);
+  });
+
+  it('calculates belowground biomass using the configured root_shoot_ratio', () => {
+    const surveys = [
+      {
+        survey_id: 'S1',
+        survey_date: '2025-02-10',
+        habitat: 'mangrove' as const,
+        plot_area_ha: 1.0,
+        aboveground_biomass_t_per_ha: 100,
+        belowground_biomass_t_per_ha: 50,
+        soil_organic_carbon_t_per_ha: 200,
+      },
+    ];
+    const ratio = 0.75;
+    const stock = meanCarbonStockTonnesPerHa(surveys, ratio);
+    const expected = 100 + 100 * ratio + 50 + 200;
+    expect(stock).toBeCloseTo(expected);
+  });
+
+  it('does not silently produce zero belowground biomass when ratio is omitted', async () => {
+    const http = new MockHttpClient([{ status: 200, data: { surveys: SURVEYS } }]);
+    const { root_shoot_ratio: _, ...projectWithoutRatio } = PROJECT;
+    let threw = false;
+    try {
+      await aggregateBlueCarbonProject(
+        projectWithoutRatio as any,
+        PERIOD,
+        { baseUrl: BASE_URL, http },
+      );
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+  });
 });

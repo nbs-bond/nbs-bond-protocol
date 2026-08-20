@@ -129,7 +129,7 @@ export const BlueCarbonProjectConfigSchema = z.object({
   habitat: z.enum(['mangrove', 'seagrass', 'saltmarsh']),
   area_ha: z.number().positive(),
   baseline_carbon_t_per_ha: z.number().nonnegative(),
-  root_shoot_ratio: z.number().positive().default(1.0),
+  root_shoot_ratio: z.number().positive(),
 });
 export type BlueCarbonProjectConfig = z.infer<typeof BlueCarbonProjectConfigSchema>;
 
