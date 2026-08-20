@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(deprecated)]
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Val, Vec};
-use nbbs_shared::GovernanceError;
+use nbbs_shared::{GovernanceError, VoteChoice};
 
 pub const DEFAULT_TIMELOCK_SECONDS: u64 = 172_800;
 pub const DEFAULT_PROPOSAL_TTL_SECONDS: u64 = 2_592_000;
@@ -197,10 +197,20 @@ impl Governance {
         }
 
         let vote_key = DataKey::Vote(proposal_id, caller.clone());
-        if env.storage().instance().get::<_, bool>(&vote_key).unwrap_or(false) {
+        // Guard checks presence of ANY prior choice, not a specific value —
+        // this is what fixes the veto-bypass bug (#121): a stored `Veto` is
+        // just as "already voted" as a stored `Approve`.
+        if env
+            .storage()
+            .instance()
+            .get::<_, VoteChoice>(&vote_key)
+            .is_some()
+        {
             return Err(GovernanceError::AlreadyVoted);
         }
-        env.storage().instance().set(&vote_key, &true);
+        env.storage()
+            .instance()
+            .set(&vote_key, &VoteChoice::Approve);
 
         let threshold: u32 = env
             .storage()
@@ -246,10 +256,19 @@ impl Governance {
         }
 
         let vote_key = DataKey::Vote(proposal_id, caller.clone());
-        if env.storage().instance().get::<_, bool>(&vote_key).unwrap_or(false) {
+        // Same presence check as vote_approve — this is the line that was
+        // broken before: reading with `.unwrap_or(false)` against a key that
+        // this function itself writes `false` into meant a veto vote could
+        // never trip its own "already voted" guard.
+        if env
+            .storage()
+            .instance()
+            .get::<_, VoteChoice>(&vote_key)
+            .is_some()
+        {
             return Err(GovernanceError::AlreadyVoted);
         }
-        env.storage().instance().set(&vote_key, &false);
+        env.storage().instance().set(&vote_key, &VoteChoice::Veto);
 
         let threshold: u32 = env
             .storage()
@@ -368,11 +387,21 @@ impl Governance {
             .ok_or(GovernanceError::ProposalNotFound)
     }
 
-    pub fn get_vote(env: Env, proposal_id: u64, signer: Address) -> bool {
+    /// Returns the signer's recorded choice on `proposal_id`, or `None` if
+    /// the signer has not voted. Distinguishes an explicit veto from a
+    /// never-voted state (issue #121) — before this fix, both returned
+    /// `false` because the storage value doubled as the vote's boolean
+    /// meaning and its presence flag.
+    ///
+    /// # Breaking change
+    ///
+    /// This is a breaking ABI change: the function previously returned
+    /// `bool`. Any off-chain consumer reading `get_vote` must be updated to
+    /// handle `Option<VoteChoice>` instead of `bool`.
+    pub fn get_vote(env: Env, proposal_id: u64, signer: Address) -> Option<VoteChoice> {
         env.storage()
             .instance()
             .get(&DataKey::Vote(proposal_id, signer))
-            .unwrap_or(false)
     }
 
     pub fn proposal_count(env: Env) -> u64 {
@@ -951,5 +980,79 @@ mod test {
         // The bond must now be in Matured status — arguments arrived uncorrupted.
         let state = issuer.get_bond_state(&bond_id);
         assert_eq!(state.status, nbbs_shared::BondStatus::Matured);
+    }
+
+    #[test]
+    fn test_get_vote_distinguishes_approve_veto_and_never_voted() {
+        let (env, client, signers) = setup();
+        let target = make_target(&env);
+        let signer_a = signers.get(1).unwrap();
+        let signer_b = signers.get(2).unwrap();
+
+        // Two distinct proposals, both proposed by signer 0.
+        let proposal_1 = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        let proposal_2 = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &1,
+        );
+
+        // Signer A vetoes proposal 1 and approves proposal 2.
+        client.vote_veto(&signer_a, &proposal_1, &0);
+        client.vote_approve(&signer_a, &proposal_2, &1);
+
+        // Assertion central del acceptance criteria: get_vote distingue los
+        // tres estados observables.
+        assert_eq!(
+            client.get_vote(&proposal_1, &signer_a),
+            Some(VoteChoice::Veto)
+        );
+        assert_eq!(
+            client.get_vote(&proposal_2, &signer_a),
+            Some(VoteChoice::Approve)
+        );
+        // Signer B never voted on either proposal.
+        assert_eq!(client.get_vote(&proposal_1, &signer_b), None);
+        assert_eq!(client.get_vote(&proposal_2, &signer_b), None);
+    }
+
+    #[test]
+    fn test_vote_veto_cannot_be_cast_twice_by_same_signer() {
+        // Regression for the bypass bug that motivated this fix: before it,
+        // `vote_veto`'s own `AlreadyVoted` guard read the same storage key
+        // with `.unwrap_or(false)` that the function itself overwrites with
+        // `false`, so a repeated veto from the same signer never tripped the
+        // guard, letting one signer inflate veto_count on their own.
+        let (env, client, signers) = setup();
+        let target = make_target(&env);
+        let signer_a = signers.get(1).unwrap();
+
+        let proposal_1 = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        client.vote_veto(&signer_a, &proposal_1, &0);
+
+        // Second veto attempt from the same signer must fail.
+        let result = client.try_vote_veto(&signer_a, &proposal_1, &1);
+        assert_eq!(result, Err(Ok(GovernanceError::AlreadyVoted)));
+
+        // veto_count must not have been inflated by the rejected second call.
+        assert_eq!(client.get_proposal(&proposal_1).veto_count, 1);
     }
 }

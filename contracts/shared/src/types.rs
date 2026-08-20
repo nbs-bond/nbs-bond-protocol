@@ -74,3 +74,19 @@ pub enum ReportStatus {
     Challenged,
     Rejected,
 }
+
+/// A signer's recorded position on a governance proposal.
+///
+/// `Approve` and `Veto` are the only two states a signer can actively
+/// record — the absence of any stored value (returned as `None` by
+/// [`get_vote`](../../../governance/src/lib.rs)) means the signer has never
+/// voted on this proposal. Distinguishing the three states matters both for
+/// the public dashboard (issue #121) and for the internal `AlreadyVoted`
+/// guard, which must check for the presence of *any* recorded choice, not
+/// for a specific value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[contracttype]
+pub enum VoteChoice {
+    Approve,
+    Veto,
+}
