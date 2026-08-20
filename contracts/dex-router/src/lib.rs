@@ -518,24 +518,66 @@ impl DEXRouter {
             .get(&DataKey::OrderCount)
             .unwrap_or(0);
 
+        if count == 0 {
+            return Ok(0);
+        }
+
+        Self::clean_expired_orders_range_impl(&env, 1, count)
+    }
+
+    pub fn clean_expired_orders_range(
+        env: Env,
+        caller: Address,
+        nonce: u64,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<u32, DEXError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(DEXError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OrderCount)
+            .unwrap_or(0);
+
+        if start_id < 1 || end_id > count || start_id > end_id {
+            return Err(DEXError::InvalidRange);
+        }
+
+        Self::clean_expired_orders_range_impl(&env, start_id, end_id)
+    }
+
+    fn clean_expired_orders_range_impl(
+        env: &Env,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<u32, DEXError> {
         let mut cleaned: u32 = 0;
-        for id in 1..=count {
+        for id in start_id..=end_id {
             let key = DataKey::Order(id);
             if let Some(mut order) = env.storage().persistent().get::<DataKey, Order>(&key) {
                 if (order.status == OrderStatus::Open
                     || order.status == OrderStatus::PartiallyFilled)
-                    && is_order_expired(&env, &order)
+                    && is_order_expired(env, &order)
                 {
                     order.status = OrderStatus::Expired;
                     env.storage().persistent().set(&key, &order);
-                    bump_persistent(&env, &key);
+                    bump_persistent(env, &key);
                     cleaned += 1;
                 }
             }
         }
 
         env.events().publish(
-            (Symbol::new(&env, "expired_orders_cleaned"),),
+            (Symbol::new(env, "expired_orders_cleaned"),),
             (cleaned,),
         );
 
@@ -1187,6 +1229,176 @@ mod test {
             &0,
         );
         assert_eq!(result, Err(Ok(DEXError::OrderAlreadyFilled)));
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_basic() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        // order 1: expires in 100s (will be expired at t=1_000_200)
+        let order1_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &0,
+        );
+        // order 2: expires in 10_000s (not expired)
+        let order2_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &500i128,
+            &200i128,
+            &Symbol::new(&env, "XLM"),
+            &10_000u64,
+            &1,
+        );
+        // order 3: expires in 100s (will be expired at t=1_000_200)
+        let order3_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &300i128,
+            &50i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &2,
+        );
+
+        env.ledger().set_timestamp(1_000_200);
+
+        // Only clean orders 2..=3 — order 1 should remain open
+        let cleaned = client.clean_expired_orders_range(&admin, &0, &2, &3);
+        assert_eq!(cleaned, 1); // only order 3
+
+        assert_eq!(client.get_order(&order1_id).status, OrderStatus::Open);
+        assert_eq!(client.get_order(&order2_id).status, OrderStatus::Open);
+        assert_eq!(client.get_order(&order3_id).status, OrderStatus::Expired);
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &0,
+        );
+
+        env.ledger().set_timestamp(1_000_200);
+
+        let cleaned1 = client.clean_expired_orders_range(&admin, &0, &1, &1);
+        assert_eq!(cleaned1, 1);
+
+        // Second call on same range — already expired, should clean 0
+        let cleaned2 = client.clean_expired_orders_range(&admin, &1, &1, &1);
+        assert_eq!(cleaned2, 0);
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_invalid() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, _bond_id, _seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        // start_id < 1
+        let r = client.try_clean_expired_orders_range(&admin, &0, &0, &5);
+        assert_eq!(r, Err(Ok(DEXError::InvalidRange)));
+
+        // end_id > order_count (count is 0)
+        let r = client.try_clean_expired_orders_range(&admin, &0, &1, &5);
+        assert_eq!(r, Err(Ok(DEXError::InvalidRange)));
+
+        // start_id > end_id
+        let r = client.try_clean_expired_orders_range(&admin, &0, &5, &3);
+        assert_eq!(r, Err(Ok(DEXError::InvalidRange)));
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_gaps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        // Create 3 orders
+        let order1 = client.list_bond_tokens(
+            &seller, &bond_id, &1_000i128, &100i128,
+            &Symbol::new(&env, "USDC"), &100u64, &0,
+        );
+        client.list_bond_tokens(
+            &seller, &bond_id, &500i128, &200i128,
+            &Symbol::new(&env, "XLM"), &10_000u64, &1,
+        );
+        let order3 = client.list_bond_tokens(
+            &seller, &bond_id, &300i128, &50i128,
+            &Symbol::new(&env, "USDC"), &100u64, &2,
+        );
+
+        // Cancel order 2 to create a gap
+        client.cancel_listing(&seller, &2, &3);
+
+        env.ledger().set_timestamp(1_000_200);
+
+        // Sweep range 1..=3 — order 2 is Cancelled so skipped gracefully
+        let cleaned = client.clean_expired_orders_range(&admin, &0, &1, &3);
+        assert_eq!(cleaned, 2); // orders 1 and 3 are expired and open
+
+        assert_eq!(client.get_order(&order1).status, OrderStatus::Expired);
+        assert_eq!(client.get_order(&order3).status, OrderStatus::Expired);
     }
 
     #[test]
