@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
@@ -51,6 +51,7 @@ const BOND_ERROR_CODE = {
 
 @Injectable()
 export class BondsService {
+  private readonly logger = new Logger(BondsService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -99,14 +100,25 @@ export class BondsService {
 
     const start = (page - 1) * limit;
 
-    const idsScVal = await this.contractService.simulateCall({
-      contractAddress: BOND_ISSUER(), method: 'get_bond_ids_range',
-      args: [
-        nativeToScVal(start, { type: 'u32' }),
-        nativeToScVal(limit, { type: 'u32' }),
-      ],
-    });
-    const ids = (scValToNative(idsScVal) as bigint[]).map(Number);
+    let ids: number[];
+    try {
+      const idsScVal = await this.contractService.simulateCall({
+        contractAddress: BOND_ISSUER(), method: 'get_bond_ids_range',
+        args: [
+          nativeToScVal(start, { type: 'u32' }),
+          nativeToScVal(limit, { type: 'u32' }),
+        ],
+      });
+      ids = (scValToNative(idsScVal) as bigint[]).map(Number);
+    } catch (error) {
+      this.logger.warn(`Failed to fetch bond IDs for page ${page}: ${error instanceof Error ? error.message : error}`);
+      const stale = await this.redis.get(cacheKey);
+      if (stale) return JSON.parse(stale);
+      return {
+        data: [],
+        meta: { page, limit, total, totalPages: Math.ceil(total / limit) || 1 },
+      };
+    }
 
     for (const id of ids) {
       try {

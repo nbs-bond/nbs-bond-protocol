@@ -502,6 +502,91 @@ describe('BondsService', () => {
         totalPages: 2,
       });
     });
+
+    it('returns empty list when get_bond_ids_range RPC fails', async () => {
+      const contractService = {
+        simulateCall: jest.fn(({ method }: { method: string }) => {
+          if (method === 'bond_count') {
+            return Promise.resolve(nativeToScVal(BigInt(5), { type: 'u64' }));
+          }
+          if (method === 'get_bond_ids_range') {
+            return Promise.reject(new Error('RPC node unreachable'));
+          }
+          return Promise.resolve(
+            nativeToScVal(BigInt(0), { type: 'u64' }),
+          );
+        }),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      const result = await svc.findAll(1, 20);
+
+      expect(result.data).toEqual([]);
+      expect(result.meta).toEqual({
+        page: 1,
+        limit: 20,
+        total: 5,
+        totalPages: 1,
+      });
+    });
+
+    it('returns stale cache when get_bond_ids_range RPC fails', async () => {
+      const cachedResult = {
+        data: [{ id: 1 }],
+        meta: { page: 1, limit: 20, total: 1, totalPages: 1 },
+      };
+
+      const redisMock = createClient() as unknown as { get: jest.Mock };
+      redisMock.get.mockImplementation((key: string) => {
+        if (key === 'bonds:1:20') return Promise.resolve(JSON.stringify(cachedResult));
+        return Promise.resolve(null);
+      });
+
+      const contractService = {
+        simulateCall: jest.fn(({ method }: { method: string }) => {
+          if (method === 'bond_count') {
+            return Promise.resolve(nativeToScVal(BigInt(1), { type: 'u64' }));
+          }
+          if (method === 'get_bond_ids_range') {
+            return Promise.reject(new Error('RPC node unreachable'));
+          }
+          return Promise.resolve(
+            nativeToScVal(BigInt(0), { type: 'u64' }),
+          );
+        }),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      const result = await svc.findAll(1, 20);
+
+      expect(result).toEqual(cachedResult);
+    });
   });
 
   describe('buildBondResponse', () => {
