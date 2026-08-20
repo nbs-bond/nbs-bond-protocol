@@ -1862,7 +1862,7 @@ mod test {
             env: Env,
             admin: Address,
             balances: &[i128],
-        ) -> (TestEnv, std::vec::Vec<Address>, u64, i128) {
+        ) -> (TestEnv, std::vec::Vec<Address>, u64, i128, BytesN<32>) {
             let t = deploy(env, admin);
             let project_id = setup_project(&t._env, &t, 7);
             let total_subscribed: i128 = balances.iter().sum();
@@ -1881,7 +1881,7 @@ mod test {
             }
 
             t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
-            (t, holders, bond_id, total_subscribed)
+            (t, holders, bond_id, total_subscribed, project_id)
         }
 
         fn setup_with_balances(
@@ -1890,9 +1890,8 @@ mod test {
             balances: &[i128],
             carbon: i128,
         ) -> (TestEnv, std::vec::Vec<Address>, u64, i128, u64) {
-            let (t, holders, bond_id, total_subscribed) =
+            let (t, holders, bond_id, total_subscribed, project_id) =
                 deploy_with_holders(env, admin, balances);
-            let project_id = setup_project(&t._env, &t, 7);
             let report_id = submit_verified_report(&t._env, &t, &project_id, carbon, BiodiversityMetrics::Absent, 0);
             (t, holders, bond_id, total_subscribed, report_id)
         }
@@ -1999,7 +1998,7 @@ mod test {
                 env.mock_all_auths();
 
                 let admin = Address::generate(&env);
-                let (t, holders, bond_id, total_subscribed) =
+                let (t, holders, bond_id, total_subscribed, project_id) =
                     deploy_with_holders(env, admin.clone(), &balances);
 
                 let mut holders_vec: Vec<(Address, i128)> = Vec::new(&t._env);
@@ -2012,7 +2011,7 @@ mod test {
                     let report_id = submit_verified_report(
                         &t._env,
                         &t,
-                        &setup_project(&t._env, &t, 7),
+                        &project_id,
                         carbon,
                         BiodiversityMetrics::Absent,
                         (period as u64) * 2,
