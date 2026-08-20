@@ -275,4 +275,58 @@ describe('StellarService — payment stream', () => {
       expect(service.isPaymentStreamActive()).toBe(true);
     });
   });
+
+  // ── Account & Helper Utilities ──────────────────────────────────────────
+
+  describe('account & utility methods', () => {
+    it('getAccount fetches account from horizon server and caches result', async () => {
+      const account = await service.getAccount('GBKEY');
+      expect(account).toEqual({
+        sequence: '0',
+        balances: [{ asset_type: 'native', balance: '100' }],
+      });
+
+      // Second call should return cached object without invoking horizon again
+      const cachedAccount = await service.getAccount('GBKEY');
+      expect(cachedAccount).toBe(account);
+    });
+
+    it('getAccount throws HttpException if horizon fails to load account', async () => {
+      (service['horizon'].loadAccount as jest.Mock).mockRejectedValueOnce(new Error('Account not found'));
+      await expect(service.getAccount('GNOTFOUND')).rejects.toThrow('Failed to load account GNOTFOUND');
+    });
+
+    it('getBalance returns native balance of account', async () => {
+      const balance = await service.getBalance('GBKEY');
+      expect(balance).toBe('100');
+    });
+
+    it('getBalances returns array of balances', async () => {
+      const balances = await service.getBalances('GBKEY');
+      expect(balances).toEqual([{ asset_type: 'native', balance: '100' }]);
+    });
+
+    it('generateKeypair returns a valid Stellar keypair', () => {
+      const pair = service.generateKeypair();
+      expect(service.isValidPublicKey(pair.publicKey)).toBe(true);
+      expect(pair.secretKey.startsWith('S')).toBe(true);
+    });
+
+    it('isValidPublicKey identifies valid and invalid public keys', () => {
+      const pair = service.generateKeypair();
+      expect(service.isValidPublicKey(pair.publicKey)).toBe(true);
+      expect(service.isValidPublicKey('INVALID')).toBe(false);
+    });
+
+    it('getNetworkPassphrase returns configured network passphrase', () => {
+      expect(typeof service.getNetworkPassphrase()).toBe('string');
+    });
+
+    it('accountExists returns true if account is found and false otherwise', async () => {
+      expect(await service.accountExists('GBKEY')).toBe(true);
+      (service['horizon'].loadAccount as jest.Mock).mockRejectedValueOnce(new Error('Not found'));
+      expect(await service.accountExists('GNOTFOUND')).toBe(false);
+    });
+  });
 });
+

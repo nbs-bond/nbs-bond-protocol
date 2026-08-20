@@ -22,5 +22,12 @@ export const routes: Routes = [
     path: 'auth',
     loadChildren: () => import('./auth/auth.routes'),
   },
-  { path: '**', redirectTo: '/dashboard' },
+  {
+    path: 'not-found',
+    loadComponent: () => import('./not-found/not-found.component').then(m => m.NotFoundComponent),
+  },
+  {
+    path: '**',
+    loadComponent: () => import('./not-found/not-found.component').then(m => m.NotFoundComponent),
+  },
 ];
