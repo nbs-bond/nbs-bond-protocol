@@ -126,6 +126,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -242,6 +243,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -275,6 +277,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -349,6 +352,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 7),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "blue_carbon"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -456,6 +460,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -540,6 +545,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -761,6 +767,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -823,6 +830,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -889,6 +897,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -956,6 +965,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1027,6 +1037,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1075,6 +1086,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1130,6 +1142,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1200,6 +1213,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1243,6 +1257,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1316,6 +1331,7 @@ mod integration {
             contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1324,6 +1340,7 @@ mod integration {
             let result = contracts.pr_client.try_register_project(
                 &alice,
                 &make_ipfs_hash(&env, 2),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "GS"),
                 &Symbol::new(&env, "BR"),
                 &0,
@@ -1333,6 +1350,7 @@ mod integration {
             let id = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 2),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "GS"),
                 &Symbol::new(&env, "BR"),
                 &1,
@@ -1356,6 +1374,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1399,6 +1418,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &0,
@@ -1435,6 +1455,7 @@ mod integration {
             let pid = contracts.pr_client.register_project(
                 alice,
                 &make_ipfs_hash(env, 1),
+                &Symbol::new(env, "Project"),
                 &Symbol::new(env, "VCS"),
                 &Symbol::new(env, "US"),
                 &0,
@@ -1550,6 +1571,7 @@ mod integration {
                 let pid = contracts.pr_client.register_project(
                     &alice,
                     &make_ipfs_hash(&env, 1),
+                    &Symbol::new(&env, "Project"),
                     &Symbol::new(&env, "VCS"),
                     &Symbol::new(&env, "US"),
                     &0,
@@ -1644,6 +1666,7 @@ mod integration {
                 let pid = contracts.pr_client.register_project(
                     &alice,
                     &make_ipfs_hash(&env, 1),
+                    &Symbol::new(&env, "Project"),
                     &Symbol::new(&env, "VCS"),
                     &Symbol::new(&env, "US"),
                     &0,

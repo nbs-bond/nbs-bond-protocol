@@ -132,7 +132,8 @@ async function main() {
   } else {
     console.log('\n📋 Registering project...');
     await invoke(admin, PROJECT_REGISTRY_ID, 'register_project', [
-      address(admin.publicKey()), projectHash, symbol(METHODOLOGY), symbol('BR'), u64(0),
+      address(admin.publicKey()), projectHash, symbol('Amazon_Corridor'), symbol(METHODOLOGY),
+      symbol('BR'), u64(0),
     ]);
 
     const now = Math.floor(Date.now() / 1000);
