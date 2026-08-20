@@ -10,6 +10,7 @@ import {
   UndistributedTotalResponse, AccruedCreditsResponse, SweepUndistributedResponse,
   QuoteBalanceResponse, QuoteTransactionResponse,
   QuoteAsset, DepositQuoteDto, WithdrawQuoteDto,
+  HolderListResponse,
 } from '../interfaces/bond.interface';
 
 @Injectable({ providedIn: 'root' })
@@ -68,6 +69,13 @@ export class ApiService {
     return this.http.post<TransferResponse>(
       `/api/bonds/${id}/transfer`,
       { fromAddress, toAddress, amount },
+      { headers: this.headers() },
+    );
+  }
+
+  getHolders(id: number): Observable<HolderListResponse> {
+    return this.http.get<HolderListResponse>(
+      `/api/bonds/${id}/holders`,
       { headers: this.headers() },
     );
   }

@@ -101,13 +101,26 @@ import { environment } from '../../../environments/environment';
                     id="amount"
                     type="number"
                     class="form-input"
+                    [class.input-error]="subscribeAmount > remainingSupply()"
                     [(ngModel)]="subscribeAmount"
                     placeholder="Enter amount"
                     min="1"
+                    [max]="remainingSupply()"
                   />
+                  <span class="supply-hint">
+                    {{ remainingSupply() | number }} tokens remaining
+                  </span>
+                  @if (subscribeAmount > remainingSupply()) {
+                    <div class="error-msg">
+                      Amount exceeds remaining supply. Maximum available: {{ remainingSupply() | number }}.
+                    </div>
+                  }
+                  @if (remainingSupply() === 0) {
+                    <div class="error-msg">This bond is fully subscribed. No tokens are available.</div>
+                  }
                   <button
                     class="btn btn-primary subscribe-btn"
-                    [disabled]="!subscribeAmount || subscribeAmount < 1 || subscribeSubmitting()"
+                    [disabled]="!subscribeAmount || subscribeAmount < 1 || subscribeAmount > remainingSupply() || remainingSupply() === 0 || subscribeSubmitting()"
                     (click)="onSubscribe()"
                   >
                     {{ subscribeSubmitting() ? 'Subscribing...' : 'Subscribe' }}
@@ -187,13 +200,26 @@ import { environment } from '../../../environments/environment';
                     id="transferAmount"
                     type="number"
                     class="form-input"
+                    [class.input-error]="transferAmount > holderBalance()"
                     [(ngModel)]="transferAmount"
                     placeholder="Enter amount"
                     min="1"
+                    [max]="holderBalance()"
                   />
+                  <span class="supply-hint">
+                    Your balance: {{ holderBalance() | number }} tokens
+                  </span>
+                  @if (transferAmount > holderBalance()) {
+                    <div class="error-msg">
+                      Amount exceeds your balance. Maximum transferable: {{ holderBalance() | number }}.
+                    </div>
+                  }
+                  @if (holderBalance() === 0) {
+                    <div class="error-msg">You have no tokens to transfer for this bond.</div>
+                  }
                   <button
                     class="btn btn-primary transfer-btn"
-                    [disabled]="!transferTo || !transferAmount || transferAmount < 1 || transferSubmitting()"
+                    [disabled]="!transferTo || !transferAmount || transferAmount < 1 || transferAmount > holderBalance() || holderBalance() === 0 || transferSubmitting()"
                     (click)="onTransfer()"
                   >
                     {{ transferSubmitting() ? 'Transferring...' : 'Transfer' }}
@@ -284,6 +310,8 @@ import { environment } from '../../../environments/environment';
     .form-label { font-size: 0.8125rem; font-weight: 600; color: #1a1a2e; }
     .form-input { padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 0.875rem; outline: none; }
     .form-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.15); }
+    .form-input.input-error { border-color: #ef4444; box-shadow: 0 0 0 2px rgba(239,68,68,0.15); }
+    .supply-hint { font-size: 0.75rem; color: #6b7280; }
     .status-notice { font-size: 0.8125rem; color: #6b7280; padding: 8px 0; }
     .btn { padding: 10px 20px; border-radius: 8px; font-size: 0.875rem; font-weight: 500; cursor: pointer; border: none; text-decoration: none; display: inline-block; text-align: center; }
     .btn-primary { background: #1a1a2e; color: #fff; }
@@ -301,6 +329,8 @@ import { environment } from '../../../environments/environment';
     .admin-section { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb; }
     .admin-note { font-size: 0.8125rem; color: #6b7280; padding: 8px 0; }
     .undistributed-total { display: flex; flex-direction: column; margin-bottom: 12px; }
+    .accrued-type { display: inline-block; margin-left: 8px; font-size: 0.75rem; color: #6b7280; }
+    .claim-hint { font-size: 0.75rem; color: #6b7280; margin-top: 4px; }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
@@ -336,6 +366,9 @@ export class BondDetailComponent implements OnInit, OnDestroy {
   readonly sweepTx = signal('');
   readonly sweepError = signal('');
 
+  /** Balance of bond tokens held by the connected wallet for this bond. */
+  readonly holderBalance = signal<number>(0);
+
   readonly isAdmin = computed(
     () => this.walletService.address() === environment.adminAddress,
   );
@@ -349,6 +382,13 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     const b = this.bond();
     if (!b || this.maturityReached()) return '';
     return this.formatCountdown(b.maturityDate * 1000 - this.now());
+  });
+
+  /** Remaining tokens available for subscription: totalSupply - totalSubscribed. */
+  readonly remainingSupply = computed(() => {
+    const b = this.bond();
+    if (!b) return 0;
+    return Math.max(0, b.totalSupply - b.totalSubscribed);
   });
 
   private maturityTimer?: ReturnType<typeof setInterval>;
@@ -392,6 +432,33 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     });
   }, { allowSignalWrites: true });
 
+  private holderBalanceLoadedFor: { bondId: number; holder: string } | null = null;
+
+  /**
+   * Loads the connected wallet's bond token balance from the holders endpoint.
+   * Re-runs whenever the bond or wallet address changes.
+   */
+  private readonly loadHolderBalanceEffect = effect(() => {
+    const b = this.bond();
+    const holder = this.walletService.address();
+    if (!b || !holder) return;
+    if (
+      this.holderBalanceLoadedFor &&
+      this.holderBalanceLoadedFor.bondId === b.id &&
+      this.holderBalanceLoadedFor.holder === holder
+    ) {
+      return;
+    }
+    this.holderBalanceLoadedFor = { bondId: b.id, holder };
+    this.apiService.getHolders(b.id).subscribe({
+      next: (res) => {
+        const entry = res.holders.find((h) => h.address === holder);
+        this.holderBalance.set(entry?.balance ?? 0);
+      },
+      error: () => this.holderBalance.set(0),
+    });
+  }, { allowSignalWrites: true });
+
   readonly canClaim = computed(() => (this.accrued()?.total ?? 0) > 0);
 
   private refreshAccrued(): void {
@@ -401,6 +468,20 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     this.apiService.getAccruedCredits(b.id, holder).subscribe({
       next: (res) => this.accrued.set(res),
       error: () => this.accrued.set(null),
+    });
+  }
+
+  private refreshHolderBalance(): void {
+    const b = this.bond();
+    const holder = this.walletService.address();
+    if (!b || !holder) return;
+    this.holderBalanceLoadedFor = null;
+    this.apiService.getHolders(b.id).subscribe({
+      next: (res) => {
+        const entry = res.holders.find((h) => h.address === holder);
+        this.holderBalance.set(entry?.balance ?? 0);
+      },
+      error: () => this.holderBalance.set(0),
     });
   }
 
@@ -458,7 +539,12 @@ export class BondDetailComponent implements OnInit, OnDestroy {
 
   onSubscribe(): void {
     const b = this.bond();
-    if (!b || !this.subscribeAmount || this.subscribeAmount < 1) return;
+    if (
+      !b ||
+      !this.subscribeAmount ||
+      this.subscribeAmount < 1 ||
+      this.subscribeAmount > this.remainingSupply()
+    ) return;
     this.subscribeSubmitting.set(true);
     this.subscribeSuccess.set(false);
     this.subscribeError.set('');
@@ -469,7 +555,11 @@ export class BondDetailComponent implements OnInit, OnDestroy {
         this.subscribeTx.set(res.transactionHash);
         this.subscribeSubmitting.set(false);
         this.apiService.getBond(b.id).subscribe({
-          next: (updated) => this.bond.set(updated),
+          next: (updated) => {
+            this.bond.set(updated);
+            // Refresh holder balance after a successful subscription
+            this.refreshHolderBalance();
+          },
         });
       },
       error: (err) => {
@@ -504,7 +594,13 @@ export class BondDetailComponent implements OnInit, OnDestroy {
 
   onTransfer(): void {
     const b = this.bond();
-    if (!b || !this.transferTo || !this.transferAmount || this.transferAmount < 1) return;
+    if (
+      !b ||
+      !this.transferTo ||
+      !this.transferAmount ||
+      this.transferAmount < 1 ||
+      this.transferAmount > this.holderBalance()
+    ) return;
     this.transferSubmitting.set(true);
     this.transferSuccess.set(false);
     this.transferError.set('');
@@ -516,6 +612,8 @@ export class BondDetailComponent implements OnInit, OnDestroy {
         this.transferSubmitting.set(false);
         this.transferTo = '';
         this.transferAmount = 0;
+        // Refresh holder balance after a successful transfer
+        this.refreshHolderBalance();
       },
       error: (err) => {
         this.transferError.set(err.error?.detail || err.message || 'Transfer failed');
@@ -553,3 +651,4 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     });
   }
 }
+
