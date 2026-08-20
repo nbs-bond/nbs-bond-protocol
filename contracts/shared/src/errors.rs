@@ -103,6 +103,10 @@ pub enum CouponEngineError {
     Overflow = 10,
     ZeroAmount = 11,
     ProjectNotApproved = 12,
+    /// The `UndistributedTotal` storage key is missing despite the
+    /// initialization flag being set.  Indicates storage corruption or
+    /// an unexpected contract state.
+    UndistributedTotalNotFound = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -21,6 +21,9 @@ pub enum DataKey {
     BondProject(u64),
     BondCreditType(u64),
     UndistributedTotal(u64),
+    /// Set to `true` once `UndistributedTotal` has been initialised for a
+    /// bond.  Used to distinguish "never set" from "set to 0".
+    UndistributedTotalInitialized(u64),
     Precision,
     BondIssuerAddress,
     OracleConsumerAddress,
@@ -447,11 +450,20 @@ impl CouponEngine {
                 .set(&DataKey::PeriodInfo(bond_id, period_index), &period_info);
 
             if undistributed > 0 {
-                let undistributed_total: i128 = env
+                let initialized = env
                     .storage()
                     .persistent()
-                    .get(&DataKey::UndistributedTotal(bond_id))
-                    .unwrap_or(0);
+                    .get::<_, bool>(&DataKey::UndistributedTotalInitialized(bond_id))
+                    .unwrap_or(false);
+
+                let undistributed_total: i128 = if initialized {
+                    env.storage()
+                        .persistent()
+                        .get(&DataKey::UndistributedTotal(bond_id))
+                        .ok_or(CouponEngineError::UndistributedTotalNotFound)?
+                } else {
+                    0
+                };
                 let new_total = undistributed_total
                     .checked_add(undistributed)
                     .ok_or(CouponEngineError::Overflow)?;
@@ -459,6 +471,12 @@ impl CouponEngine {
                     .persistent()
                     .set(&DataKey::UndistributedTotal(bond_id), &new_total);
             }
+
+            // Mark UndistributedTotal as initialised so subsequent distributions
+            // can detect storage corruption (missing key after first write).
+            env.storage()
+                .persistent()
+                .set(&DataKey::UndistributedTotalInitialized(bond_id), &true);
 
             let count: u32 = env
                 .storage()
@@ -1806,6 +1824,56 @@ mod test {
         let user = Address::generate(&t._env);
         let result = t.client.try_sweep_undistributed(&user, &bond_id, &0);
         assert_eq!(result, Err(Ok(CouponEngineError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_distribute_coupon_errors_when_undistributed_total_missing() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 100);
+        let holder_a = Address::generate(&t._env);
+        let holder_b = Address::generate(&t._env);
+        let holder_c = Address::generate(&t._env);
+
+        // 3 holders × 1 token = 3 total supply → dust on 100 credits (100/3 = 33 each, 1 undistributed)
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder_a, 1);
+        let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
+        issuer.subscribe(&holder_b, &bond_id, &1, &0);
+        issuer.subscribe(&holder_c, &bond_id, &1, &0);
+
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        let report_id = submit_verified_report(
+            &t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 0,
+        );
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder_a, &holder_b, &holder_c]);
+
+        // First distribution succeeds and sets UndistributedTotalInitialized.
+        let result = t.client.distribute_coupon(
+            &t.admin, &bond_id, &0, &holders, &report_id, &1, &true,
+        );
+        assert_eq!(result.total_credits, 99);
+        assert_eq!(t.client.get_undistributed_total(&bond_id), 1);
+
+        // Simulate storage corruption: remove UndistributedTotal but keep the flag.
+        t._env
+            .storage()
+            .persistent()
+            .remove(&DataKey::UndistributedTotal(bond_id));
+
+        // Second distribution must fail because the flag is set but the value is gone.
+        let report_id2 = submit_verified_report(
+            &t._env, &t, &project_id, 100_000, BiodiversityMetrics::Absent, 2,
+        );
+        let holders2 = holders_with_balances(&t._env, &t, bond_id, &[&holder_a, &holder_b, &holder_c]);
+        let result = t.client.try_distribute_coupon(
+            &t.admin, &bond_id, &1, &holders2, &report_id2, &2, &true,
+        );
+        assert_eq!(result, Err(Ok(CouponEngineError::UndistributedTotalNotFound)));
     }
 
     #[test]
