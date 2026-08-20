@@ -1,6 +1,6 @@
 import { Component, inject, OnInit, OnDestroy, ChangeDetectionStrategy, signal, computed, effect } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { RouterModule, ActivatedRoute } from '@angular/router';
+import { RouterModule, ActivatedRoute, Router } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../shared/services/api.service';
 import { WalletService } from '../../auth/wallet.service';
@@ -306,6 +306,7 @@ import { environment } from '../../../environments/environment';
 })
 export class BondDetailComponent implements OnInit, OnDestroy {
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
   private readonly apiService = inject(ApiService);
   private readonly walletService = inject(WalletService);
 
@@ -433,8 +434,7 @@ export class BondDetailComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     const id = Number(this.route.snapshot.paramMap.get('id'));
     if (!id) {
-      this.error.set('Invalid bond ID');
-      this.loading.set(false);
+      void this.router.navigate(['/not-found']);
       return;
     }
     this.maturityTimer = setInterval(() => this.now.set(Date.now()), 1000);
@@ -444,7 +444,11 @@ export class BondDetailComponent implements OnInit, OnDestroy {
         this.loading.set(false);
       },
       error: (err) => {
-        this.error.set(err.status === 404 ? 'Bond not found' : 'Failed to load bond');
+        if (err.status === 404) {
+          void this.router.navigate(['/not-found']);
+          return;
+        }
+        this.error.set('Failed to load bond');
         this.loading.set(false);
       },
     });

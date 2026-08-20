@@ -1,6 +1,6 @@
 import { Component, inject, OnInit, ChangeDetectionStrategy, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { RouterModule, ActivatedRoute } from '@angular/router';
+import { RouterModule, ActivatedRoute, Router } from '@angular/router';
 import { ApiService } from '../../shared/services/api.service';
 import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
 import { LoadingSpinnerComponent } from '../../shared/components/loading-spinner/loading-spinner.component';
@@ -84,6 +84,7 @@ import { Project } from '../../shared/interfaces/bond.interface';
 })
 export class ProjectDetailComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
   private readonly apiService = inject(ApiService);
 
   readonly project = signal<Project | null>(null);
@@ -98,8 +99,7 @@ export class ProjectDetailComponent implements OnInit {
   ngOnInit(): void {
     const id = Number(this.route.snapshot.paramMap.get('id'));
     if (!id) {
-      this.error.set('Invalid project ID');
-      this.loading.set(false);
+      void this.router.navigate(['/not-found']);
       return;
     }
     this.apiService.getProject(id).subscribe({
@@ -108,7 +108,11 @@ export class ProjectDetailComponent implements OnInit {
         this.loading.set(false);
       },
       error: (err) => {
-        this.error.set(err.status === 404 ? 'Project not found' : 'Failed to load project');
+        if (err.status === 404) {
+          void this.router.navigate(['/not-found']);
+          return;
+        }
+        this.error.set('Failed to load project');
         this.loading.set(false);
       },
     });
