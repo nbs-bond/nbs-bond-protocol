@@ -51,6 +51,38 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
     Ok(())
 }
 
+fn ensure_metadata_hash_available(
+    env: &Env,
+    metadata_ipfs_hash: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::ProjectCount)
+        .unwrap_or(0);
+
+    for i in 1..=count {
+        let key = project_id_to_bytes(env, i);
+        if let Some(project) = env
+            .storage()
+            .instance()
+            .get::<_, Project>(&DataKey::Project(key))
+        {
+            let active_project = matches!(
+                project.status,
+                ProjectStatus::Pending | ProjectStatus::Approved
+            );
+            if active_project
+                && project.metadata_ipfs_hash.to_array() == metadata_ipfs_hash.to_array()
+            {
+                return Err(RegistryError::ProjectAlreadyExists);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[contract]
 pub struct ProjectRegistry;
 
@@ -78,14 +110,16 @@ impl ProjectRegistry {
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
 
         let hash_arr = metadata_ipfs_hash.to_array();
         if hash_arr.iter().all(|&b| b == 0) {
             return Err(RegistryError::ProjectNotFound);
         }
+        ensure_metadata_hash_available(&env, &metadata_ipfs_hash)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
 
         let count: u64 = env
             .storage()
@@ -358,6 +392,71 @@ mod test {
             &0,
         );
         assert_eq!(result, Err(Ok(RegistryError::ProjectNotFound)));
+    }
+
+    #[test]
+    fn test_register_project_duplicate_pending_hash() {
+        let (env, client, _admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let hash = create_hash(&env, 1);
+
+        let id = client.register_project(
+            &user,
+            &hash,
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        assert_eq!(id, 1);
+
+        let result = client.try_register_project(
+            &user2,
+            &hash,
+            &Symbol::new(&env, "GS"),
+            &Symbol::new(&env, "BR"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(RegistryError::ProjectAlreadyExists)));
+        assert_eq!(client.project_count(), 1);
+
+        let hash2 = create_hash(&env, 2);
+        let id2 = client.register_project(
+            &user2,
+            &hash2,
+            &Symbol::new(&env, "GS"),
+            &Symbol::new(&env, "BR"),
+            &0,
+        );
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_register_project_reuses_rejected_hash() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let hash = create_hash(&env, 1);
+
+        let rejected_id = client.register_project(
+            &user,
+            &hash,
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        client.reject_project(&admin, &rejected_id, &0);
+
+        let reused_id = client.register_project(
+            &user2,
+            &hash,
+            &Symbol::new(&env, "GS"),
+            &Symbol::new(&env, "BR"),
+            &0,
+        );
+        assert_eq!(reused_id, 2);
+
+        let project = client.get_project(&reused_id);
+        assert_eq!(project.status, ProjectStatus::Pending);
+        assert_eq!(project.metadata_ipfs_hash, hash);
     }
 
     #[test]
