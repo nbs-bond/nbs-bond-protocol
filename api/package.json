@@ -56,6 +56,7 @@
     "collectCoverageFrom": ["**/*.ts"],
     "coverageDirectory": "../coverage",
     "testEnvironment": "node",
+    "setupFiles": ["<rootDir>/../test/setup-jwt.ts"],
     "moduleNameMapper": { "^@/(.*)$": "<rootDir>/$1" },
     "passWithNoTests": true
   }
