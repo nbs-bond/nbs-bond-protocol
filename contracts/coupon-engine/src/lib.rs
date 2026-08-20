@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(deprecated)]
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal, Symbol, Vec};
-use nbbs_shared::{BiodiversityMetrics, BondError, CreditType, ReportStatus};
+use nbbs_shared::{BiodiversityMetrics, CouponEngineError, CreditType, ReportStatus};
 use nbbs_oracle_consumer::Report;
 
 pub const FIXED_POINT: i128 = 10_000_000;
@@ -115,12 +115,12 @@ impl CouponEngine {
         bond_id: u64,
         project_id: BytesN<32>,
         nonce: u64,
-    ) -> Result<(), BondError> {
+    ) -> Result<(), CouponEngineError> {
         caller.require_auth();
 
         let expected_nonce = get_nonce(&env, &caller);
         if nonce != expected_nonce {
-            return Err(BondError::InvalidNonce);
+            return Err(CouponEngineError::InvalidNonce);
         }
         set_nonce(&env, &caller, expected_nonce + 1);
 
@@ -134,7 +134,7 @@ impl CouponEngine {
             .storage()
             .instance()
             .get(&DataKey::BondIssuerAddress)
-            .ok_or(BondError::NotInitialized)?;
+            .ok_or(CouponEngineError::NotInitialized)?;
         let config: nbbs_shared::BondConfig = env.invoke_contract(
             &bond_issuer,
             &Symbol::new(&env, "get_bond"),
@@ -142,14 +142,14 @@ impl CouponEngine {
         );
 
         if config.project_id != project_id {
-            return Err(BondError::BondNotFound);
+            return Err(CouponEngineError::BondNotFound);
         }
 
         let project_registry: Address = env
             .storage()
             .instance()
             .get(&DataKey::ProjectRegistryAddress)
-            .ok_or(BondError::NotInitialized)?;
+            .ok_or(CouponEngineError::NotInitialized)?;
 
         let status: nbbs_shared::ProjectStatus = env.invoke_contract(
             &project_registry,
@@ -158,7 +158,7 @@ impl CouponEngine {
         );
 
         if status != nbbs_shared::ProjectStatus::Approved {
-            return Err(BondError::ProjectNotApproved);
+            return Err(CouponEngineError::ProjectNotApproved);
         }
 
         env.storage()
@@ -190,12 +190,12 @@ impl CouponEngine {
         // Set to `true` in the last (or only) batch call to finalise the period,
         // emit the coupon_distributed event, and clean up transient BatchState.
         is_final_batch: bool,
-    ) -> Result<CouponResult, BondError> {
+    ) -> Result<CouponResult, CouponEngineError> {
         caller.require_auth();
 
         let expected_nonce = get_nonce(&env, &caller);
         if nonce != expected_nonce {
-            return Err(BondError::InvalidNonce);
+            return Err(CouponEngineError::InvalidNonce);
         }
         set_nonce(&env, &caller, expected_nonce + 1);
 
@@ -208,7 +208,7 @@ impl CouponEngine {
             .get(&DataKey::PeriodInfo(bond_id, period_index));
         if let Some(ref info) = existing {
             if info.distributed {
-                return Err(BondError::PeriodAlreadyDistributed);
+                return Err(CouponEngineError::PeriodAlreadyDistributed);
             }
         }
 
@@ -216,13 +216,13 @@ impl CouponEngine {
             .storage()
             .instance()
             .get(&DataKey::BondProject(bond_id))
-            .ok_or(BondError::BondNotFound)?;
+            .ok_or(CouponEngineError::BondNotFound)?;
 
         let credit_type: CreditType = env
             .storage()
             .instance()
             .get(&DataKey::BondCreditType(bond_id))
-            .ok_or(BondError::BondNotFound)?;
+            .ok_or(CouponEngineError::BondNotFound)?;
 
         // ── Batch state: initialise on first call, resume on subsequent ──────
         let batch_key = DataKey::BatchState(bond_id, period_index);
@@ -231,7 +231,7 @@ impl CouponEngine {
                 // Subsequent batch: verify that the same report is being used.
                 let s: BatchState = s;
                 if s.report_id != report_id {
-                    return Err(BondError::InvalidReport);
+                    return Err(CouponEngineError::InvalidReport);
                 }
                 s
             }
@@ -241,7 +241,7 @@ impl CouponEngine {
                     .storage()
                     .instance()
                     .get(&DataKey::OracleConsumerAddress)
-                    .ok_or(BondError::NotInitialized)?;
+                    .ok_or(CouponEngineError::NotInitialized)?;
 
                 let report: Report = env.invoke_contract(
                     &oracle_consumer,
@@ -250,10 +250,10 @@ impl CouponEngine {
                 );
 
                 if report.status != ReportStatus::Verified {
-                    return Err(BondError::ReportNotVerified);
+                    return Err(CouponEngineError::ReportNotVerified);
                 }
                 if report.project_id != project_id {
-                    return Err(BondError::BondNotFound);
+                    return Err(CouponEngineError::BondNotFound);
                 }
 
                 let bond_issuer: Address = env
@@ -272,17 +272,17 @@ impl CouponEngine {
                 let (carbon_total, biodiversity_total) = match credit_type {
                     CreditType::Carbon | CreditType::BlueCarbon => (carbon_total, 0),
                     CreditType::Biodiversity => match report.biodiversity {
-                        BiodiversityMetrics::Absent => return Err(BondError::InvalidReport),
+                        BiodiversityMetrics::Absent => return Err(CouponEngineError::InvalidReport),
                         ref metrics => (0, compute_biodiversity_credits(metrics)),
                     },
                     CreditType::Basket => match report.biodiversity {
-                        BiodiversityMetrics::Absent => return Err(BondError::InvalidReport),
+                        BiodiversityMetrics::Absent => return Err(CouponEngineError::InvalidReport),
                         ref metrics => (carbon_total, compute_biodiversity_credits(metrics)),
                     },
                 };
                 let total_credits = carbon_total
                     .checked_add(biodiversity_total)
-                    .ok_or(BondError::Overflow)?;
+                    .ok_or(CouponEngineError::Overflow)?;
 
                 let credits_per_token = if total_subscribed > 0 && total_credits > 0 {
                     total_credits * FIXED_POINT / total_subscribed
@@ -339,7 +339,7 @@ impl CouponEngine {
                         if holder_credits > 0 {
                             total_holder_credits = total_holder_credits
                                 .checked_add(holder_credits)
-                                .ok_or(BondError::Overflow)?;
+                                .ok_or(CouponEngineError::Overflow)?;
                             accrue_credits(
                                 &env,
                                 bond_id,
@@ -356,7 +356,7 @@ impl CouponEngine {
                         if holder_credits > 0 {
                             total_holder_credits = total_holder_credits
                                 .checked_add(holder_credits)
-                                .ok_or(BondError::Overflow)?;
+                                .ok_or(CouponEngineError::Overflow)?;
                             accrue_credits(
                                 &env,
                                 bond_id,
@@ -374,11 +374,11 @@ impl CouponEngine {
                             state.biodiversity_per_token * balance / FIXED_POINT;
                         let holder_credits = carbon_holder
                             .checked_add(biodiversity_holder)
-                            .ok_or(BondError::Overflow)?;
+                            .ok_or(CouponEngineError::Overflow)?;
                         if holder_credits > 0 {
                             total_holder_credits = total_holder_credits
                                 .checked_add(holder_credits)
-                                .ok_or(BondError::Overflow)?;
+                                .ok_or(CouponEngineError::Overflow)?;
                             if carbon_holder > 0 {
                                 accrue_credits(
                                     &env,
@@ -412,7 +412,7 @@ impl CouponEngine {
         state.distributed_so_far = state
             .distributed_so_far
             .checked_add(total_holder_credits)
-            .ok_or(BondError::Overflow)?;
+            .ok_or(CouponEngineError::Overflow)?;
         state.holder_count_so_far += holder_count;
         env.storage().persistent().set(&batch_key, &state);
 
@@ -423,7 +423,7 @@ impl CouponEngine {
                 .storage()
                 .instance()
                 .get(&DataKey::OracleConsumerAddress)
-                .ok_or(BondError::NotInitialized)?;
+                .ok_or(CouponEngineError::NotInitialized)?;
             let report: Report = env.invoke_contract(
                 &oracle_consumer,
                 &Symbol::new(&env, "get_report"),
@@ -454,7 +454,7 @@ impl CouponEngine {
                     .unwrap_or(0);
                 let new_total = undistributed_total
                     .checked_add(undistributed)
-                    .ok_or(BondError::Overflow)?;
+                    .ok_or(CouponEngineError::Overflow)?;
                 env.storage()
                     .persistent()
                     .set(&DataKey::UndistributedTotal(bond_id), &new_total);
@@ -524,11 +524,11 @@ impl CouponEngine {
             .unwrap_or(0)
     }
 
-    pub fn get_bond_credit_type(env: Env, bond_id: u64) -> Result<CreditType, BondError> {
+    pub fn get_bond_credit_type(env: Env, bond_id: u64) -> Result<CreditType, CouponEngineError> {
         env.storage()
             .instance()
             .get(&DataKey::BondCreditType(bond_id))
-            .ok_or(BondError::BondNotFound)
+            .ok_or(CouponEngineError::BondNotFound)
     }
 
     pub fn claim_credits(
@@ -536,12 +536,12 @@ impl CouponEngine {
         caller: Address,
         bond_id: u64,
         nonce: u64,
-    ) -> Result<i128, BondError> {
+    ) -> Result<i128, CouponEngineError> {
         caller.require_auth();
 
         let expected_nonce = get_nonce(&env, &caller);
         if nonce != expected_nonce {
-            return Err(BondError::InvalidNonce);
+            return Err(CouponEngineError::InvalidNonce);
         }
         set_nonce(&env, &caller, expected_nonce + 1);
 
@@ -597,11 +597,11 @@ impl CouponEngine {
         env: Env,
         bond_id: u64,
         period_index: u32,
-    ) -> Result<PeriodInfo, BondError> {
+    ) -> Result<PeriodInfo, CouponEngineError> {
         env.storage()
             .persistent()
             .get(&DataKey::PeriodInfo(bond_id, period_index))
-            .ok_or(BondError::BondNotFound)
+            .ok_or(CouponEngineError::PeriodNotFound)
     }
 
     /// Returns up to `count` `PeriodInfo` records for `bond_id`, starting at
@@ -659,12 +659,12 @@ impl CouponEngine {
         caller: Address,
         bond_id: u64,
         nonce: u64,
-    ) -> Result<i128, BondError> {
+    ) -> Result<i128, CouponEngineError> {
         caller.require_auth();
 
         let expected_nonce = get_nonce(&env, &caller);
         if nonce != expected_nonce {
-            return Err(BondError::InvalidNonce);
+            return Err(CouponEngineError::InvalidNonce);
         }
         set_nonce(&env, &caller, expected_nonce + 1);
 
@@ -687,12 +687,12 @@ impl CouponEngine {
         caller: Address,
         deduct_caller: Address,
         nonce: u64,
-    ) -> Result<(), BondError> {
+    ) -> Result<(), CouponEngineError> {
         caller.require_auth();
 
         let expected_nonce = get_nonce(&env, &caller);
         if nonce != expected_nonce {
-            return Err(BondError::InvalidNonce);
+            return Err(CouponEngineError::InvalidNonce);
         }
         set_nonce(&env, &caller, expected_nonce + 1);
 
@@ -711,16 +711,16 @@ impl CouponEngine {
         holder: Address,
         amount: i128,
         credit_type: CreditType,
-    ) -> Result<i128, BondError> {
+    ) -> Result<i128, CouponEngineError> {
         let authorized: Address = env
             .storage()
             .instance()
             .get(&DataKey::DeductCaller)
-            .ok_or(BondError::Unauthorized)?;
+            .ok_or(CouponEngineError::Unauthorized)?;
         authorized.require_auth();
 
         if amount <= 0 {
-            return Err(BondError::ZeroAmount);
+            return Err(CouponEngineError::ZeroAmount);
         }
 
         let combined_key = DataKey::AccruedCredits(bond_id, holder.clone());
@@ -730,7 +730,7 @@ impl CouponEngine {
             .get(&combined_key)
             .unwrap_or(0);
         if amount > combined {
-            return Err(BondError::Overflow);
+            return Err(CouponEngineError::Overflow);
         }
 
         // BlueCarbon credits are accrued under Carbon, so resolve the storage
@@ -752,7 +752,7 @@ impl CouponEngine {
             .get(&by_type_key)
             .unwrap_or(0);
         if amount > by_type {
-            return Err(BondError::Overflow);
+            return Err(CouponEngineError::Overflow);
         }
 
         env.storage()
@@ -771,14 +771,14 @@ impl CouponEngine {
     }
 }
 
-fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
+fn require_admin(env: &Env, caller: &Address) -> Result<(), CouponEngineError> {
     let admin: Address = env
         .storage()
         .instance()
         .get(&DataKey::Admin)
-        .ok_or(BondError::NotInitialized)?;
+        .ok_or(CouponEngineError::NotInitialized)?;
     if caller != &admin {
-        return Err(BondError::Unauthorized);
+        return Err(CouponEngineError::Unauthorized);
     }
     Ok(())
 }
@@ -814,12 +814,12 @@ fn accrue_credits(
     holder: Address,
     credit_type: CreditType,
     amount: i128,
-) -> Result<(), BondError> {
+) -> Result<(), CouponEngineError> {
     let by_type_key = DataKey::AccruedCreditsByType(bond_id, holder.clone(), credit_type);
     let by_type: i128 = env.storage().persistent().get(&by_type_key).unwrap_or(0);
     env.storage()
         .persistent()
-        .set(&by_type_key, &by_type.checked_add(amount).ok_or(BondError::Overflow)?);
+        .set(&by_type_key, &by_type.checked_add(amount).ok_or(CouponEngineError::Overflow)?);
 
     let combined_key = DataKey::AccruedCredits(bond_id, holder);
     let combined: i128 = env.storage().persistent().get(&combined_key).unwrap_or(0);
@@ -827,7 +827,7 @@ fn accrue_credits(
         .persistent()
         .set(
             &combined_key,
-            &combined.checked_add(amount).ok_or(BondError::Overflow)?,
+            &combined.checked_add(amount).ok_or(CouponEngineError::Overflow)?,
         );
     Ok(())
 }
@@ -1067,7 +1067,7 @@ mod test {
 
         let project_id = setup_project(&t._env, &t, 42);
         let result = t.client.try_register_bond(&user, &1, &project_id, &0);
-        assert_eq!(result, Err(Ok(BondError::Unauthorized)));
+        assert_eq!(result, Err(Ok(CouponEngineError::Unauthorized)));
     }
 
     #[test]
@@ -1080,7 +1080,7 @@ mod test {
 
         let project_id = setup_project(&t._env, &t, 42);
         let result = t.client.try_register_bond(&t.admin, &1, &project_id, &1);
-        assert_eq!(result, Err(Ok(BondError::InvalidNonce)));
+        assert_eq!(result, Err(Ok(CouponEngineError::InvalidNonce)));
     }
 
     #[test]
@@ -1108,7 +1108,7 @@ mod test {
         let holder = Address::generate(&t._env);
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 1000);
         let result = t.client.try_register_bond(&t.admin, &bond_id, &project_id, &0);
-        assert_eq!(result, Err(Ok(BondError::ProjectNotApproved)));
+        assert_eq!(result, Err(Ok(CouponEngineError::ProjectNotApproved)));
     }
 
     #[test]
@@ -1126,7 +1126,7 @@ mod test {
         let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder, 1000);
 
         let result = t.client.try_register_bond(&t.admin, &bond_id, &wrong_project_id, &0);
-        assert_eq!(result, Err(Ok(BondError::BondNotFound)));
+        assert_eq!(result, Err(Ok(CouponEngineError::BondNotFound)));
     }
 
     #[test]
@@ -1326,7 +1326,7 @@ mod test {
             &1,
             &true,
         );
-        assert_eq!(result, Err(Ok(BondError::InvalidReport)));
+        assert_eq!(result, Err(Ok(CouponEngineError::InvalidReport)));
     }
 
     #[test]
@@ -1434,7 +1434,7 @@ mod test {
             &1,
             &true,
         );
-        assert_eq!(result, Err(Ok(BondError::ReportNotVerified)));
+        assert_eq!(result, Err(Ok(CouponEngineError::ReportNotVerified)));
 
         let accrued = t.client.accrued_credits(&bond_id, &holder);
         assert_eq!(accrued, 0);
@@ -1467,7 +1467,7 @@ mod test {
             &1,
             &true,
         );
-        assert_eq!(result, Err(Ok(BondError::BondNotFound)));
+        assert_eq!(result, Err(Ok(CouponEngineError::BondNotFound)));
     }
 
     #[test]
@@ -1500,7 +1500,7 @@ mod test {
             &2,
             &true,
         );
-        assert_eq!(result, Err(Ok(BondError::PeriodAlreadyDistributed)));
+        assert_eq!(result, Err(Ok(CouponEngineError::PeriodAlreadyDistributed)));
     }
 
     #[test]
@@ -1524,7 +1524,7 @@ mod test {
             &0,
             &true,
         );
-        assert_eq!(result, Err(Ok(BondError::BondNotFound)));
+        assert_eq!(result, Err(Ok(CouponEngineError::BondNotFound)));
     }
 
     #[test]
@@ -1805,7 +1805,7 @@ mod test {
 
         let user = Address::generate(&t._env);
         let result = t.client.try_sweep_undistributed(&user, &bond_id, &0);
-        assert_eq!(result, Err(Ok(BondError::Unauthorized)));
+        assert_eq!(result, Err(Ok(CouponEngineError::Unauthorized)));
     }
 
     #[test]
@@ -1841,7 +1841,7 @@ mod test {
 
         let holder = Address::generate(&env);
         let result = client.try_claim_credits(&holder, &1, &1);
-        assert_eq!(result, Err(Ok(BondError::InvalidNonce)));
+        assert_eq!(result, Err(Ok(CouponEngineError::InvalidNonce)));
     }
 
     mod property {
@@ -2092,7 +2092,7 @@ mod test {
         // Period must NOT be marked distributed yet.
         assert_eq!(
             t.client.try_get_period_info(&bond_id, &0),
-            Err(Ok(BondError::BondNotFound)),
+            Err(Ok(CouponEngineError::PeriodNotFound)),
             "period must not be finalised after partial batch"
         );
         assert_eq!(partial.holder_count, 2);
@@ -2182,7 +2182,7 @@ mod test {
         let result = t.client.try_distribute_coupon(
             &t.admin, &bond_id, &0, &holders, &report_id, &2, &true,
         );
-        assert_eq!(result, Err(Ok(BondError::PeriodAlreadyDistributed)));
+        assert_eq!(result, Err(Ok(CouponEngineError::PeriodAlreadyDistributed)));
     }
 
     #[test]
@@ -2224,7 +2224,7 @@ mod test {
         // Period must NOT be finalised yet.
         assert_eq!(
             t.client.try_get_period_info(&bond_id, &0),
-            Err(Ok(BondError::BondNotFound))
+            Err(Ok(CouponEngineError::PeriodNotFound))
         );
 
         // Batch 2: holders 3-5 (not final).

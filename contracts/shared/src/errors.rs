@@ -89,6 +89,23 @@ pub enum CreditError {
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracterror]
+pub enum CouponEngineError {
+    NotInitialized = 1,
+    Unauthorized = 2,
+    InvalidNonce = 3,
+    BondNotFound = 4,
+    PeriodNotFound = 5,
+    PeriodAlreadyDistributed = 6,
+    AlreadyProcessed = 7,
+    InvalidReport = 8,
+    ReportNotVerified = 9,
+    Overflow = 10,
+    ZeroAmount = 11,
+    ProjectNotApproved = 12,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracterror]
 pub enum GovernanceError {
     NotInitialized = 1,
     Unauthorized = 2,

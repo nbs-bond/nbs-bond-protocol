@@ -8,7 +8,7 @@ use soroban_sdk::{
     Val, Vec,
 };
 use nbbs_coupon_engine::PeriodInfo;
-use nbbs_shared::{BondError, CreditError, CreditType};
+use nbbs_shared::{CouponEngineError, CreditError, CreditType};
 
 /// Ledgers closed in a day at the network's ~5 second close time.
 const LEDGERS_PER_DAY: u32 = 17_280;
@@ -280,7 +280,7 @@ impl CreditRetirement {
 
         // The period carries the oracle report id and the monitoring window the
         // credits were measured over — the vintage, in GHG Protocol terms.
-        let period = match env.try_invoke_contract::<PeriodInfo, BondError>(
+        let period = match env.try_invoke_contract::<PeriodInfo, CouponEngineError>(
             &coupon_engine,
             &Symbol::new(&env, "get_period_info"),
             vec![
@@ -302,7 +302,7 @@ impl CreditRetirement {
 
         // Atomically deduct from CouponEngine so retired credits cannot be
         // claimed again via `claim_credits`.
-        let deducted = env.try_invoke_contract::<i128, BondError>(
+        let deducted = env.try_invoke_contract::<i128, CouponEngineError>(
             &coupon_engine,
             &Symbol::new(&env, "deduct_credits"),
             vec![

@@ -10,8 +10,8 @@ mod integration {
     use nbbs_dex_router::{DEXRouter, DEXRouterClient};
     use nbbs_credit_retirement::{CreditRetirement, CreditRetirementClient};
     use nbbs_shared::{
-        BiodiversityMetrics, BondConfig, BondError, CreditType, OracleError, ProjectStatus,
-        RegistryError, ReportStatus,
+        BiodiversityMetrics, BondConfig, BondError, CouponEngineError, CreditType, OracleError,
+        ProjectStatus, RegistryError, ReportStatus,
     };
 
     fn make_project_id(env: &Env, value: u8) -> BytesN<32> {
@@ -317,7 +317,7 @@ mod integration {
                 &2,
                 &true,
             );
-            assert_eq!(rejected, Err(Ok(BondError::ReportNotVerified)));
+            assert_eq!(rejected, Err(Ok(CouponEngineError::ReportNotVerified)));
 
             contracts.oc_client.verify_report(&admin, &report_id, &1);
 
@@ -681,10 +681,10 @@ mod integration {
                 &admin, &bond_id, &0, &b1, &report_id, &2, &false,
             );
             assert_eq!(r1.holder_count, 3);
-            // Period must NOT be finalised yet — get_period_info should return BondNotFound.
+            // Period must NOT be finalised yet — get_period_info should return PeriodNotFound.
             assert_eq!(
                 contracts.ce_client.try_get_period_info(&bond_id, &0),
-                Err(Ok(BondError::BondNotFound)),
+                Err(Ok(CouponEngineError::PeriodNotFound)),
                 "period must not be finalised after batch 1"
             );
 
@@ -738,7 +738,7 @@ mod integration {
             let dup_attempt = contracts.ce_client.try_distribute_coupon(
                 &admin, &bond_id, &0, &b1, &report_id, &5, &true,
             );
-            assert_eq!(dup_attempt, Err(Ok(BondError::PeriodAlreadyDistributed)));
+            assert_eq!(dup_attempt, Err(Ok(CouponEngineError::PeriodAlreadyDistributed)));
         }
     }
 
