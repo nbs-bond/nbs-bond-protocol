@@ -107,7 +107,7 @@ describe('ProjectsService', () => {
         name: 'Amazon Reforestation',
         methodology: 'VM0003',
         country: 'BRA',
-        location: '-3.4653, -62.2159',
+        location: { lat: -3.4653, lng: -62.2159 },
         totalAreaHa: 500,
         carbonSequestrationEstimate: 1000,
       };

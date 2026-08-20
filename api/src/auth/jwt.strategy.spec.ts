@@ -10,7 +10,7 @@ describe('JwtStrategy', () => {
   });
 
   it('validates and maps payload to AuthenticatedUser', async () => {
-    const payload = { sub: 'GBKEY123', kycStatus: 'VERIFIED' };
+    const payload = { sub: 'GBKEY123', kycStatus: KycStatus.VERIFIED };
     const user = await strategy.validate(payload);
 
     expect(user).toEqual({

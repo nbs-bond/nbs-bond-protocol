@@ -66,7 +66,7 @@ describe('AuthController', () => {
     };
     authService.getProfile.mockResolvedValue(expected);
 
-    const req = { user: { walletAddress: 'G123', kycStatus: 'VERIFIED' } } as AuthenticatedRequest;
+    const req = { user: { walletAddress: 'G123', kycStatus: 'VERIFIED' } } as unknown as AuthenticatedRequest;
     const result = await controller.profile(req);
 
     expect(authService.getProfile).toHaveBeenCalledWith('G123');
