@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
-import { PassportStrategy } from '@nestjs/passport';
-import { ExtractJwt, Strategy } from 'passport-jwt';
-import { AuthenticatedUser, KycStatus } from '../common/interfaces/authenticated-request.interface';
+import { Injectable } from "@nestjs/common";
+import { PassportStrategy } from "@nestjs/passport";
+import { ExtractJwt, Strategy } from "passport-jwt";
+import { AuthenticatedUser } from "../common/interfaces/authenticated-request.interface";
+import { getJwtSecret } from "./jwt.config";
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -9,14 +10,13 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: process.env.JWT_SECRET || 'dev-secret-change-in-production',
+      secretOrKey: getJwtSecret(),
     });
   }
 
-  async validate(payload: { sub: string; kycStatus: string }): Promise<AuthenticatedUser> {
+  async validate(payload: { sub: string }): Promise<AuthenticatedUser> {
     return {
       walletAddress: payload.sub,
-      kycStatus: payload.kycStatus as KycStatus,
     };
   }
 }

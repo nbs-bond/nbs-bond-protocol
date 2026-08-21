@@ -6,6 +6,12 @@ use nbbs_shared::{BiodiversityMetrics, OracleError, ReportStatus};
 pub const CHALLENGE_WINDOW_SECONDS: u64 = 259200;
 pub const SLASH_PENALTY_PPM: i128 = 100_000;
 
+// Persistent-storage TTL constants (in ledgers).
+// MIN_TTL  ≈  1 day   at 5-second ledger cadence (~17 280 ledgers).
+// MAX_TTL  ≈ 120 days at 5-second ledger cadence (~2 073 600 ledgers).
+const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
+const PERSISTENT_TTL_EXTEND_TO: u32 = 2_073_600;
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -97,17 +103,24 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), OracleError> {
     Ok(())
 }
 
+/// Bump a persistent storage key's TTL if it is below the threshold.
+fn bump_persistent<K: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val> + soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
+    env.storage().persistent().extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
 fn get_nonce(env: &Env, addr: &Address) -> u64 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Nonce(addr.clone()))
-        .unwrap_or(0)
+    let key = DataKey::Nonce(addr.clone());
+    let val: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    if env.storage().persistent().has(&key) {
+        bump_persistent(env, &key);
+    }
+    val
 }
 
 fn set_nonce(env: &Env, addr: &Address, nonce: u64) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::Nonce(addr.clone()), &nonce);
+    let key = DataKey::Nonce(addr.clone());
+    env.storage().persistent().set(&key, &nonce);
+    bump_persistent(env, &key);
 }
 
 #[contract]
@@ -143,11 +156,8 @@ impl OracleConsumer {
 
         require_admin(&env, &caller)?;
 
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Provider(provider.clone()))
-        {
+        let provider_key = DataKey::Provider(provider.clone());
+        if env.storage().persistent().has(&provider_key) {
             return Err(OracleError::ProviderAlreadyExists);
         }
 
@@ -159,19 +169,18 @@ impl OracleConsumer {
             registered_at: env.ledger().timestamp(),
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Provider(provider.clone()), &oracle_provider);
+        env.storage().persistent().set(&provider_key, &oracle_provider);
+        bump_persistent(&env, &provider_key);
 
+        let list_key = DataKey::ProviderList;
         let mut providers: Vec<Address> = env
             .storage()
-            .instance()
-            .get(&DataKey::ProviderList)
+            .persistent()
+            .get(&list_key)
             .unwrap_or(vec![&env]);
         providers.push_back(provider.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::ProviderList, &providers);
+        env.storage().persistent().set(&list_key, &providers);
+        bump_persistent(&env, &list_key);
 
         env.events().publish(
             (Symbol::new(&env, "provider_registered"),),
@@ -197,16 +206,16 @@ impl OracleConsumer {
 
         require_admin(&env, &caller)?;
 
+        let provider_key = DataKey::Provider(provider.clone());
         let mut p: OracleProvider = env
             .storage()
-            .instance()
-            .get(&DataKey::Provider(provider.clone()))
+            .persistent()
+            .get(&provider_key)
             .ok_or(OracleError::ProviderNotFound)?;
 
         p.active = false;
-        env.storage()
-            .instance()
-            .set(&DataKey::Provider(provider.clone()), &p);
+        env.storage().persistent().set(&provider_key, &p);
+        bump_persistent(&env, &provider_key);
 
         env.events().publish(
             (Symbol::new(&env, "provider_removed"),),
@@ -237,11 +246,13 @@ impl OracleConsumer {
         }
         set_nonce(&env, &provider, expected_nonce + 1);
 
+        let provider_key = DataKey::Provider(provider.clone());
         let p: OracleProvider = env
             .storage()
-            .instance()
-            .get(&DataKey::Provider(provider.clone()))
+            .persistent()
+            .get(&provider_key)
             .ok_or(OracleError::ProviderNotFound)?;
+        bump_persistent(&env, &provider_key);
 
         if !p.active {
             return Err(OracleError::Unauthorized);
@@ -282,28 +293,28 @@ impl OracleConsumer {
             verified_at: 0,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Report(report_id), &report);
+        let report_key = DataKey::Report(report_id);
+        env.storage().persistent().set(&report_key, &report);
+        bump_persistent(&env, &report_key);
 
+        let proj_key = DataKey::ProjectReports(project_id.clone());
         let mut project_reports: Vec<u64> = env
             .storage()
-            .instance()
-            .get(&DataKey::ProjectReports(project_id.clone()))
+            .persistent()
+            .get(&proj_key)
             .unwrap_or(vec![&env]);
         project_reports.push_back(report_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProjectReports(project_id.clone()), &project_reports);
+        env.storage().persistent().set(&proj_key, &project_reports);
+        bump_persistent(&env, &proj_key);
 
+        let prc_key = DataKey::ProviderReportCount(provider.clone());
         let report_count: u64 = env
             .storage()
-            .instance()
-            .get(&DataKey::ProviderReportCount(provider.clone()))
+            .persistent()
+            .get(&prc_key)
             .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProviderReportCount(provider.clone()), &(report_count + 1));
+        env.storage().persistent().set(&prc_key, &(report_count + 1));
+        bump_persistent(&env, &prc_key);
 
         env.events().publish(
             (Symbol::new(&env, "report_submitted"),),
@@ -323,11 +334,13 @@ impl OracleConsumer {
 
         let is_admin = require_admin(&env, &caller).is_ok();
         if !is_admin {
+            let provider_key = DataKey::Provider(caller.clone());
             let p: OracleProvider = env
                 .storage()
-                .instance()
-                .get(&DataKey::Provider(caller.clone()))
+                .persistent()
+                .get(&provider_key)
                 .ok_or(OracleError::Unauthorized)?;
+            bump_persistent(&env, &provider_key);
             if !p.active {
                 return Err(OracleError::Unauthorized);
             }
@@ -339,21 +352,19 @@ impl OracleConsumer {
         }
         set_nonce(&env, &caller, expected_nonce + 1);
 
+        let report_key = DataKey::Report(report_id);
         let mut report: Report = env
             .storage()
-            .instance()
-            .get(&DataKey::Report(report_id))
+            .persistent()
+            .get(&report_key)
             .ok_or(OracleError::ReportNotFound)?;
 
         if report.status != ReportStatus::Pending {
             return Err(OracleError::ReportAlreadyVerified);
         }
 
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Challenge(report_id))
-        {
+        let challenge_key = DataKey::Challenge(report_id);
+        if env.storage().persistent().has(&challenge_key) {
             return Err(OracleError::ReportAlreadyVerified);
         }
 
@@ -364,7 +375,7 @@ impl OracleConsumer {
         let verifiers_key = DataKey::ReportVerifiers(report_id);
         let mut verifiers: Vec<Address> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&verifiers_key)
             .unwrap_or(vec![&env]);
 
@@ -378,12 +389,12 @@ impl OracleConsumer {
 
         if !already_verified {
             verifiers.push_back(caller.clone());
-            env.storage()
-                .instance()
-                .set(&verifiers_key, &verifiers);
-            env.storage()
-                .instance()
-                .set(&DataKey::VerificationCount(report_id), &verifiers.len());
+            env.storage().persistent().set(&verifiers_key, &verifiers);
+            bump_persistent(&env, &verifiers_key);
+
+            let vc_key = DataKey::VerificationCount(report_id);
+            env.storage().persistent().set(&vc_key, &verifiers.len());
+            bump_persistent(&env, &vc_key);
         }
 
         let threshold: u32 = env
@@ -395,9 +406,8 @@ impl OracleConsumer {
         if verifiers.len() >= threshold {
             report.status = ReportStatus::Verified;
             report.verified_at = env.ledger().timestamp();
-            env.storage()
-                .instance()
-                .set(&DataKey::Report(report_id), &report);
+            env.storage().persistent().set(&report_key, &report);
+            bump_persistent(&env, &report_key);
 
             env.events().publish(
                 (Symbol::new(&env, "report_verified"),),
@@ -423,14 +433,20 @@ impl OracleConsumer {
         }
         set_nonce(&env, &challenger, expected_nonce + 1);
 
+        let report_key = DataKey::Report(report_id);
         let report: Report = env
             .storage()
-            .instance()
-            .get(&DataKey::Report(report_id))
+            .persistent()
+            .get(&report_key)
             .ok_or(OracleError::ReportNotFound)?;
+        bump_persistent(&env, &report_key);
 
         if report.status != ReportStatus::Pending {
             return Err(OracleError::ReportAlreadyVerified);
+        }
+
+        if challenger == report.provider {
+            return Err(OracleError::SelfChallenge);
         }
 
         let now = env.ledger().timestamp();
@@ -443,11 +459,8 @@ impl OracleConsumer {
             return Err(OracleError::ChallengeWindowExpired);
         }
 
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Challenge(report_id))
-        {
+        let challenge_key = DataKey::Challenge(report_id);
+        if env.storage().persistent().has(&challenge_key) {
             return Err(OracleError::ProviderAlreadyExists);
         }
 
@@ -459,29 +472,27 @@ impl OracleConsumer {
             resolved: false,
             resolution: 0,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::Challenge(report_id), &challenge);
+        env.storage().persistent().set(&challenge_key, &challenge);
+        bump_persistent(&env, &challenge_key);
 
         let mut report_mut: Report = env
             .storage()
-            .instance()
-            .get(&DataKey::Report(report_id))
+            .persistent()
+            .get(&report_key)
             .unwrap();
         report_mut.status = ReportStatus::Challenged;
-        env.storage()
-            .instance()
-            .set(&DataKey::Report(report_id), &report_mut);
+        env.storage().persistent().set(&report_key, &report_mut);
+        bump_persistent(&env, &report_key);
 
+        let pc_key = DataKey::ProviderChallenges(report.provider.clone());
         let mut provider_challenges: Vec<u64> = env
             .storage()
-            .instance()
-            .get(&DataKey::ProviderChallenges(report.provider.clone()))
+            .persistent()
+            .get(&pc_key)
             .unwrap_or(vec![&env]);
         provider_challenges.push_back(report_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProviderChallenges(report.provider.clone()), &provider_challenges);
+        env.storage().persistent().set(&pc_key, &provider_challenges);
+        bump_persistent(&env, &pc_key);
 
         env.events().publish(
             (Symbol::new(&env, "report_challenged"),),
@@ -512,10 +523,11 @@ impl OracleConsumer {
             return Err(OracleError::InvalidResolution);
         }
 
+        let challenge_key = DataKey::Challenge(report_id);
         let mut challenge: Challenge = env
             .storage()
-            .instance()
-            .get(&DataKey::Challenge(report_id))
+            .persistent()
+            .get(&challenge_key)
             .ok_or(OracleError::ReportNotFound)?;
 
         if challenge.resolved {
@@ -524,19 +536,18 @@ impl OracleConsumer {
 
         challenge.resolved = true;
         challenge.resolution = resolution as u32;
-        env.storage()
-            .instance()
-            .set(&DataKey::Challenge(report_id), &challenge);
+        env.storage().persistent().set(&challenge_key, &challenge);
+        bump_persistent(&env, &challenge_key);
 
+        let report_key = DataKey::Report(report_id);
         let mut report: Report = env
             .storage()
-            .instance()
-            .get(&DataKey::Report(report_id))
+            .persistent()
+            .get(&report_key)
             .ok_or(OracleError::ReportNotFound)?;
         report.status = resolution;
-        env.storage()
-            .instance()
-            .set(&DataKey::Report(report_id), &report);
+        env.storage().persistent().set(&report_key, &report);
+        bump_persistent(&env, &report_key);
 
         if resolution == ReportStatus::Rejected {
             slash_provider(&env, &report.provider, report_id);
@@ -551,78 +562,88 @@ impl OracleConsumer {
     }
 
     pub fn get_provider(env: Env, provider: Address) -> Result<OracleProvider, OracleError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Provider(provider))
-            .ok_or(OracleError::ProviderNotFound)
+        let key = DataKey::Provider(provider);
+        let val = env.storage().persistent().get(&key).ok_or(OracleError::ProviderNotFound)?;
+        bump_persistent(&env, &key);
+        Ok(val)
     }
 
     pub fn get_report(env: Env, report_id: u64) -> Result<Report, OracleError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Report(report_id))
-            .ok_or(OracleError::ReportNotFound)
+        let key = DataKey::Report(report_id);
+        let val = env.storage().persistent().get(&key).ok_or(OracleError::ReportNotFound)?;
+        bump_persistent(&env, &key);
+        Ok(val)
     }
 
     pub fn list_providers(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::ProviderList)
-            .unwrap_or(vec![&env])
+        let key = DataKey::ProviderList;
+        let val = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
     }
 
     pub fn get_project_reports(env: Env, project_id: BytesN<32>) -> Vec<u64> {
-        env.storage()
-            .instance()
-            .get(&DataKey::ProjectReports(project_id))
-            .unwrap_or(vec![&env])
+        let key = DataKey::ProjectReports(project_id);
+        let val = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
     }
 
     pub fn get_challenge(env: Env, report_id: u64) -> Result<Challenge, OracleError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Challenge(report_id))
-            .ok_or(OracleError::ReportNotFound)
+        let key = DataKey::Challenge(report_id);
+        let val = env.storage().persistent().get(&key).ok_or(OracleError::ReportNotFound)?;
+        bump_persistent(&env, &key);
+        Ok(val)
     }
 
     pub fn get_verification_count(env: Env, report_id: u64) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::VerificationCount(report_id))
-            .unwrap_or(0)
+        let key = DataKey::VerificationCount(report_id);
+        let val = env.storage().persistent().get(&key).unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
     }
 
     pub fn get_report_verifiers(env: Env, report_id: u64) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::ReportVerifiers(report_id))
-            .unwrap_or(vec![&env])
+        let key = DataKey::ReportVerifiers(report_id);
+        let val = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
     }
 
     pub fn get_provider_stats(env: Env, provider: Address) -> Result<ProviderStats, OracleError> {
+        let provider_key = DataKey::Provider(provider.clone());
         let p: OracleProvider = env
             .storage()
-            .instance()
-            .get(&DataKey::Provider(provider.clone()))
+            .persistent()
+            .get(&provider_key)
             .ok_or(OracleError::ProviderNotFound)?;
+        bump_persistent(&env, &provider_key);
 
-        let reports_submitted: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProviderReportCount(provider.clone()))
-            .unwrap_or(0);
+        let prc_key = DataKey::ProviderReportCount(provider.clone());
+        let reports_submitted: u64 = env.storage().persistent().get(&prc_key).unwrap_or(0);
+        if env.storage().persistent().has(&prc_key) {
+            bump_persistent(&env, &prc_key);
+        }
 
-        let challenges: Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProviderChallenges(provider.clone()))
-            .unwrap_or(vec![&env]);
+        let pc_key = DataKey::ProviderChallenges(provider.clone());
+        let challenges: Vec<u64> = env.storage().persistent().get(&pc_key).unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&pc_key) {
+            bump_persistent(&env, &pc_key);
+        }
 
-        let history: Vec<SlashRecord> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SlashHistory(provider.clone()))
-            .unwrap_or(vec![&env]);
+        let sh_key = DataKey::SlashHistory(provider.clone());
+        let history: Vec<SlashRecord> = env.storage().persistent().get(&sh_key).unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&sh_key) {
+            bump_persistent(&env, &sh_key);
+        }
 
         let mut total_penalty: i128 = 0;
         for record in history.iter() {
@@ -640,22 +661,26 @@ impl OracleConsumer {
     }
 
     pub fn get_slash_history(env: Env, provider: Address) -> Vec<SlashRecord> {
-        env.storage()
-            .instance()
-            .get(&DataKey::SlashHistory(provider))
-            .unwrap_or(vec![&env])
+        let key = DataKey::SlashHistory(provider);
+        let val = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
     }
 
     pub fn get_challenge_history(env: Env, provider: Address) -> Vec<Challenge> {
-        let ids: Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProviderChallenges(provider))
-            .unwrap_or(vec![&env]);
+        let pc_key = DataKey::ProviderChallenges(provider);
+        let ids: Vec<u64> = env.storage().persistent().get(&pc_key).unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&pc_key) {
+            bump_persistent(&env, &pc_key);
+        }
 
         let mut challenges: Vec<Challenge> = vec![&env];
         for id in ids.iter() {
-            if let Some(challenge) = env.storage().instance().get(&DataKey::Challenge(id)) {
+            let c_key = DataKey::Challenge(id);
+            if let Some(challenge) = env.storage().persistent().get::<DataKey, Challenge>(&c_key) {
+                bump_persistent(&env, &c_key);
                 challenges.push_back(challenge);
             }
         }
@@ -710,16 +735,16 @@ impl OracleConsumer {
             return Err(OracleError::InsufficientStake);
         }
 
+        let provider_key = DataKey::Provider(provider.clone());
         let mut p: OracleProvider = env
             .storage()
-            .instance()
-            .get(&DataKey::Provider(provider.clone()))
+            .persistent()
+            .get(&provider_key)
             .ok_or(OracleError::ProviderNotFound)?;
 
         p.stake = p.stake.checked_add(amount).ok_or(OracleError::InsufficientStake)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::Provider(provider.clone()), &p);
+        env.storage().persistent().set(&provider_key, &p);
+        bump_persistent(&env, &provider_key);
 
         env.events().publish(
             (Symbol::new(&env, "stake_added"),),
@@ -747,19 +772,19 @@ impl OracleConsumer {
             return Err(OracleError::InsufficientStake);
         }
 
+        let provider_key = DataKey::Provider(provider.clone());
         let mut p: OracleProvider = env
             .storage()
-            .instance()
-            .get(&DataKey::Provider(provider.clone()))
+            .persistent()
+            .get(&provider_key)
             .ok_or(OracleError::ProviderNotFound)?;
 
         if p.stake < amount {
             return Err(OracleError::InsufficientStake);
         }
         p.stake -= amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::Provider(provider.clone()), &p);
+        env.storage().persistent().set(&provider_key, &p);
+        bump_persistent(&env, &provider_key);
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
@@ -771,10 +796,11 @@ impl OracleConsumer {
 }
 
 fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
+    let provider_key = DataKey::Provider(provider.clone());
     let mut p: OracleProvider = env
         .storage()
-        .instance()
-        .get(&DataKey::Provider(provider.clone()))
+        .persistent()
+        .get(&provider_key)
         .unwrap();
 
     let mut penalty = p.stake * SLASH_PENALTY_PPM / 1_000_000;
@@ -789,14 +815,14 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
     if p.stake == 0 {
         p.active = false;
     }
-    env.storage()
-        .instance()
-        .set(&DataKey::Provider(provider.clone()), &p);
+    env.storage().persistent().set(&provider_key, &p);
+    bump_persistent(env, &provider_key);
 
+    let sh_key = DataKey::SlashHistory(provider.clone());
     let mut history: Vec<SlashRecord> = env
         .storage()
-        .instance()
-        .get(&DataKey::SlashHistory(provider.clone()))
+        .persistent()
+        .get(&sh_key)
         .unwrap_or(vec![&env]);
     history.push_back(SlashRecord {
         report_id,
@@ -805,9 +831,8 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
         timestamp: env.ledger().timestamp(),
         active_after: p.active,
     });
-    env.storage()
-        .instance()
-        .set(&DataKey::SlashHistory(provider.clone()), &history);
+    env.storage().persistent().set(&sh_key, &history);
+    bump_persistent(env, &sh_key);
 
     env.events().publish(
         (Symbol::new(env, "provider_slashed"),),
@@ -1001,6 +1026,51 @@ mod test {
         let stored_challenge = client.get_challenge(&report_id);
         assert!(stored_challenge.resolved);
         assert_eq!(stored_challenge.resolution, ReportStatus::Verified as u32);
+    }
+
+    #[test]
+    fn test_provider_cannot_challenge_own_report() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        env.ledger()
+            .set_timestamp(1_000_000 + CHALLENGE_WINDOW_SECONDS + 1);
+
+        let result = client.try_challenge_report(
+            &provider,
+            &report_id,
+            &make_ipfs_hash(&env, 2),
+            &1,
+        );
+
+        assert_eq!(result, Err(Ok(OracleError::SelfChallenge)));
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
+        assert!(matches!(
+            client.try_get_challenge(&report_id),
+            Err(Ok(OracleError::ReportNotFound))
+        ));
     }
 
     #[test]
@@ -2148,6 +2218,59 @@ mod test {
                     prop_assert_eq!(client.get_provider(&provider).stake, stake);
                 }
             }
+        }
+    }
+
+    // ── TTL / persistent-storage stress tests ────────────────────────────────
+
+    /// Submit 500 reports for a single project and verify `get_project_reports`
+    /// returns the correct count without panicking.  This exercises the
+    /// persistent `ProjectReports` index across many appends and confirms that
+    /// the contract does not hit an instance-storage size cap.
+    #[test]
+    fn test_project_reports_500_stress() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_count: u64 = 500;
+        for i in 0..report_count {
+            let period_start = 1_000 + i * 100;
+            let period_end = period_start + 50;
+            client.submit_report(
+                &provider,
+                &project_id,
+                &period_start,
+                &period_end,
+                &100_000i128,
+                &BiodiversityMetrics::Absent,
+                &Symbol::new(&env, "verra_vcs"),
+                &make_ipfs_hash(&env, (i % 256) as u8),
+                &i,
+            );
+        }
+
+        let ids = client.get_project_reports(&project_id);
+        assert_eq!(ids.len() as u64, report_count, "expected {report_count} reports, got {}", ids.len());
+
+        // Spot-check first and last IDs.
+        assert_eq!(ids.get(0).unwrap(), 1u64);
+        assert_eq!(ids.get((report_count - 1) as u32).unwrap(), report_count);
+
+        // Verify each report is individually retrievable.
+        for id in 1..=report_count {
+            let r = client.get_report(&id);
+            assert_eq!(r.id, id);
+            assert_eq!(r.project_id, project_id);
         }
     }
 }

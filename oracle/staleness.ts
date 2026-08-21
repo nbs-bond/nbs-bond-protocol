@@ -36,20 +36,23 @@ export interface StalenessResult {
   isStale: boolean;
 }
 
-function parseTimestamp(value: string, fallback: number): number {
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? fallback : parsed;
+function parseTimestampSeconds(value: string, fallback: number): number {
+  const parsedMilliseconds = Date.parse(value);
+  return Number.isNaN(parsedMilliseconds)
+    ? fallback
+    : Math.floor(parsedMilliseconds / 1000);
 }
 
 /**
  * Compute the staleness metric for one or more projects: seconds elapsed
  * since the last verified report versus the expected reporting window
  * (cadence + grace). A project with no verified report falls back to its
- * creation timestamp as the baseline.
+ * creation timestamp as the baseline. The reference timestamp uses Unix
+ * seconds to match Soroban's ledger timestamp.
  */
 export function computeStaleness(
   inputs: StalenessInput[],
-  now: number = Date.now(),
+  referenceTimestamp: number = Math.floor(Date.now() / 1000),
 ): StalenessResult[] {
   return inputs.map((input) => {
     const cadence = input.cadenceSeconds > 0 ? input.cadenceSeconds : DEFAULT_CADENCE_SECONDS;
@@ -58,19 +61,21 @@ export function computeStaleness(
       : DEFAULT_GRACE_SECONDS;
 
     const baseline = input.lastVerifiedAt
-      ? parseTimestamp(input.lastVerifiedAt, now)
-      : parseTimestamp(input.createdAt, now);
+      ? parseTimestampSeconds(input.lastVerifiedAt, referenceTimestamp)
+      : parseTimestampSeconds(input.createdAt, referenceTimestamp);
 
-    const expectedNextReportAt = baseline + (cadence + grace) * 1000;
-    const stalenessSeconds = Math.max(0, Math.floor((now - baseline) / 1000));
+    const expectedNextReportAt = baseline + cadence + grace;
+    const stalenessSeconds = Math.max(0, referenceTimestamp - baseline);
 
     return {
       projectId: input.projectId,
       provider: input.provider,
-      lastVerifiedAt: input.lastVerifiedAt ? new Date(baseline).toISOString() : undefined,
-      expectedNextReportAt: new Date(expectedNextReportAt).toISOString(),
+      lastVerifiedAt: input.lastVerifiedAt
+        ? new Date(baseline * 1000).toISOString()
+        : undefined,
+      expectedNextReportAt: new Date(expectedNextReportAt * 1000).toISOString(),
       stalenessSeconds,
-      isStale: now > expectedNextReportAt,
+      isStale: referenceTimestamp > expectedNextReportAt,
     };
   });
 }

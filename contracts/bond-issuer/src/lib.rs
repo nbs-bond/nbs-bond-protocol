@@ -1,9 +1,11 @@
 #![no_std]
 #![allow(deprecated)]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
 use nbbs_shared::{BondConfig, BondError, BondStatus};
 
 pub const MAX_SUPPLY: i128 = 1_000_000_000_000_000_000;
+const LEDGER_CLOSE_TIME_SECS: u64 = 5;
+const MAX_PERSISTENT_TTL: u32 = 2_073_600;
 
 #[derive(Clone)]
 #[contracttype]
@@ -12,7 +14,10 @@ pub enum DataKey {
     BondConfig(u64),
     BondState(u64),
     HolderBalance(u64, Address),
+    HolderList(u64),
+    HolderCount(u64),
     BondCount,
+    BondList,
     Nonce(Address),
 }
 
@@ -34,6 +39,48 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
         return Err(BondError::Unauthorized);
     }
     Ok(())
+}
+
+/// Register a holder in the bond's on-chain `HolderList`. Called once per
+/// holder on the first mint/transfer into a zero balance, so the list tracks
+/// the set of addresses that have ever held the bond without duplicating
+/// entries. Addresses that later transfer their entire balance out remain in
+/// the list (with a zero balance) and are filtered at coupon distribution.
+fn append_holder(env: &Env, bond_id: u64, holder: Address) {
+    let key = DataKey::HolderList(bond_id);
+    let mut list: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(vec![&env]);
+    list.push_back(holder);
+    env.storage().persistent().set(&key, &list);
+
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::HolderCount(bond_id))
+        .unwrap_or(0);
+    env.storage()
+        .instance()
+        .set(&DataKey::HolderCount(bond_id), &(count + 1));
+}
+
+fn extend_bond_ttl(env: &Env, bond_id: u64, maturity_date: u64) {
+    let now = env.ledger().timestamp();
+    let remaining_secs = maturity_date.saturating_sub(now);
+    let remaining_ledgers = remaining_secs / LEDGER_CLOSE_TIME_SECS;
+
+    let extend_to = remaining_ledgers
+        .saturating_add(17_280)
+        .min(MAX_PERSISTENT_TTL as u64) as u32;
+    let threshold = extend_to / 10;
+    let threshold = threshold.max(1_728);
+
+    let config_key = DataKey::BondConfig(bond_id);
+    let state_key = DataKey::BondState(bond_id);
+    env.storage().persistent().extend_ttl(&config_key, threshold, extend_to);
+    env.storage().persistent().extend_ttl(&state_key, threshold, extend_to);
 }
 
 #[contract]
@@ -99,7 +146,7 @@ impl BondIssuer {
             .set(&DataKey::BondCount, &bond_id);
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::BondConfig(bond_id), &config);
 
         let state = BondState {
@@ -108,8 +155,20 @@ impl BondIssuer {
             created_at: env.ledger().timestamp(),
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::BondState(bond_id), &state);
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
+
+        let mut bond_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondList)
+            .unwrap_or(vec![&env]);
+        bond_list.push_back(bond_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BondList, &bond_list);
 
         env.events().publish(
             (Symbol::new(&env, "bond_issued"),),
@@ -146,15 +205,17 @@ impl BondIssuer {
 
         let config: BondConfig = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondConfig(bond_id))
             .ok_or(BondError::BondNotFound)?;
 
         let mut state: BondState = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondState(bond_id))
             .ok_or(BondError::BondNotFound)?;
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
 
         if state.status != BondStatus::Active {
             return Err(BondError::BondAlreadyMatured);
@@ -185,10 +246,16 @@ impl BondIssuer {
             .persistent()
             .set(&balance_key, &new_balance);
 
+        if current_balance == 0 {
+            append_holder(&env, bond_id, investor.clone());
+        }
+
         state.total_subscribed = new_total;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::BondState(bond_id), &state);
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
 
         env.events().publish(
             (Symbol::new(&env, "subscribed"),),
@@ -216,15 +283,17 @@ impl BondIssuer {
 
         let config: BondConfig = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondConfig(bond_id))
             .ok_or(BondError::BondNotFound)?;
 
         let state: BondState = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondState(bond_id))
             .ok_or(BondError::BondNotFound)?;
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
         if state.status != BondStatus::Active {
             return Err(BondError::BondAlreadyMatured);
         }
@@ -263,6 +332,10 @@ impl BondIssuer {
             .persistent()
             .set(&to_key, &new_to_balance);
 
+        if to_balance == 0 {
+            append_holder(&env, bond_id, to.clone());
+        }
+
         env.events().publish(
             (Symbol::new(&env, "transferred"),),
             (bond_id, from, to, amount),
@@ -296,11 +369,19 @@ impl BondIssuer {
             return Err(BondError::ZeroAmount);
         }
 
+        let config: BondConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondConfig(bond_id))
+            .ok_or(BondError::BondNotFound)?;
+
         let mut state: BondState = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondState(bond_id))
             .ok_or(BondError::BondNotFound)?;
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
 
         if state.status != BondStatus::Matured {
             return Err(BondError::BondAlreadyMatured);
@@ -328,8 +409,10 @@ impl BondIssuer {
             .checked_sub(amount)
             .ok_or(BondError::Overflow)?;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::BondState(bond_id), &state);
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
 
         env.events().publish(
             (Symbol::new(&env, "redeemed"),),
@@ -340,17 +423,28 @@ impl BondIssuer {
     }
 
     pub fn get_bond(env: Env, bond_id: u64) -> Result<BondConfig, BondError> {
-        env.storage()
-            .instance()
+        let config: BondConfig = env
+            .storage()
+            .persistent()
             .get(&DataKey::BondConfig(bond_id))
-            .ok_or(BondError::BondNotFound)
+            .ok_or(BondError::BondNotFound)?;
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
+        Ok(config)
     }
 
     pub fn get_bond_state(env: Env, bond_id: u64) -> Result<BondState, BondError> {
-        env.storage()
-            .instance()
+        let config: BondConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondConfig(bond_id))
+            .ok_or(BondError::BondNotFound)?;
+        let state: BondState = env
+            .storage()
+            .persistent()
             .get(&DataKey::BondState(bond_id))
-            .ok_or(BondError::BondNotFound)
+            .ok_or(BondError::BondNotFound)?;
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
+        Ok(state)
     }
 
     pub fn get_holder_balance(env: Env, bond_id: u64, holder: Address) -> i128 {
@@ -360,21 +454,71 @@ impl BondIssuer {
             .unwrap_or(0)
     }
 
+    /// Full on-chain holder list for `bond_id`, in insertion order.
+    pub fn get_holder_list(env: Env, bond_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HolderList(bond_id))
+            .unwrap_or(vec![&env])
+    }
+
+    /// Number of distinct holders ever recorded for `bond_id`.
+    pub fn get_holder_count(env: Env, bond_id: u64) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::HolderCount(bond_id))
+            .unwrap_or(0)
+    }
+
+    /// Returns up to `count` holder addresses for `bond_id` starting at index
+    /// `start` of the persistent `HolderList`, preserving insertion order.
+    /// Mirrors `get_bond_ids_range` so the API can page through the holder
+    /// list without materialising it in a single call.
+    pub fn get_holder_list_range(env: Env, bond_id: u64, start: u32, count: u32) -> Vec<Address> {
+        let holder_list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderList(bond_id))
+            .unwrap_or(vec![&env]);
+        let mut result: Vec<Address> = vec![&env];
+
+        let len = holder_list.len();
+        if count == 0 || start >= len {
+            return result;
+        }
+
+        let end = ((start as u64) + (count as u64)).min(len as u64) as u32;
+        for i in start..end {
+            if let Some(addr) = holder_list.get(i) {
+                result.push_back(addr);
+            }
+        }
+
+        result
+    }
+
     pub fn total_supply(env: Env, bond_id: u64) -> Result<i128, BondError> {
         let config: BondConfig = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondConfig(bond_id))
             .ok_or(BondError::BondNotFound)?;
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
         Ok(config.total_supply)
     }
 
     pub fn total_subscribed(env: Env, bond_id: u64) -> Result<i128, BondError> {
+        let config: BondConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondConfig(bond_id))
+            .ok_or(BondError::BondNotFound)?;
         let state: BondState = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondState(bond_id))
             .ok_or(BondError::BondNotFound)?;
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
         Ok(state.total_subscribed)
     }
 
@@ -383,6 +527,41 @@ impl BondIssuer {
             .instance()
             .get(&DataKey::BondCount)
             .unwrap_or(0)
+    }
+
+    pub fn get_all_bond_ids(env: Env) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BondList)
+            .unwrap_or(vec![&env])
+    }
+
+    /// Returns up to `count` bond IDs starting at index `start` of the
+    /// persistent `BondList`, preserving issuance order. `start` is a
+    /// zero-based offset into the list, not a bond ID. Returns an empty
+    /// vector when `start` is beyond the end of the list or when `count`
+    /// is zero. Does not modify storage.
+    pub fn get_bond_ids_range(env: Env, start: u32, count: u32) -> Vec<u64> {
+        let bond_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondList)
+            .unwrap_or(vec![&env]);
+        let mut result: Vec<u64> = vec![&env];
+
+        let len = bond_list.len();
+        if count == 0 || start >= len {
+            return result;
+        }
+
+        let end = ((start as u64) + (count as u64)).min(len as u64) as u32;
+        for i in start..end {
+            if let Some(id) = bond_list.get(i) {
+                result.push_back(id);
+            }
+        }
+
+        result
     }
 
     pub fn mature_bond(
@@ -409,15 +588,17 @@ impl BondIssuer {
 
         let config: BondConfig = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondConfig(bond_id))
             .ok_or(BondError::BondNotFound)?;
 
         let mut state: BondState = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::BondState(bond_id))
             .ok_or(BondError::BondNotFound)?;
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
 
         if state.status != BondStatus::Active {
             return Err(BondError::BondAlreadyMatured);
@@ -429,8 +610,10 @@ impl BondIssuer {
 
         state.status = BondStatus::Matured;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::BondState(bond_id), &state);
+
+        extend_bond_ttl(&env, bond_id, config.maturity_date);
 
         env.events().publish(
             (Symbol::new(&env, "bond_matured"),),
@@ -444,7 +627,10 @@ impl BondIssuer {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, vec, BytesN};
+    use soroban_sdk::{
+        testutils::Address as _, testutils::Ledger as _, testutils::storage::Persistent as _,
+        vec, BytesN,
+    };
 
     fn create_project_id(env: &Env, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
@@ -835,6 +1021,120 @@ mod test {
     }
 
     #[test]
+    fn test_holder_list_tracks_subscribers() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &2000, &0);
+        client.subscribe(&user2, &bond_id, &3000, &0);
+
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_list(&bond_id),
+            vec![&env, user.clone(), user2.clone()]
+        );
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &0, &1),
+            vec![&env, user.clone()]
+        );
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &1, &10),
+            vec![&env, user2.clone()]
+        );
+    }
+
+    #[test]
+    fn test_holder_list_dedupes_repeat_subscriber() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &500, &0);
+        client.subscribe(&user, &bond_id, &500, &1);
+
+        assert_eq!(client.get_holder_count(&bond_id), 1);
+        assert_eq!(client.get_holder_list(&bond_id), vec![&env, user.clone()]);
+    }
+
+    #[test]
+    fn test_holder_list_appends_transfer_recipient() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &1000, &0);
+        client.transfer(&user, &user2, &bond_id, &600);
+
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_list(&bond_id),
+            vec![&env, user.clone(), user2.clone()]
+        );
+        assert_eq!(client.get_holder_balance(&bond_id, &user), 400);
+        assert_eq!(client.get_holder_balance(&bond_id, &user2), 600);
+    }
+
+    #[test]
+    fn test_holder_list_keeps_source_after_full_transfer() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &1000, &0);
+        client.transfer(&user, &user2, &bond_id, &1000);
+
+        // The source keeps a zero balance and remains in the list; the API
+        // filters zero-balance addresses out at distribution time.
+        assert_eq!(client.get_holder_balance(&bond_id, &user), 0);
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_list(&bond_id),
+            vec![&env, user.clone(), user2.clone()]
+        );
+    }
+
+    #[test]
+    fn test_holder_list_empty_for_new_bond() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        assert_eq!(client.get_holder_count(&bond_id), 0);
+        assert_eq!(client.get_holder_list(&bond_id), vec![&env]);
+        assert_eq!(client.get_holder_list_range(&bond_id, &0, &20), vec![&env]);
+    }
+
+    #[test]
+    fn test_holder_list_range_pagination() {
+        let (env, client, admin, _user) = setup();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&a, &bond_id, &100, &0);
+        client.subscribe(&b, &bond_id, &200, &0);
+        client.subscribe(&c, &bond_id, &300, &0);
+
+        assert_eq!(client.get_holder_count(&bond_id), 3);
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &0, &2),
+            vec![&env, a.clone(), b.clone()]
+        );
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &2, &2),
+            vec![&env, c.clone()]
+        );
+        assert_eq!(client.get_holder_list_range(&bond_id, &3, &20), vec![&env]);
+        assert_eq!(client.get_holder_list_range(&bond_id, &0, &0), vec![&env]);
+    }
+
+    #[test]
     fn test_bond_count() {
         let (env, client, admin, _user) = setup();
         assert_eq!(client.bond_count(), 0);
@@ -846,6 +1146,271 @@ mod test {
 
         client.issue_bond(&admin, &config, &1);
         assert_eq!(client.bond_count(), 2);
+    }
+
+    #[test]
+    fn test_get_all_bond_ids_empty() {
+        let (env, client, _admin, _user) = setup();
+        assert_eq!(client.get_all_bond_ids(), vec![&env]);
+    }
+
+    #[test]
+    fn test_get_bond_ids_range_empty() {
+        let (env, client, _admin, _user) = setup();
+        assert_eq!(client.get_bond_ids_range(&0, &20), vec![&env]);
+    }
+
+    #[test]
+    fn test_bond_list_first_bond() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+
+        let bond_id = client.issue_bond(&admin, &config, &0);
+        assert_eq!(bond_id, 1);
+
+        assert_eq!(client.get_all_bond_ids(), vec![&env, 1u64]);
+        assert_eq!(client.get_bond_ids_range(&0, &20), vec![&env, 1u64]);
+        assert_eq!(client.bond_count(), 1);
+    }
+
+    #[test]
+    fn test_bond_list_multiple_bonds() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+
+        for nonce in 0..5u64 {
+            let bond_id = client.issue_bond(&admin, &config, &nonce);
+            assert_eq!(bond_id, nonce + 1);
+        }
+
+        let ids = client.get_all_bond_ids();
+        assert_eq!(ids, vec![&env, 1u64, 2u64, 3u64, 4u64, 5u64]);
+        assert_eq!(ids.len(), 5);
+        assert_eq!(client.bond_count(), 5);
+
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            let bond = client.get_bond(&id);
+            assert_eq!(bond.face_value, 1000);
+        }
+    }
+
+    #[test]
+    fn test_bond_ids_range() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+
+        for nonce in 0..5u64 {
+            client.issue_bond(&admin, &config, &nonce);
+        }
+
+        assert_eq!(
+            client.get_bond_ids_range(&0, &3),
+            vec![&env, 1u64, 2u64, 3u64]
+        );
+        assert_eq!(
+            client.get_bond_ids_range(&2, &2),
+            vec![&env, 3u64, 4u64]
+        );
+        assert_eq!(
+            client.get_bond_ids_range(&4, &20),
+            vec![&env, 5u64]
+        );
+        assert_eq!(client.get_bond_ids_range(&5, &20), vec![&env]);
+        assert_eq!(client.get_bond_ids_range(&100, &20), vec![&env]);
+        assert_eq!(client.get_bond_ids_range(&0, &0), vec![&env]);
+        assert_eq!(client.get_all_bond_ids(), vec![&env, 1u64, 2u64, 3u64, 4u64, 5u64]);
+    }
+
+    // --- Issue #94: Persistent storage + TTL tests ---
+
+    #[test]
+    fn test_bond_config_state_written_to_persistent() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        let contract_addr = client.address.clone();
+        let config_key = DataKey::BondConfig(bond_id);
+        let state_key = DataKey::BondState(bond_id);
+
+        env.as_contract(&contract_addr, || {
+            assert!(env.storage().persistent().has(&config_key));
+            assert!(env.storage().persistent().has(&state_key));
+            assert!(!env.storage().instance().has(&config_key));
+            assert!(!env.storage().instance().has(&state_key));
+        });
+    }
+
+    #[test]
+    fn test_ttl_extended_on_read() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        let contract_addr = client.address.clone();
+        let config_key = DataKey::BondConfig(bond_id);
+
+        env.ledger().set_sequence_number(100);
+        let _ = client.get_bond(&bond_id);
+        let ttl_after_first = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&config_key)
+        });
+        assert!(ttl_after_first > 0);
+
+        env.ledger().set_sequence_number(500);
+        let _ = client.get_bond(&bond_id);
+        let ttl_after_second = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&config_key)
+        });
+        assert!(ttl_after_second > 0);
+        assert!(ttl_after_second >= ttl_after_first - 400);
+    }
+
+    #[test]
+    fn test_ttl_extended_on_write_subscribe() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        let contract_addr = client.address.clone();
+        let config_key = DataKey::BondConfig(bond_id);
+        let state_key = DataKey::BondState(bond_id);
+
+        env.ledger().set_sequence_number(100);
+        client.subscribe(&user, &bond_id, &500, &0);
+        let (ttl_config, ttl_state) = env.as_contract(&contract_addr, || {
+            (
+                env.storage().persistent().get_ttl(&config_key),
+                env.storage().persistent().get_ttl(&state_key),
+            )
+        });
+        assert!(ttl_config > 0);
+        assert!(ttl_state > 0);
+    }
+
+    #[test]
+    fn test_ttl_extended_on_write_transfer() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+        client.subscribe(&user, &bond_id, &1000, &0);
+
+        let contract_addr = client.address.clone();
+        let config_key = DataKey::BondConfig(bond_id);
+        let state_key = DataKey::BondState(bond_id);
+
+        env.ledger().set_sequence_number(100);
+        client.transfer(&user, &user2, &bond_id, &500);
+        let (ttl_config, ttl_state) = env.as_contract(&contract_addr, || {
+            (
+                env.storage().persistent().get_ttl(&config_key),
+                env.storage().persistent().get_ttl(&state_key),
+            )
+        });
+        assert!(ttl_config > 0);
+        assert!(ttl_state > 0);
+    }
+
+    #[test]
+    fn test_ttl_extended_on_write_redeem() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+        client.subscribe(&user, &bond_id, &3000, &0);
+        env.ledger().set_timestamp(config.maturity_date);
+        client.mature_bond(&admin, &bond_id, &1);
+
+        let contract_addr = client.address.clone();
+        let state_key = DataKey::BondState(bond_id);
+
+        env.ledger().set_sequence_number(100);
+        client.redeem(&user, &bond_id, &1000, &1);
+        let ttl_state = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&state_key)
+        });
+        assert!(ttl_state > 0);
+    }
+
+    #[test]
+    fn test_ttl_extended_on_write_mature_bond() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+        client.subscribe(&user, &bond_id, &3000, &0);
+
+        let contract_addr = client.address.clone();
+        let config_key = DataKey::BondConfig(bond_id);
+        let state_key = DataKey::BondState(bond_id);
+
+        env.ledger().set_timestamp(config.maturity_date);
+        env.ledger().set_sequence_number(100);
+        client.mature_bond(&admin, &bond_id, &1);
+        let (ttl_config, ttl_state) = env.as_contract(&contract_addr, || {
+            (
+                env.storage().persistent().get_ttl(&config_key),
+                env.storage().persistent().get_ttl(&state_key),
+            )
+        });
+        assert!(ttl_config > 0);
+        assert!(ttl_state > 0);
+    }
+
+    #[test]
+    fn test_ttl_scales_with_maturity_date() {
+        let (env, client, admin, _user) = setup();
+
+        let mut config_short = make_config(&env);
+        config_short.maturity_date = 500_000;
+        config_short.coupon_schedule = vec![&env, 100_000u64, 200_000u64];
+        let bond_short = client.issue_bond(&admin, &config_short, &0);
+
+        let mut config_long = make_config(&env);
+        config_long.maturity_date = 3_000_000;
+        let bond_long = client.issue_bond(&admin, &config_long, &1);
+
+        let contract_addr = client.address.clone();
+        let key_short = DataKey::BondConfig(bond_short);
+        let key_long = DataKey::BondConfig(bond_long);
+
+        let (ttl_short, ttl_long) = env.as_contract(&contract_addr, || {
+            (
+                env.storage().persistent().get_ttl(&key_short),
+                env.storage().persistent().get_ttl(&key_long),
+            )
+        });
+
+        assert!(ttl_long > ttl_short);
+    }
+
+    #[test]
+    fn test_regression_entry_survives_near_ttl_expiry() {
+        let (env, client, admin, _user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        let contract_addr = client.address.clone();
+        let config_key = DataKey::BondConfig(bond_id);
+
+        let initial_ttl = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&config_key)
+        });
+        assert!(initial_ttl > 0);
+
+        env.ledger().set_sequence_number(1 + initial_ttl - 5);
+        let ttl_before = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&config_key)
+        });
+        assert!(ttl_before <= 10);
+
+        let stored = client.get_bond(&bond_id);
+        assert_eq!(stored.face_value, 1000);
+
+        let ttl_after = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&config_key)
+        });
+        assert!(ttl_after > ttl_before);
     }
 
     mod property {

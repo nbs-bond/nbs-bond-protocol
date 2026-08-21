@@ -1,4 +1,4 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import {
   Horizon,
   Keypair,
@@ -12,12 +12,26 @@ interface CacheEntry<T> {
   expiresAt: number;
 }
 
+interface StreamState {
+  publicKey: string;
+  onPayment: (payment: Horizon.ServerApi.PaymentOperationRecord) => void;
+  cursor?: string;
+  closeFn: (() => void) | null;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  backoffMs: number;
+}
+
+const INITIAL_BACKOFF_MS = 1_000;
+const MAX_BACKOFF_MS = 30_000;
+
 @Injectable()
 export class StellarService {
+  private readonly logger = new Logger(StellarService.name);
   private horizon: Horizon.Server;
   private networkPassphrase: string;
   private accountCache: Map<string, CacheEntry<Horizon.AccountResponse>> = new Map();
   private readonly CACHE_TTL_MS = 30_000;
+  private streamState: StreamState | null = null;
 
   constructor() {
     this.horizon = new Horizon.Server(
@@ -80,19 +94,89 @@ export class StellarService {
     onPayment: (payment: Horizon.ServerApi.PaymentOperationRecord) => void,
     cursor?: string,
   ): () => void {
+    this.closePaymentStream();
+
+    this.streamState = {
+      publicKey,
+      onPayment,
+      cursor,
+      closeFn: null,
+      reconnectTimer: null,
+      backoffMs: INITIAL_BACKOFF_MS,
+    };
+
+    this.openPaymentStream(this.streamState);
+
+    return () => this.closePaymentStream();
+  }
+
+  private openPaymentStream(state: StreamState): void {
     const builder = this.horizon
       .payments()
-      .forAccount(publicKey);
+      .forAccount(state.publicKey);
 
-    if (cursor) {
-      builder.cursor(cursor);
+    if (state.cursor) {
+      builder.cursor(state.cursor);
     }
 
-    return builder.stream({
+    state.closeFn = builder.stream({
       onmessage: (value) => {
-        onPayment(value as unknown as Horizon.ServerApi.PaymentOperationRecord);
+        state.backoffMs = INITIAL_BACKOFF_MS;
+        state.onPayment(value as unknown as Horizon.ServerApi.PaymentOperationRecord);
+      },
+      onerror: (event) => {
+        this.logger.error(
+          `Payment stream error for ${state.publicKey}: ${event.data ?? 'unknown error'}`,
+        );
+        this.closeCurrentStream(state);
+        this.scheduleReconnect(state);
       },
     });
+  }
+
+  private closeCurrentStream(state: StreamState): void {
+    if (state.closeFn) {
+      state.closeFn();
+      state.closeFn = null;
+    }
+  }
+
+  private scheduleReconnect(state: StreamState): void {
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+    }
+
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      if (this.streamState === state) {
+        this.logger.log(
+          `Reconnecting payment stream for ${state.publicKey} after ${state.backoffMs}ms`,
+        );
+        this.openPaymentStream(state);
+      }
+    }, state.backoffMs);
+
+    state.backoffMs = Math.min(state.backoffMs * 2, MAX_BACKOFF_MS);
+  }
+
+  private closePaymentStream(): void {
+    if (!this.streamState) {
+      return;
+    }
+
+    const state = this.streamState;
+
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+
+    this.closeCurrentStream(state);
+    this.streamState = null;
+  }
+
+  isPaymentStreamActive(): boolean {
+    return this.streamState != null && this.streamState.closeFn != null;
   }
 
   getKeypairFromSecret(secretKey: string): Keypair {

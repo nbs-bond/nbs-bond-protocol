@@ -495,7 +495,7 @@ Maintains the canonical on-chain registry of all NbS projects eligible for bond 
 
 ### `CreditRetirement`
 
-Handles the permanent on-chain retirement of carbon and biodiversity credits. Retired credits are burned and a retirement certificate NFT is issued to the retiring wallet — usable for corporate net-zero disclosures.
+Handles the permanent on-chain retirement of carbon and biodiversity credits. Retired credits are burned and a retirement certificate is recorded for the retiring wallet, carrying the bond, project, oracle report and vintage year the credits originated from — usable for corporate net-zero disclosures. See [docs/retirement-certificates.md](docs/retirement-certificates.md).
 
 ---
 
@@ -591,6 +591,27 @@ npm run typecheck          # tsc --noEmit
 ```
 
 To point an adapter at a live registry instead, set the matching environment variable (`VERRA_REGISTRY_URL`, `SATELLITE_API_URL`, `IOT_API_URL`, `BLUE_CARBON_API_URL`) and call the exported ingest function, e.g. `pollVerraProject('VCS-1234', { periodStart: '2025-01-01', periodEnd: '2025-03-31' })`.
+
+### Degradation alerts
+
+A `degraded`/`down` adapter health status now triggers action instead of being
+silent. When the oracle monitor serves `GET /health`, each probe result is fed
+through a `ProviderAlertTracker` (`oracle/health.ts`) that:
+
+- emits a **structured log event** (provider, provider address, methodology,
+  `consecutiveMissedWindows`, `lastSeenAt`, status, checked-at, upstream URL) so
+  an on-call engineer has full context;
+- **POSTs a documented webhook payload** to `ORACLE_ALERT_WEBHOOK`
+  (PagerDuty / Slack / OpsGenie) when configured — see
+  [docs/runbook-degraded-providers.md](docs/runbook-degraded-providers.md) for
+  the schema and the alert lifecycle;
+- **rate-limits alerts per provider** via `ORACLE_ALERT_COOLDOWN_MS` (default
+  1h) so a provider oscillating healthy/degraded within one reporting window
+  cannot cause alert fatigue; while it stays degraded the alert re-fires at
+  most once per cooldown;
+- delivers the webhook **fire-and-forget** with a short timeout
+  (`ORACLE_ALERT_TIMEOUT_MS`, default 2s) — a slow or unreachable webhook
+  endpoint never blocks health checks or the monitoring of other providers.
 
 ### Measurement models
 
@@ -716,21 +737,36 @@ cd contracts && cargo build --release && cd ..
 
 ```bash
 # 1. Configure environment
-cp api/.env.example api/.env
+cp .env.example api/.env
 # Edit api/.env with your Stellar keys and API credentials
 
 # 2. Deploy contracts to testnet
 ./scripts/deploy-testnet.sh
 
-# 3. Start the API server
+# 3. Seed one bond, two oracle providers, and a verified report
+set -a && source api/.env && set +a
+NODE_PATH=api/node_modules api/node_modules/.bin/ts-node --transpile-only scripts/seed-testnet.ts
+
+# 4. Start the API server
 cd api && npm run start:dev
 
-# 4. Start the Angular frontend
+# 5. Start the Angular frontend
 cd frontend && ng serve
 
-# 5. Open the app
+# 6. Open the app
 open http://localhost:4200
 ```
+
+### Wallet Requirement (Freighter)
+
+Signing in requires the [Freighter](https://www.freighter.app/) browser extension. If it is
+not installed, the app shows an install prompt linking to the listing for your browser
+(Chrome Web Store for Chrome, Brave and Edge; Firefox Add-ons for Firefox) rather than
+failing silently. Install the extension and use **I have installed it — retry** — no page
+reload needed, since Freighter injects itself as soon as its content script runs.
+
+Prompts you dismiss inside Freighter (connection or signature requests) are reported as
+declined, distinct from the extension being absent.
 
 ---
 
@@ -763,6 +799,8 @@ IPFS_API_URL=https://api.pinata.cloud
 IPFS_API_KEY=your_pinata_api_key
 IPFS_SECRET_KEY=your_pinata_secret_key
 IPFS_GATEWAY=https://gateway.pinata.cloud/ipfs/
+IPFS_LOCAL_API_URL=http://localhost:5001/api/v0
+REQUIRE_IPFS_PINNING=false
 
 # ── Oracle ───────────────────────────────────────────────────────
 # Whitelisted provider addresses allowed to submit reports
@@ -784,6 +822,12 @@ PORT=3000
 NODE_ENV=development
 LOG_LEVEL=debug
 ```
+
+Project documents are uploaded and pinned directly through Pinata when both
+Pinata credentials are configured. Without credentials, non-production
+environments use `IPFS_LOCAL_API_URL` and log that remote pinning was skipped.
+Production always requires Pinata credentials; set `REQUIRE_IPFS_PINNING=true`
+to enforce the same behavior in another environment.
 
 ---
 
@@ -917,6 +961,7 @@ nbs-bond-protocol/
 | `GET` | `/bonds/:id` | Get bond tranche details |
 | `POST` | `/bonds/:id/subscribe` | Subscribe to a bond tranche |
 | `GET` | `/bonds/:id/holders` | List all token holders |
+| `GET` | `/bonds/:id/periods` | Coupon period history (paginated, optional `?include_report=true`) |
 | `POST` | `/bonds/:id/coupon` | Trigger coupon distribution (admin) |
 
 ### Projects
@@ -944,6 +989,8 @@ nbs-bond-protocol/
 | `POST` | `/oracle/reports` | Submit a measurement report (providers only) |
 | `GET` | `/oracle/reports/:projectId` | Get oracle history for a project |
 | `POST` | `/oracle/challenge/:reportId` | Challenge a submitted report |
+| `GET` | `/oracle/providers` | List registered oracle providers with stake and health |
+| `POST` | `/oracle/providers` | Register a new oracle provider (admin only) |
 
 ---
 
@@ -972,12 +1019,63 @@ cd api
 # Unit tests
 npm run test
 
-# Integration tests (requires testnet connection)
+# E2E tests
 npm run test:e2e
 
 # Coverage report
 npm run test:cov
 ```
+
+#### E2E test suites
+
+`npm run test:e2e` runs two categories of suite:
+
+| Suite | Keys required | Behaviour when keys absent |
+|---|---|---|
+| **API validation** | None | Always runs — uses an in-process probe controller, no network |
+| **Signing suites** (bond issuance, investor subscription) | `ADMIN_SECRET_KEY`, `INVESTOR_SECRET_KEY` | Skipped automatically with a log message |
+
+The skip logic lives in `api/test/testenv.ts` and uses `describe.skip` at
+collection time (not `test.skip` inside `beforeAll`), which is the correct
+Jest primitive for conditionally skipping a suite.
+
+**To enable the signing suites against testnet:**
+
+1. Copy `.env.example` to `api/.env` and fill in real Stellar testnet keys:
+
+   ```env
+   ADMIN_SECRET_KEY=S<55 base32 chars>   # valid StrKey-encoded Ed25519 seed
+   INVESTOR_SECRET_KEY=S<55 base32 chars>
+   USER_SECRET_KEY=S<55 base32 chars>
+   ```
+
+   Keys must satisfy the full Stellar StrKey spec — starts with `S`, 56
+   characters total, valid base32 checksum. The validation uses
+   `StrKey.isValidEd25519SecretSeed()` from `@stellar/stellar-sdk`, not a
+   simple regex, so near-valid keys are also caught before reaching the
+   network.
+
+2. Fund each account via Friendbot (testnet only):
+
+   ```
+   https://friendbot.stellar.org/?addr=<YOUR_PUBLIC_KEY>
+   ```
+
+   A correctly formatted key that has never been funded will still produce
+   `tx_failed` errors. Funding is required before any signing test can
+   succeed.
+
+3. Deploy the contracts to testnet:
+
+   ```bash
+   ./scripts/deploy-testnet.sh
+   ```
+
+4. Run:
+
+   ```bash
+   cd api && npm run test:e2e
+   ```
 
 ### Frontend
 
@@ -1001,7 +1099,7 @@ ng e2e
 # Deploy all contracts to Stellar testnet
 ./scripts/deploy-testnet.sh
 
-# The script writes contract addresses into .env automatically
+# The script writes contract addresses into api/.env automatically
 # BOND_ISSUER_ADDRESS=C...
 # COUPON_ENGINE_ADDRESS=C...
 # etc.
@@ -1018,12 +1116,22 @@ ng e2e
 
 ### Docker
 
+> **Requirement:** Docker Compose **v2** (bundled with Docker Desktop 4.x and recent
+> Docker Engine). The stack relies on the Compose Specification
+> (`depends_on: { condition: service_healthy }`), which legacy Compose v1 does not
+> support. Verify with `docker compose version`.
+
 ```bash
-# Start all services (API + PostgreSQL + Redis)
-docker-compose up -d
+# Start all services (API + PostgreSQL + Redis).
+# The API waits for Postgres and Redis to become healthy before starting, so it
+# no longer crashes on the first request while the database is still initializing.
+docker compose up -d
 
 # View logs
-docker-compose logs -f api
+docker compose logs -f api
+
+# Watch dependency health status
+docker compose ps
 ```
 
 ---

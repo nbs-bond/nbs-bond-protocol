@@ -1,13 +1,14 @@
-import { Component, inject, ChangeDetectionStrategy } from '@angular/core';
+import { Component, inject, signal, computed, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router } from '@angular/router';
 import { WalletService } from './wallet.service';
 import { AuthService } from './auth.service';
+import { FreighterInstallPromptComponent } from './freighter-install-prompt.component';
 
 @Component({
   selector: 'app-auth',
   standalone: true,
-  imports: [CommonModule],
+  imports: [CommonModule, FreighterInstallPromptComponent],
   template: `
     <div class="auth-page">
       <div class="auth-card">
@@ -15,7 +16,7 @@ import { AuthService } from './auth.service';
         <p class="subtitle">Sign in with your Stellar wallet</p>
 
         <ng-container *ngIf="!walletService.isConnected()">
-          <button class="btn btn-primary" (click)="walletService.connect()" [disabled]="walletService.isConnecting()">
+          <button class="btn btn-primary" (click)="connect()" [disabled]="walletService.isConnecting()">
             {{ walletService.isConnecting() ? 'Connecting...' : 'Connect Wallet' }}
           </button>
         </ng-container>
@@ -29,7 +30,12 @@ import { AuthService } from './auth.service';
           </button>
         </ng-container>
 
-        <p *ngIf="error" class="error">{{ error }}</p>
+        <app-freighter-install-prompt
+          *ngIf="walletService.needsInstall()"
+          (retry)="connect()"
+        />
+
+        <p *ngIf="errorMessage()" class="error">{{ errorMessage() }}</p>
       </div>
     </div>
   `,
@@ -43,6 +49,7 @@ import { AuthService } from './auth.service';
     .btn-primary { background: #1a1a2e; color: #fff; }
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
     .error { color: #ef4444; margin-top: 12px; font-size: 0.875rem; }
+    app-freighter-install-prompt { display: block; margin-top: 16px; }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
@@ -51,15 +58,28 @@ export class AuthComponent {
   readonly walletService = inject(WalletService);
   readonly authService = inject(AuthService);
 
-  error = '';
+  private readonly signInError = signal('');
+
+  /** A missing extension is reported by the install prompt, not as plain error text. */
+  readonly errorMessage = computed(() => {
+    const walletError = this.walletService.error();
+    if (walletError && walletError.kind !== 'not-installed') return walletError.message;
+    return this.signInError();
+  });
+
+  /** `connect()` resolves rather than rejecting, so a failure always reaches the UI. */
+  async connect(): Promise<void> {
+    this.signInError.set('');
+    await this.walletService.connect();
+  }
 
   async signIn(): Promise<void> {
-    this.error = '';
+    this.signInError.set('');
     try {
       await this.authService.login();
       await this.router.navigate(['/dashboard']);
     } catch (e: any) {
-      this.error = e.message || 'Sign in failed';
+      this.signInError.set(e.message || 'Sign in failed');
     }
   }
 }

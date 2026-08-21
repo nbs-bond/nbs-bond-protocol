@@ -3,13 +3,15 @@ import * as fs from 'fs';
 import {
   AdapterHealth,
   HealthCheckConfig,
+  HealthCheckOptions,
   runHealthChecks,
   checkAdapterHealth,
   defaultHealthChecks,
+  AlertNotificationOptions,
+  ProviderAlertTracker,
 } from './health';
 import {
   StalenessInput,
-  StalenessResult,
   computeStaleness,
   cadenceForMethodology,
 } from './staleness';
@@ -20,6 +22,8 @@ interface StalenessRequestBody {
   projects?: Array<
     Omit<StalenessInput, 'cadenceSeconds'> & { methodology?: string }
   >;
+  /** Unix timestamp in seconds, matching Soroban's ledger timestamp. */
+  referenceTimestamp?: number;
 }
 
 function readStalenessFile(filePath?: string): StalenessInput[] | null {
@@ -35,6 +39,25 @@ function readStalenessFile(filePath?: string): StalenessInput[] | null {
 function sendJson(response: http.ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { 'Content-Type': 'application/json' });
   response.end(JSON.stringify(body));
+}
+
+function resolveReferenceTimestamp(value: unknown): number {
+  if (value === undefined || value === null || value === '') {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error('referenceTimestamp must be a non-negative Unix timestamp in seconds');
+  }
+  return parsed;
+}
+
+function stalenessResponse(inputs: StalenessInput[], referenceTimestamp: number): unknown {
+  return {
+    asOf: new Date(referenceTimestamp * 1000).toISOString(),
+    projects: computeStaleness(inputs, referenceTimestamp),
+  };
 }
 
 function readBody(request: http.IncomingMessage): Promise<string> {
@@ -56,19 +79,32 @@ function readBody(request: http.IncomingMessage): Promise<string> {
  * Start the oracle monitor HTTP server.
  *
  * Endpoints:
- *   GET  /health                 per-adapter health check
- *   GET  /staleness              staleness from ORACLE_STALENESS_FILE (optional)
+ *   GET  /health                 per-adapter health check (feeds degradation alerts)
+ *   GET  /staleness              staleness from ORACLE_STALENESS_FILE
  *   POST /staleness              staleness computed from a JSON body
+ *
+ * Both staleness endpoints accept an optional `referenceTimestamp` Unix
+ * timestamp in seconds, matching Soroban's ledger timestamp.
+ *
+ * When `alertOptions` is provided (or `ORACLE_ALERT_WEBHOOK` is set), every
+ * `GET /health` probe is fed through a `ProviderAlertTracker`: providers that
+ * degrade emit structured log events and a fire-and-forget webhook POST, at
+ * most once per cooldown per provider. Alert delivery never blocks the
+ * health response.
  */
 export function startMonitorServer(
   adapters: HealthCheckConfig[] = [],
   port: number = DEFAULT_PORT,
+  alertOptions: AlertNotificationOptions = {},
+  healthOptions: HealthCheckOptions = {},
 ): http.Server {
+  const tracker = new ProviderAlertTracker(alertOptions);
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://localhost');
 
     if (url.pathname === '/health' && request.method === 'GET') {
-      const health: AdapterHealth[] = await runHealthChecks(adapters);
+      const health: AdapterHealth[] = await runHealthChecks(adapters, healthOptions);
+      health.forEach((entry) => tracker.evaluate(entry));
       sendJson(response, 200, {
         asOf: new Date().toISOString(),
         status: health.some((entry) => entry.status === 'down') ? 'down' : 'ok',
@@ -85,7 +121,16 @@ export function startMonitorServer(
         });
         return;
       }
-      sendJson(response, 200, { asOf: new Date().toISOString(), projects: computeStaleness(inputs) });
+      try {
+        const referenceTimestamp = resolveReferenceTimestamp(
+          url.searchParams.get('referenceTimestamp'),
+        );
+        sendJson(response, 200, stalenessResponse(inputs, referenceTimestamp));
+      } catch (error) {
+        sendJson(response, 400, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return;
     }
 
@@ -101,8 +146,10 @@ export function startMonitorServer(
           cadenceSeconds: project.cadenceSeconds ?? cadenceForMethodology(project.methodology ?? ''),
           graceSeconds: project.graceSeconds,
         }));
-        const results: StalenessResult[] = computeStaleness(inputs);
-        sendJson(response, 200, { asOf: new Date().toISOString(), projects: results });
+        const referenceTimestamp = resolveReferenceTimestamp(
+          body.referenceTimestamp ?? url.searchParams.get('referenceTimestamp'),
+        );
+        sendJson(response, 200, stalenessResponse(inputs, referenceTimestamp));
       } catch (error) {
         sendJson(response, 400, {
           error: error instanceof Error ? error.message : String(error),

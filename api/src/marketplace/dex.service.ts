@@ -36,6 +36,7 @@ const DEX_ERROR_CODE = {
   ZeroAmount: 9,
   InsufficientFunds: 10,
   Overflow: 11,
+  SellerBalanceDepleted: 12,
 } as const;
 
 @Injectable()
@@ -103,7 +104,8 @@ export class DexService {
 
   async listBondTokens(dto: ListBondDto, sellerAddress: string): Promise<OrderResponse> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), sellerAddress);
+    const adminPublicKey = this.getAdminPublicKey();
+    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
     const { result } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'list_bond_tokens', adminSecret,
@@ -113,7 +115,7 @@ export class DexService {
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
         nativeToScVal(BigInt(dto.pricePerToken), { type: 'i128' }),
         nativeToScVal(dto.quoteAsset, { type: 'symbol' }),
-        nativeToScVal(BigInt(dto.expiresAfterSeconds || 604800), { type: 'u64' }),
+        nativeToScVal(BigInt(dto.expiresAfterSeconds ?? 86400), { type: 'u64' }),
       ],
       nonce,
     );
@@ -130,13 +132,14 @@ export class DexService {
     const escrowed = await this.getQuoteBalance(buyerAddress, order.quoteAsset);
     if (escrowed.balance < proceeds) {
       throw new BadRequestException(
-        `Insufficient escrowed ${order.quoteAsset}: required ${proceeds}, escrowed ${escrowed}. ` +
-        'Call POST /marketplace/escrow/deposit before purchasing.',
+        `Insufficient escrowed ${order.quoteAsset}: required ${proceeds}, escrowed ${escrowed.balance}. ` +
+        'Call POST /marketplace/deposit before purchasing.',
       );
     }
 
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), buyerAddress);
+    const adminPublicKey = this.getAdminPublicKey();
+    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
     try {
       await this.contractService.invokeContractMethod(
@@ -150,6 +153,12 @@ export class DexService {
         nonce,
       );
     } catch (error) {
+      // The buy attempt consumed one API-managed nonce slot before failing.
+      // Soroban transactions are atomic, so the on-chain nonce and the escrow
+      // bookkeeping were rolled back with the frame — re-sync the nonce mirror
+      // from the chain so the buyer can simply retry the purchase instead of
+      // hitting InvalidNonce on the next attempt.
+      await this.nonceService.sync(DEX_ROUTER(), adminPublicKey).catch(() => undefined);
       throw this.mapDexError(error);
     }
 
@@ -159,7 +168,8 @@ export class DexService {
 
   async cancelOrder(orderId: number, callerAddress: string): Promise<void> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
+    const adminPublicKey = this.getAdminPublicKey();
+    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
     await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'cancel_listing', adminSecret,
@@ -210,7 +220,8 @@ export class DexService {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
+    const adminPublicKey = this.getAdminPublicKey();
+    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
     const { transactionHash } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'deposit_quote', adminSecret,
@@ -222,7 +233,9 @@ export class DexService {
       nonce,
     );
 
-    return { address: callerAddress, asset: dto.asset, amount: dto.amount, transactionHash };
+    const { balance } = await this.getQuoteBalance(callerAddress, dto.asset);
+
+    return { address: callerAddress, asset: dto.asset, amount: dto.amount, balance, transactionHash };
   }
 
   async withdrawQuote(
@@ -230,7 +243,8 @@ export class DexService {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
+    const adminPublicKey = this.getAdminPublicKey();
+    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
     const { transactionHash } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'withdraw_quote', adminSecret,
@@ -242,7 +256,9 @@ export class DexService {
       nonce,
     );
 
-    return { address: callerAddress, asset: dto.asset, amount: dto.amount, transactionHash };
+    const { balance } = await this.getQuoteBalance(callerAddress, dto.asset);
+
+    return { address: callerAddress, asset: dto.asset, amount: dto.amount, balance, transactionHash };
   }
 
   private decodeOrder(data: any[]): OrderResponse {
@@ -274,6 +290,10 @@ export class DexService {
     return process.env.ADMIN_SECRET_KEY || '';
   }
 
+  private getAdminPublicKey(): string {
+    return this.stellarService.getKeypairFromSecret(this.getAdminSecret()).publicKey();
+  }
+
   private mapDexError(error: unknown): Error {
     const message = error instanceof Error ? error.message : String(error);
     const match = message.match(/#(\d+)/) ?? message.match(/Error\(-(\d+)/);
@@ -281,8 +301,25 @@ export class DexService {
 
     if (code === DEX_ERROR_CODE.InsufficientFunds) {
       return new HttpException(
-        'Insufficient escrowed funds. Call POST /marketplace/escrow/deposit before purchasing.',
+        'Insufficient escrowed funds. Call POST /marketplace/deposit before purchasing.',
         HttpStatus.PAYMENT_REQUIRED,
+      );
+    }
+
+    if (code === DEX_ERROR_CODE.SellerBalanceDepleted) {
+      return new HttpException(
+        {
+          statusCode: HttpStatus.CONFLICT,
+          error: 'Conflict',
+          message:
+            'Order could not be filled because the seller no longer holds enough ' +
+            'bond tokens. Your escrowed funds were not debited and remain ' +
+            'available. The nonce for this attempted purchase was consumed — ' +
+            'retry the purchase.',
+          reason: 'seller_balance_depleted',
+          nonce_consumed: true,
+        },
+        HttpStatus.CONFLICT,
       );
     }
 

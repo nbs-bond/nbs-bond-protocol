@@ -14,6 +14,16 @@ pub enum BondError {
     Overflow = 9,
     ReportNotVerified = 10,
     InvalidReport = 11,
+    /// The period has already been fully distributed.  Replaces the previous
+    /// overloaded use of `Overflow` (= 9) for this guard so callers can
+    /// distinguish a real arithmetic overflow from a duplicate distribution
+    /// attempt.  The old numeric value is intentionally *not* reused.
+    PeriodAlreadyDistributed = 12,
+    /// A batch call supplied a holder that was already paid in a previous
+    /// batch for the same period.  The holder is silently skipped; this
+    /// variant is returned only when the *entire* batch consists of already-
+    /// paid addresses, so callers can detect a fully-redundant call.
+    AlreadyProcessed = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +40,7 @@ pub enum OracleError {
     InsufficientStake = 9,
     InvalidSignature = 10,
     InvalidResolution = 11,
+    SelfChallenge = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +57,8 @@ pub enum DEXError {
     ZeroAmount = 9,
     InsufficientFunds = 10,
     Overflow = 11,
+    SellerBalanceDepleted = 12,
+    InvalidRange = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +83,31 @@ pub enum CreditError {
     NotAHolder = 6,
     InvalidCertificate = 7,
     InvalidCreditType = 8,
+    ProjectMismatch = 9,
+    PeriodNotFound = 10,
+    PeriodNotDistributed = 11,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracterror]
+pub enum CouponEngineError {
+    NotInitialized = 1,
+    Unauthorized = 2,
+    InvalidNonce = 3,
+    BondNotFound = 4,
+    PeriodNotFound = 5,
+    PeriodAlreadyDistributed = 6,
+    AlreadyProcessed = 7,
+    InvalidReport = 8,
+    ReportNotVerified = 9,
+    Overflow = 10,
+    ZeroAmount = 11,
+    ProjectNotApproved = 12,
+    /// A holder's combined AccruedCredits balance didn't match the sum of
+    /// their per-type balances when claim_credits or sweep_undistributed
+    /// tried to zero it out (issue #110). Returned instead of silently
+    /// destroying the mismatched amount.
+    AccountingMismatch = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,4 +123,15 @@ pub enum GovernanceError {
     TimelockNotElapsed = 8,
     NotQueued = 9,
     AlreadyExecuted = 10,
+    ProposalExpired = 11,
+    /// The proposal's `(target, method)` pair is not present in the on-chain
+    /// execution allowlist, or the proposal targets the governance contract
+    /// itself with a method that is not one of its self-administration
+    /// entrypoints. Returned by `execute` *before* the cross-contract call is
+    /// dispatched, so a rejected proposal never reaches the target.
+    UnauthorizedCall = 12,
+    /// A self-administration proposal carried an argument list that could not
+    /// be decoded into the expected types, or whose values were out of range
+    /// (for example an allowlist longer than `MAX_ALLOWED_CALLS`).
+    InvalidCallArgs = 13,
 }

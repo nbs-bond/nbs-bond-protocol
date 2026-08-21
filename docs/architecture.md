@@ -75,6 +75,10 @@ pub fn get_all_projects(...)
 // Public functions
 pub fn retire_credits(...)
 pub fn get_retirement_record(...)
+pub fn get_retirement_certificate(...)
+pub fn get_bond_retirements(...)
+pub fn get_bond_certificates(...)
+pub fn extend_retirement_ttl(...)
 pub fn get_retired_balance(...)
 ```
 
@@ -93,6 +97,10 @@ pub fn get_retired_balance(...)
 | DEXRouter | Order(order_id) | OrderData | Marketplace order |
 | DEXRouter | Balance(symbol, addr) | i128 | Escrowed quote-asset balance |
 | ProjectRegistry | Project(project_id) | ProjectInfo | Project record |
+| CreditRetirement | Retirement(id) | RetirementRecord | Retirement + certificate provenance (persistent) |
+| CreditRetirement | BondHolderRetirements(bond_id, holder) | Vec<u64> | Certificate index by bond and holder (persistent) |
+| CreditRetirement | HolderRetirements(holder) | Vec<u64> | All retirement ids for a holder (persistent) |
+| CreditRetirement | RetiredPerBond(bond_id, holder) | i128 | Credits already retired against a bond (persistent) |
 
 ## Cross-Contract Calls
 
@@ -101,7 +109,8 @@ ProjectRegistry ──► BondIssuer (verify project exists)
 BondIssuer ──► CouponEngine (distribute coupons)
 CouponEngine ──► OracleConsumer (read verified reports by report_id)
 DEXRouter ──► BondIssuer (settle purchase via transfer, debiting seller / crediting buyer)
-CreditRetirement ──► CouponEngine (verify credit ownership)
+CreditRetirement ──► CouponEngine (verify credit ownership, read PeriodInfo for the vintage window)
+CreditRetirement ──► BondIssuer (verify holding, validate the caller's project_id)
 ```
 
 ## Bond Maturity
@@ -116,6 +125,12 @@ CreditRetirement ──► CouponEngine (verify credit ownership)
 - `execute_purchase` atomically transfers bond tokens (`BondIssuer.transfer`) and escrowed quote (`price_per_token * amount`) from buyer to seller, so a fill either fully settles or fully reverts.
 - Sellers can `withdraw_quote` their proceeds; `get_quote_balance` reports escrowed balances by symbol.
 
+### Purchase failure semantics
+
+- `list_bond_tokens` checks the seller's bond holder balance at listing time. `execute_purchase` re-checks it at execution time: a seller can list tokens and transfer them away before the order fills, and the re-check rejects the fill with `DEXError::SellerBalanceDepleted` instead of stumbling into the inner `BondIssuer.transfer` failure.
+- A failed purchase is fully atomic. The transaction reverts, so the buyer's escrowed quote is never debited, the order remains `Open`, and the `purchase_failed` event (`seller_balance_depleted`) is published for observability. Note: in Soroban, events emitted by a frame that reverts are not persisted on the ledger — the event is best-effort, while the escrow rollback is the hard guarantee.
+- **Nonce behavior.** The contract keeps a per-address nonce incremented at the start of every call. Because a failed purchase reverts the entire transaction, the on-chain nonce is rolled back too — a raw contract caller can retry with the *same* nonce. The API keeps a Redis nonce mirror (`NonceService`) that is consumed on every attempt; on a failed buy the service re-syncs the mirror from the chain, so the next `/marketplace/buy` retry does not hit `InvalidNonce`. The failed attempt is surfaced as `409 Conflict` with `nonce_consumed: true`, telling the frontend the attempt consumed its nonce slot and should be retried.
+
 ## Coupon Integrity
 
 - `CouponEngine.distribute_coupon` accepts an **on-chain `report_id`** instead of a caller-supplied report, eliminating fabricated distributions.
@@ -123,6 +138,13 @@ CreditRetirement ──► CouponEngine (verify credit ownership)
 - The report's `project_id` must match the bond's registered project, otherwise distribution is rejected.
 - The verified report id is persisted in `PeriodInfo`, making every distribution auditable back to its evidence.
 - Integer-division remainder that cannot be allocated to holders is recorded as `undistributed` per period and aggregated in `UndistributedTotal`; the admin can recover it via `sweep_undistributed`, preventing value from being silently lost.
+
+## Retirement Certificates
+
+- `retire_credits` takes the `project_id` and `period_index` from the caller and validates both on-chain: the project against `BondIssuer.get_bond`, the period against `CouponEngine.get_period_info`.
+- The certificate caches `report_id`, `vintage_year`, and the monitoring window (`vintage_period_start` / `vintage_period_end`) at retirement time, so reads never re-derive the vintage from the oracle.
+- Certificates are keyed in persistent storage and indexed by `(bond_id, holder)`; `extend_retirement_ttl` is permissionless so any relying party can keep a certificate alive.
+- See [retirement-certificates.md](retirement-certificates.md) for the certificate schema, the design trade-offs, and the caller migration note.
 
 ## API Layer
 
@@ -136,6 +158,7 @@ CreditRetirement ──► CouponEngine (verify credit ownership)
 | POST | /bonds/:id/coupon | Trigger coupon distribution (by report_id) |
 | POST | /bonds/:id/claim | Claim accrued credits |
 | GET | /bonds/:id/undistributed | Get undistributed coupon dust total |
+| GET | /bonds/:id/periods | Coupon period history (paginated, optional `?include_report=true`) |
 | POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust (admin only) |
 | POST | /bonds/:id/transfer | Transfer bond tokens to another address |
 | POST | /projects | Register project |

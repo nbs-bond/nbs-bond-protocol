@@ -3,6 +3,7 @@ import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { IpfsService } from './ipfs.service';
 import { NonceService } from '../common/services/nonce.service';
+import { toBytes32 } from '../stellar/bytes32';
 import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { createClient, RedisClientType } from '@redis/client';
 import { CreateProjectDto } from './dto/create-project.dto';
@@ -39,7 +40,6 @@ export class ProjectsService {
     };
 
     const ipfsResult = await this.ipfsService.uploadJson(metadata);
-    const ipfsHash = Buffer.from(ipfsResult.hash, 'hex');
 
     const ownerSecret = process.env.USER_SECRET_KEY || '';
     const nonce = await this.nonceService.next(PROJECT_REGISTRY(), ownerAddress);
@@ -48,7 +48,7 @@ export class ProjectsService {
       PROJECT_REGISTRY(), 'register_project', ownerSecret,
       [
         Address.fromString(ownerAddress).toScVal(),
-        nativeToScVal(ipfsHash, { type: 'bytes' }),
+        toBytes32(ipfsResult.hash),
         nativeToScVal(dto.methodology, { type: 'symbol' }),
         nativeToScVal(dto.country, { type: 'symbol' }),
       ],

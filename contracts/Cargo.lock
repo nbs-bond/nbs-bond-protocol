@@ -1018,6 +1018,7 @@ version = "0.1.0"
 dependencies = [
  "nbbs-bond-issuer",
  "nbbs-oracle-consumer",
+ "nbbs-project-registry",
  "nbbs-shared",
  "proptest",
  "soroban-sdk",
@@ -1030,6 +1031,7 @@ dependencies = [
  "nbbs-bond-issuer",
  "nbbs-coupon-engine",
  "nbbs-oracle-consumer",
+ "nbbs-project-registry",
  "nbbs-shared",
  "soroban-sdk",
 ]
@@ -1048,6 +1050,8 @@ dependencies = [
 name = "nbbs-governance"
 version = "0.1.0"
 dependencies = [
+ "nbbs-bond-issuer",
+ "nbbs-oracle-consumer",
  "nbbs-project-registry",
  "nbbs-shared",
  "soroban-sdk",

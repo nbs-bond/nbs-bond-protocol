@@ -1,7 +1,10 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
+import { KycService } from '../auth/kyc.service';
+import { KycStatus } from '../common/interfaces/authenticated-request.interface';
+import { toBytes32 } from '../stellar/bytes32';
 import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { createClient, RedisClientType } from '@redis/client';
 import { CreateBondDto } from './dto/create-bond.dto';
@@ -20,7 +23,10 @@ import {
   AccruedCreditsByType,
   AccruedCreditsResponse,
   SweepUndistributedResponse,
-  AccruedCreditsResponse,
+  PeriodInfoResponse,
+  PeriodListResponse,
+  PeriodReportResponse,
+  ReportStatus,
   BondStatusEnum,
   BondMaturityStatusEnum,
   CreditTypeEnum,
@@ -28,6 +34,7 @@ import {
 
 const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
 const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
+const ORACLE_CONSUMER = () => process.env.ORACLE_CONSUMER_ADDRESS || '';
 
 // Soroban `CreditType` unit enum variants are encoded as their u32 discriminant
 // (see contracts/shared/src/types.rs).
@@ -51,12 +58,14 @@ const BOND_ERROR_CODE = {
 
 @Injectable()
 export class BondsService {
+  private readonly logger = new Logger(BondsService.name);
   private redis: RedisClientType;
 
   constructor(
     private readonly contractService: ContractService,
     private readonly stellarService: StellarService,
     private readonly nonceService: NonceService,
+    private readonly kycService: KycService,
   ) {
     this.redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
     this.redis.connect().catch(() => {});
@@ -97,14 +106,31 @@ export class BondsService {
     } catch {}
 
     const start = (page - 1) * limit;
-    const end = Math.min(start + limit, total);
 
-    for (let id = 1; id <= total; id++) {
-      if (id > start && id <= end) {
-        try {
-          bonds.push(await this.buildBondResponse(id));
-        } catch {}
-      }
+    let ids: number[];
+    try {
+      const idsScVal = await this.contractService.simulateCall({
+        contractAddress: BOND_ISSUER(), method: 'get_bond_ids_range',
+        args: [
+          nativeToScVal(start, { type: 'u32' }),
+          nativeToScVal(limit, { type: 'u32' }),
+        ],
+      });
+      ids = (scValToNative(idsScVal) as bigint[]).map(Number);
+    } catch (error) {
+      this.logger.warn(`Failed to fetch bond IDs for page ${page}: ${error instanceof Error ? error.message : error}`);
+      const stale = await this.redis.get(cacheKey);
+      if (stale) return JSON.parse(stale);
+      return {
+        data: [],
+        meta: { page, limit, total, totalPages: Math.ceil(total / limit) || 1 },
+      };
+    }
+
+    for (const id of ids) {
+      try {
+        bonds.push(await this.buildBondResponse(id));
+      } catch {}
     }
 
     const result = {
@@ -126,6 +152,19 @@ export class BondsService {
   }
 
   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+    // Gate subscription on KYC: the cached status check makes this resilient
+    // to KYC provider outages (see KycService) instead of a synchronous live
+    // call on every request.
+    const eligible = await this.kycService.isEligible(
+      dto.investorAddress,
+      KycStatus.VERIFIED,
+    );
+    if (!eligible) {
+      throw new ForbiddenException(
+        'KYC verification required before subscribing to a bond',
+      );
+    }
+
     const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
     const { transactionHash } = await this.contractService.invokeContractMethod(
@@ -149,74 +188,148 @@ export class BondsService {
     const holders = [];
 
     for (const address of holderAddresses) {
-      try {
-        const balanceScVal = await this.contractService.simulateCall({
-          contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
-          args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
-        });
-        const balance = Number(scValToNative(balanceScVal));
-        if (balance > 0) holders.push({ address, balance });
-      } catch {}
+      const balance = await this.getHolderBalance(id, address);
+      if (balance > 0) holders.push({ address, balance });
     }
 
     return { bondId: id, holders, total: holders.length };
   }
 
-  async getAccruedCredits(id: number, holder: string): Promise<AccruedCreditsResponse> {
-    const [carbonScVal, biodiversityScVal] = await Promise.all([
-      this.contractService.simulateCall({
-        contractAddress: COUPON_ENGINE(),
-        method: 'accrued_credits_by_type',
-        args: [
-          nativeToScVal(BigInt(id), { type: 'u64' }),
-          Address.fromString(holder).toScVal(),
-          nativeToScVal(CREDIT_TYPE_DISCRIMINANT.Carbon, { type: 'u32' }),
-        ],
-      }),
-      this.contractService.simulateCall({
-        contractAddress: COUPON_ENGINE(),
-        method: 'accrued_credits_by_type',
-        args: [
-          nativeToScVal(BigInt(id), { type: 'u64' }),
-          Address.fromString(holder).toScVal(),
-          nativeToScVal(CREDIT_TYPE_DISCRIMINANT.Biodiversity, { type: 'u32' }),
-        ],
-      }),
-    ]);
+  /**
+   * Returns the on-chain balance for `address` in bond `id`, or 0 when the
+   * address cannot be resolved on-chain. Used to filter the holder set passed
+   * to CouponEngine so stale (zero-balance) addresses are never forwarded.
+   */
+  private async getHolderBalance(id: number, address: string): Promise<number> {
+    try {
+      const balanceScVal = await this.contractService.simulateCall({
+        contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
+        args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+      });
+      return Number(scValToNative(balanceScVal));
+    } catch {
+      return 0;
+    }
+  }
 
-    return {
-      bondId: id,
-      holder,
-      carbon: Number(scValToNative(carbonScVal)),
-      biodiversity: Number(scValToNative(biodiversityScVal)),
-    };
+  /**
+   * Reconciles the off-chain holder set against on-chain state. Candidates are
+   * the union of the Redis `bond:<id>:holders` set and the on-chain
+   * `HolderList`, so holders who subscribed/transferred without going through
+   * the API are included, then filtered to those with a positive balance.
+   */
+  private async resolveOnChainHolders(id: number): Promise<string[]> {
+    const dbHolders = await this.redis.sMembers(`bond:${id}:holders`);
+    const onChainHolders = await this.readOnChainHolderList(id);
+
+    const candidates = new Set<string>([...dbHolders, ...onChainHolders]);
+    const holders: string[] = [];
+    for (const address of candidates) {
+      const balance = await this.getHolderBalance(id, address);
+      if (balance > 0) holders.push(address);
+    }
+    return holders;
+  }
+
+  /**
+   * Reads the on-chain holder list in pages (`get_holder_count` +
+   * `get_holder_list_range`) so a bond with many holders does not materialise
+   * the full list in a single contract call. Falls back to an empty list if
+   * the on-chain list cannot be read, leaving the DB set as the sole source.
+   */
+  private async readOnChainHolderList(id: number): Promise<string[]> {
+    try {
+      const countScVal = await this.contractService.simulateCall({
+        contractAddress: BOND_ISSUER(), method: 'get_holder_count',
+        args: [nativeToScVal(BigInt(id), { type: 'u64' })],
+      });
+      const count = Number(scValToNative(countScVal));
+
+      const pageSize = 200;
+      const holders: string[] = [];
+      for (let start = 0; start < count; start += pageSize) {
+        const pageScVal = await this.contractService.simulateCall({
+          contractAddress: BOND_ISSUER(), method: 'get_holder_list_range',
+          args: [
+            nativeToScVal(BigInt(id), { type: 'u64' }),
+            nativeToScVal(start, { type: 'u32' }),
+            nativeToScVal(pageSize, { type: 'u32' }),
+          ],
+        });
+        const page = scValToNative(pageScVal) as string[];
+        if (!page || page.length === 0) break;
+        holders.push(...page);
+      }
+      return holders;
+    } catch {
+      return [];
+    }
   }
 
   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
-    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
 
-    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+    // Reconcile the off-chain holder set against on-chain state, then fetch
+    // each holder's balance so the contract doesn't need to call
+    // BondIssuer.get_holder_balance for every address in the transaction.
+    const holderAddresses = await this.resolveOnChainHolders(id);
+    const holderBalances: Array<{ address: string; balance: bigint }> = [];
+    for (const address of holderAddresses) {
+      const balance = await this.getHolderBalance(id, address);
+      if (balance > 0) {
+        holderBalances.push({ address, balance: BigInt(balance) });
+      }
+    }
 
-    const { result } = await this.contractService.invokeContractMethod(
-      COUPON_ENGINE(), 'distribute_coupon', adminSecret,
-      [
-        Address.fromString(adminAddress).toScVal(),
-        nativeToScVal(BigInt(id), { type: 'u64' }),
-        nativeToScVal(dto.periodIndex, { type: 'u32' }),
-        xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
-        nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
-      ],
-      nonce,
-    );
+    const BATCH_SIZE = dto.batchSize ?? 50;
+    let lastResult: any = null;
+    let batchCount = 0;
 
-    const parsed = scValToNative(result) as any[];
+    for (let start = 0; start < holderBalances.length || batchCount === 0; start += BATCH_SIZE) {
+      const slice = holderBalances.slice(start, start + BATCH_SIZE);
+      const isFinalBatch = start + BATCH_SIZE >= holderBalances.length;
+      batchCount += 1;
+
+      const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
+
+      // Encode Vec<(Address, i128)> as an ScVal vec of 2-element vecs.
+      const holdersScVal = xdr.ScVal.scvVec(
+        slice.map(({ address, balance }) =>
+          xdr.ScVal.scvVec([
+            Address.fromString(address).toScVal(),
+            nativeToScVal(balance, { type: 'i128' }),
+          ]),
+        ),
+      );
+
+      const { result } = await this.contractService.invokeContractMethod(
+        COUPON_ENGINE(), 'distribute_coupon', adminSecret,
+        [
+          Address.fromString(adminAddress).toScVal(),
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          nativeToScVal(dto.periodIndex, { type: 'u32' }),
+          holdersScVal,
+          nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
+          nativeToScVal(isFinalBatch, { type: 'bool' }),
+        ],
+        nonce,
+      );
+
+      lastResult = result;
+
+      // If there are no holders at all we still need a single final-batch call
+      // to finalise the period; break after the first iteration in that case.
+      if (holderBalances.length === 0) break;
+    }
+
+    const parsed = scValToNative(lastResult) as any[];
     return {
       bondId: id,
       periodIndex: dto.periodIndex,
       totalCredits: Number(parsed?.[2] ?? 0),
       holderCount: Number(parsed?.[3] ?? 0),
+      batchCount,
     };
   }
 
@@ -325,6 +438,120 @@ export class BondsService {
     };
   }
 
+  /**
+   * Coupon period history for a bond, paginated to keep responses bounded for
+   * long-running bonds. Reads the full page in a single `get_period_info_range`
+   * cross-contract call (one round-trip per page) instead of N round-trips.
+   * Pass `includeReport=true` to hydrate each period's `report_id` into a full
+   * OracleConsumer report summary; this is opt-in to avoid the extra
+   * cross-contract calls by default.
+   */
+  async getPeriods(
+    id: number,
+    page = 1,
+    limit = 20,
+    includeReport = false,
+  ): Promise<PeriodListResponse> {
+    const cacheKey = `bond:${id}:periods:${page}:${limit}:${includeReport}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    const countScVal = await this.contractService.simulateCall({
+      contractAddress: COUPON_ENGINE(),
+      method: 'get_period_count',
+      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
+    });
+    const total = Number(scValToNative(countScVal));
+
+    const start = (page - 1) * limit;
+    const periodsScVal = await this.contractService.simulateCall({
+      contractAddress: COUPON_ENGINE(),
+      method: 'get_period_info_range',
+      args: [
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        nativeToScVal(start, { type: 'u32' }),
+        nativeToScVal(limit, { type: 'u32' }),
+      ],
+    });
+
+    const data: PeriodInfoResponse[] = [];
+    for (const raw of (scValToNative(periodsScVal) as any[]) ?? []) {
+      const period = this.decodePeriodInfo(raw);
+      if (includeReport && period.reportId > 0) {
+        period.report = await this.getReportSummary(period.reportId);
+      }
+      data.push(period);
+    }
+
+    const result: PeriodListResponse = {
+      data,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit) || 1,
+      },
+    };
+
+    await this.redis.setEx(cacheKey, 60, JSON.stringify(result));
+    return result;
+  }
+
+  /**
+   * Decodes a CouponEngine `PeriodInfo` struct (field order matches the
+   * contract declaration): period_index, start_time, end_time,
+   * total_credits_earned, distributed, report_id, undistributed.
+   */
+  private decodePeriodInfo(data: any[]): PeriodInfoResponse {
+    return {
+      periodIndex: Number(data[0]),
+      startTime: Number(data[1]),
+      endTime: Number(data[2]),
+      totalCreditsEarned: Number(data[3]),
+      distributed: Boolean(data[4]),
+      reportId: Number(data[5]),
+      undistributed: Number(data[6]),
+    };
+  }
+
+  private async getReportSummary(reportId: number): Promise<PeriodReportResponse> {
+    const reportScVal = await this.contractService.simulateCall({
+      contractAddress: ORACLE_CONSUMER(),
+      method: 'get_report',
+      args: [nativeToScVal(BigInt(reportId), { type: 'u64' })],
+    });
+    return this.decodeReport(scValToNative(reportScVal) as any[]);
+  }
+
+  /**
+   * Decodes an OracleConsumer `Report` struct. Field order matches the
+   * contract declaration; note the `biodiversity` field is skipped by
+   * position (index 6) when building the summary.
+   */
+  private decodeReport(data: any[]): PeriodReportResponse {
+    return {
+      id: Number(data[0]),
+      providerAddress: data[1] as string,
+      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
+      periodStart: Number(data[3]),
+      periodEnd: Number(data[4]),
+      carbonSequestered: Number(data[5]),
+      methodology: data[7] as string,
+      ipfsHash: Buffer.from(data[8] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[9])),
+      submittedAt: Number(data[10]),
+      verifiedAt: Number(data[11]),
+    };
+  }
+
+  private reportStatusFromIndex(index: number): ReportStatus {
+    return (
+      ['Pending', 'Verified', 'Challenged', 'Rejected'][index] as
+        | ReportStatus
+        | undefined
+    ) ?? 'Pending';
+  }
+
   async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
@@ -367,7 +594,7 @@ export class BondsService {
 
   private encodeBondConfig(dto: CreateBondDto): xdr.ScVal {
     return xdr.ScVal.scvVec([
-      xdr.ScVal.scvBytes(Buffer.from(dto.projectId, 'hex')),
+      toBytes32(dto.projectId),
       nativeToScVal(BigInt(dto.faceValue), { type: 'i128' }),
       xdr.ScVal.scvVec(dto.couponSchedule.map((ts) => nativeToScVal(BigInt(ts), { type: 'u64' }))),
       nativeToScVal(dto.creditType, { type: 'symbol' }),

@@ -1,6 +1,15 @@
 import { Test } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
-import { xdr, scValToNative, nativeToScVal } from '@stellar/stellar-sdk';
+import { xdr, scValToNative, nativeToScVal, Address, Keypair } from '@stellar/stellar-sdk';
+
+// BigInt is not JSON-serializable by default.  Jest workers use JSON.stringify
+// to communicate mock call data back to the parent process; XDR objects stored
+// in mock histories can contain BigInt values.  This polyfill prevents the
+// "Do not know how to serialize a BigInt" error without affecting test
+// assertions (toJSON is only invoked by JSON.stringify).
+(BigInt.prototype as any).toJSON = function () {
+  return this.toString();
+};
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -16,10 +25,18 @@ jest.mock('@redis/client', () => {
   };
 });
 
+import { createClient } from '@redis/client';
+
 import { BondsService } from './bonds.service';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
+import { KycService } from '../auth/kyc.service';
+import { InvalidProjectIdError } from '../stellar/bytes32';
+
+const kycServiceMock = {
+  isEligible: jest.fn().mockResolvedValue(true),
+};
 
 describe('BondsService', () => {
   let service: BondsService;
@@ -29,13 +46,13 @@ describe('BondsService', () => {
       providers: [
         BondsService,
         { provide: ContractService, useValue: {} },
-        { provide: StellarService, useValue: {} },
-        {
-          provide: NonceService,
-          useValue: { next: jest.fn().mockResolvedValue(0) },
-        },
-      ],
-    }).compile();
+        { provide: StellarService, useValue: {} },          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
 
     service = moduleRef.get(BondsService);
   });
@@ -62,6 +79,19 @@ describe('BondsService', () => {
       expect(raw[4]).toBe(BigInt(3000000));
       expect(raw[5]).toBe(BigInt(10000));
     });
+
+    it('rejects a projectId that is not a valid 64-char hex or CIDv0', () => {
+      expect(() =>
+        (service as any).encodeBondConfig({
+          projectId: 'VCS-1234',
+          faceValue: 1000,
+          couponSchedule: [1000000],
+          creditType: 'Carbon',
+          maturityDate: 3000000,
+          totalSupply: 10000,
+        }),
+      ).toThrow(InvalidProjectIdError);
+    });
   });
 
   describe('distributeCoupon arg encoding', () => {
@@ -76,6 +106,9 @@ describe('BondsService', () => {
           ]),
           successful: true,
         }),
+        simulateCall: jest
+          .fn()
+          .mockResolvedValue(nativeToScVal(BigInt(0), { type: 'u64' })),
       };
       const stellarService = {
         getKeypairFromSecret: jest.fn().mockReturnValue({
@@ -93,6 +126,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
@@ -104,11 +138,145 @@ describe('BondsService', () => {
 
       expect(contractAddress).toBe('');
       expect(method).toBe('distribute_coupon');
-      expect(args.length).toBe(5);
+      // args: caller, bond_id, period_index, holders, report_id, is_final_batch
+      expect(args.length).toBe(6);
       expect(scValToNative(args[0])).toBe(
         'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
       );
       expect(scValToNative(args[4])).toBe(BigInt(7));
+    });
+  });
+
+  describe('distributeCoupon holder reconciliation', () => {
+    const ADMIN = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    const redisMock = () =>
+      createClient() as unknown as {
+        sMembers: jest.Mock;
+        sAdd: jest.Mock;
+      };
+
+    const holderListScVal = (addrs: string[]) =>
+      xdr.ScVal.scvVec(addrs.map((a) => Address.fromString(a).toScVal()));
+
+    const buildService = async (opts: {
+      dbHolders: string[];
+      onChainHolders: string[];
+      balances: Record<string, number>;
+      holderListFails?: boolean;
+    }) => {
+      redisMock().sMembers.mockResolvedValue(opts.dbHolders);
+
+      const simulateCall = jest.fn(
+        ({ method, args }: { method: string; args: any[] }) => {
+          if (method === 'get_holder_count') {
+            if (opts.holderListFails) {
+              return Promise.reject(new Error('contract not found'));
+            }
+            return Promise.resolve(
+              nativeToScVal(BigInt(opts.onChainHolders.length), { type: 'u64' }),
+            );
+          }
+          if (method === 'get_holder_list_range') {
+            return Promise.resolve(holderListScVal(opts.onChainHolders));
+          }
+          if (method === 'get_holder_balance') {
+            const holder = scValToNative(args[1]) as string;
+            return Promise.resolve(
+              nativeToScVal(BigInt(opts.balances[holder] ?? 0), { type: 'i128' }),
+            );
+          }
+          return Promise.resolve(nativeToScVal(BigInt(0), { type: 'u64' }));
+        },
+      );
+
+      const invokeContractMethod = jest.fn().mockResolvedValue({
+        result: xdr.ScVal.scvVec([
+          nativeToScVal(BigInt(1), { type: 'u64' }),
+          xdr.ScVal.scvU32(0),
+          nativeToScVal(BigInt(1_000_000), { type: 'i128' }),
+          xdr.ScVal.scvU32(1),
+        ]),
+        successful: true,
+      });
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: { simulateCall, invokeContractMethod } },
+          {
+            provide: StellarService,
+            useValue: {
+              getKeypairFromSecret: jest.fn().mockReturnValue({ publicKey: () => ADMIN }),
+            },
+          },
+          { provide: NonceService, useValue: { next: jest.fn().mockResolvedValue(0) } },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      return { svc: moduleRef.get(BondsService), invokeContractMethod };
+    };
+
+    const passedHolders = (invokeContractMethod: jest.Mock): string[] =>
+      (scValToNative(invokeContractMethod.mock.calls[0][3][3]) as [string, bigint][]).map(([addr]) => addr);
+
+    it('includes on-chain holders missing from the off-chain DB set', async () => {
+      const dbHolder = Keypair.random().publicKey();
+      const onChainOnly = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [dbHolder],
+        onChainHolders: [dbHolder, onChainOnly],
+        balances: { [dbHolder]: 100, [onChainOnly]: 200 },
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod).sort()).toEqual(
+        [dbHolder, onChainOnly].sort(),
+      );
+    });
+
+    it('filters stale zero-balance addresses out of the holder list', async () => {
+      const stale = Keypair.random().publicKey();
+      const active = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [stale, active],
+        onChainHolders: [],
+        balances: { [stale]: 0, [active]: 100 },
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod)).toEqual([active]);
+    });
+
+    it('deduplicates holders present in both the DB set and the on-chain list', async () => {
+      const h1 = Keypair.random().publicKey();
+      const h2 = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [h1],
+        onChainHolders: [h1, h2],
+        balances: { [h1]: 100, [h2]: 200 },
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod).sort()).toEqual([h1, h2].sort());
+    });
+
+    it('falls back to the DB set when the on-chain holder list cannot be read', async () => {
+      const dbHolder = Keypair.random().publicKey();
+      const { svc, invokeContractMethod } = await buildService({
+        dbHolders: [dbHolder],
+        onChainHolders: [],
+        balances: { [dbHolder]: 100 },
+        holderListFails: true,
+      });
+
+      await svc.distributeCoupon(1, { periodIndex: 0, reportId: 7 });
+
+      expect(passedHolders(invokeContractMethod)).toEqual([dbHolder]);
     });
   });
 
@@ -129,6 +297,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
@@ -220,6 +389,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
 
@@ -260,6 +430,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
       return moduleRef.get(BondsService);
@@ -303,6 +474,172 @@ describe('BondsService', () => {
     });
   });
 
+  describe('findAll', () => {
+    const configScVal = () =>
+      xdr.ScVal.scvVec([
+        xdr.ScVal.scvBytes(Buffer.from('a1b2'.padEnd(64, '0'), 'hex')),
+        nativeToScVal(BigInt(1000), { type: 'i128' }),
+        xdr.ScVal.scvVec([nativeToScVal(BigInt(1000000), { type: 'u64' })]),
+        nativeToScVal('Carbon', { type: 'symbol' }),
+        nativeToScVal(BigInt(253402300799), { type: 'u64' }),
+        nativeToScVal(BigInt(10000), { type: 'i128' }),
+      ]);
+
+    const stateScVal = () =>
+      xdr.ScVal.scvVec([
+        nativeToScVal(BigInt(5000), { type: 'i128' }),
+        nativeToScVal('Active', { type: 'symbol' }),
+        nativeToScVal(BigInt(1767225600), { type: 'u64' }),
+      ]);
+
+    it('lists bonds via get_bond_ids_range instead of iterating 1..BondCount', async () => {
+      const contractService = {
+        simulateCall: jest.fn(({ method }: { method: string }) => {
+          if (method === 'bond_count') {
+            return Promise.resolve(nativeToScVal(BigInt(3), { type: 'u64' }));
+          }
+          if (method === 'get_bond_ids_range') {
+            return Promise.resolve(
+              xdr.ScVal.scvVec([nativeToScVal(BigInt(3), { type: 'u64' })]),
+            );
+          }
+          if (method === 'get_bond') {
+            return Promise.resolve(configScVal());
+          }
+          return Promise.resolve(stateScVal());
+        }),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      const result = await svc.findAll(2, 2);
+
+      const rangeCall: any = contractService.simulateCall.mock.calls.find(
+        ([options]: any[]) => options.method === 'get_bond_ids_range',
+      );
+      expect(rangeCall).toBeDefined();
+      expect(rangeCall[0].args).toEqual([
+        nativeToScVal(2, { type: 'u32' }),
+        nativeToScVal(2, { type: 'u32' }),
+      ]);
+
+      const getBondCalls = contractService.simulateCall.mock.calls.filter(
+        ([options]: any[]) => options.method === 'get_bond',
+      );
+      expect(
+        getBondCalls.map(([options]: any[]) =>
+          Number(scValToNative(options.args[0])),
+        ),
+      ).toEqual([3]);
+
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0].id).toBe(3);
+      expect(result.meta).toEqual({
+        page: 2,
+        limit: 2,
+        total: 3,
+        totalPages: 2,
+      });
+    });
+
+    it('returns empty list when get_bond_ids_range RPC fails', async () => {
+      const contractService = {
+        simulateCall: jest.fn(({ method }: { method: string }) => {
+          if (method === 'bond_count') {
+            return Promise.resolve(nativeToScVal(BigInt(5), { type: 'u64' }));
+          }
+          if (method === 'get_bond_ids_range') {
+            return Promise.reject(new Error('RPC node unreachable'));
+          }
+          return Promise.resolve(
+            nativeToScVal(BigInt(0), { type: 'u64' }),
+          );
+        }),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      const result = await svc.findAll(1, 20);
+
+      expect(result.data).toEqual([]);
+      expect(result.meta).toEqual({
+        page: 1,
+        limit: 20,
+        total: 5,
+        totalPages: 1,
+      });
+    });
+
+    it('returns stale cache when get_bond_ids_range RPC fails', async () => {
+      const cachedResult = {
+        data: [{ id: 1 }],
+        meta: { page: 1, limit: 20, total: 1, totalPages: 1 },
+      };
+
+      const redisMock = createClient() as unknown as { get: jest.Mock };
+      redisMock.get.mockImplementation((key: string) => {
+        if (key === 'bonds:1:20') return Promise.resolve(JSON.stringify(cachedResult));
+        return Promise.resolve(null);
+      });
+
+      const contractService = {
+        simulateCall: jest.fn(({ method }: { method: string }) => {
+          if (method === 'bond_count') {
+            return Promise.resolve(nativeToScVal(BigInt(1), { type: 'u64' }));
+          }
+          if (method === 'get_bond_ids_range') {
+            return Promise.reject(new Error('RPC node unreachable'));
+          }
+          return Promise.resolve(
+            nativeToScVal(BigInt(0), { type: 'u64' }),
+          );
+        }),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      const result = await svc.findAll(1, 20);
+
+      expect(result).toEqual(cachedResult);
+    });
+  });
+
   describe('buildBondResponse', () => {
     const configScVal = (maturityDate: number) =>
       xdr.ScVal.scvVec([
@@ -338,6 +675,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
       return moduleRef.get(BondsService);
@@ -384,6 +722,7 @@ describe('BondsService', () => {
             provide: NonceService,
             useValue: { next: jest.fn().mockResolvedValue(0) },
           },
+          { provide: KycService, useValue: kycServiceMock },
         ],
       }).compile();
       return moduleRef.get(BondsService);
@@ -428,6 +767,232 @@ describe('BondsService', () => {
       const result = await svc.getAccruedCredits(1, HOLDER);
       expect(result.total).toBe(0);
       expect(result.perCreditType).toEqual([]);
+    });
+  });
+
+  describe('getPeriods', () => {
+    const REPORT_HOLDER = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    const periodScVal = (periodIndex: number, reportId: number) =>
+      xdr.ScVal.scvVec([
+        xdr.ScVal.scvU32(periodIndex),
+        nativeToScVal(BigInt(1000), { type: 'u64' }),
+        nativeToScVal(BigInt(2000), { type: 'u64' }),
+        nativeToScVal(BigInt(150), { type: 'i128' }),
+        xdr.ScVal.scvBool(true),
+        nativeToScVal(BigInt(reportId), { type: 'u64' }),
+        nativeToScVal(BigInt(10), { type: 'i128' }),
+      ]);
+
+    const reportScVal = () =>
+      xdr.ScVal.scvVec([
+        nativeToScVal(BigInt(7), { type: 'u64' }),
+        Address.fromString(REPORT_HOLDER).toScVal(),
+        xdr.ScVal.scvBytes(Buffer.alloc(32)),
+        nativeToScVal(BigInt(1000), { type: 'u64' }),
+        nativeToScVal(BigInt(2000), { type: 'u64' }),
+        nativeToScVal(BigInt(500), { type: 'i128' }),
+        xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]),
+        nativeToScVal('VM0003', { type: 'symbol' }),
+        xdr.ScVal.scvBytes(Buffer.alloc(32)),
+        xdr.ScVal.scvU32(1),
+        nativeToScVal(BigInt(1700000000), { type: 'u64' }),
+        nativeToScVal(BigInt(1700000060), { type: 'u64' }),
+      ]);
+
+    const buildService = async (
+      simulateCall: jest.Mock,
+    ) => {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: { simulateCall } },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+      return moduleRef.get(BondsService);
+    };
+
+    it('gates subscription on KYC eligibility', async () => {
+      const kycService = {
+        isEligible: jest.fn().mockResolvedValue(false),
+      };
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: {} },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycService },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      await expect(
+        svc.subscribe(1, { investorAddress: 'GABC', amount: 100 }),
+      ).rejects.toMatchObject({
+        status: 403,
+        message: 'KYC verification required before subscribing to a bond',
+      });
+      expect(kycService.isEligible).toHaveBeenCalledWith('GABC', 'verified');
+    });
+
+    it('reads one page per-call via get_period_info_range and returns paginated meta', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) => {
+        if (method === 'get_period_count') {
+          return Promise.resolve(xdr.ScVal.scvU32(3));
+        }
+        return Promise.resolve(
+          xdr.ScVal.scvVec([periodScVal(0, 1), periodScVal(1, 2)]),
+        );
+      });
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 2);
+
+      const rangeCall: any = simulateCall.mock.calls.find(
+        ([options]: any[]) => options.method === 'get_period_info_range',
+      );
+      expect(rangeCall).toBeDefined();
+      expect(rangeCall[0].args).toEqual([
+        nativeToScVal(BigInt(3), { type: 'u64' }),
+        nativeToScVal(0, { type: 'u32' }),
+        nativeToScVal(2, { type: 'u32' }),
+      ]);
+
+      expect(result.meta).toEqual({ page: 1, limit: 2, total: 3, totalPages: 2 });
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0]).toEqual({
+        periodIndex: 0,
+        startTime: 1000,
+        endTime: 2000,
+        totalCreditsEarned: 150,
+        distributed: true,
+        reportId: 1,
+        undistributed: 10,
+      });
+    });
+
+    it('returns an empty page for bonds without any distributed period', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) =>
+        method === 'get_period_count'
+          ? Promise.resolve(xdr.ScVal.scvU32(0))
+          : Promise.resolve(xdr.ScVal.scvVec([])),
+      );
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 20);
+
+      expect(result.data).toEqual([]);
+      expect(result.meta).toEqual({ page: 1, limit: 20, total: 0, totalPages: 1 });
+    });
+
+    it('does not hydrate reports by default', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) => {
+        if (method === 'get_period_count') {
+          return Promise.resolve(xdr.ScVal.scvU32(1));
+        }
+        return Promise.resolve(xdr.ScVal.scvVec([periodScVal(0, 7)]));
+      });
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 20);
+
+      expect(result.data[0].report).toBeUndefined();
+      const reportCalls = simulateCall.mock.calls.filter(
+        ([options]: any[]) => options.method === 'get_report',
+      );
+      expect(reportCalls).toHaveLength(0);
+    });
+
+    it('hydrates linked reports when includeReport is set', async () => {
+      const simulateCall = jest.fn(({ method }: { method: string }) => {
+        if (method === 'get_period_count') {
+          return Promise.resolve(xdr.ScVal.scvU32(1));
+        }
+        if (method === 'get_period_info_range') {
+          return Promise.resolve(xdr.ScVal.scvVec([periodScVal(0, 7)]));
+        }
+        return Promise.resolve(reportScVal());
+      });
+      const svc = await buildService(simulateCall);
+
+      const result = await svc.getPeriods(3, 1, 20, true);
+
+      expect(result.data[0].report).toEqual({
+        id: 7,
+        providerAddress: REPORT_HOLDER,
+        projectId: Buffer.alloc(32).toString('hex'),
+        periodStart: 1000,
+        periodEnd: 2000,
+        carbonSequestered: 500,
+        methodology: 'VM0003',
+        ipfsHash: Buffer.alloc(32).toString('hex'),
+        status: 'Verified',
+        submittedAt: 1700000000,
+        verifiedAt: 1700000060,
+      });
+    });
+
+    it('decodes a PeriodInfo struct from contract field order', async () => {
+      const svc = await buildService(jest.fn());
+      const period = (svc as any).decodePeriodInfo([
+        2,
+        BigInt(1000),
+        BigInt(2000),
+        BigInt(150),
+        true,
+        BigInt(9),
+        BigInt(0),
+      ]);
+      expect(period).toEqual({
+        periodIndex: 2,
+        startTime: 1000,
+        endTime: 2000,
+        totalCreditsEarned: 150,
+        distributed: true,
+        reportId: 9,
+        undistributed: 0,
+      });
+    });
+
+    it('decodes an OracleConsumer Report struct skipping the biodiversity field', async () => {
+      const svc = await buildService(jest.fn());
+      const report = (svc as any).decodeReport([
+        BigInt(9),
+        REPORT_HOLDER,
+        Buffer.alloc(32),
+        BigInt(1000),
+        BigInt(2000),
+        BigInt(500),
+        [0],
+        'VM0003',
+        Buffer.alloc(32),
+        1,
+        BigInt(1700000000),
+        BigInt(1700000060),
+      ]);
+      expect(report).toEqual({
+        id: 9,
+        providerAddress: REPORT_HOLDER,
+        projectId: Buffer.alloc(32).toString('hex'),
+        periodStart: 1000,
+        periodEnd: 2000,
+        carbonSequestered: 500,
+        methodology: 'VM0003',
+        ipfsHash: Buffer.alloc(32).toString('hex'),
+        status: 'Verified',
+        submittedAt: 1700000000,
+        verifiedAt: 1700000060,
+      });
     });
   });
 });

@@ -5,6 +5,21 @@ import { AdminGuard } from '../common/guards/admin.guard';
 describe('BondsController guards', () => {
   const GUARDS_METADATA = '__guards__';
 
+  it.each([
+    ['create', [JwtAuthGuard, AdminGuard]],
+    ['subscribe', [JwtAuthGuard]],
+    ['distributeCoupon', [JwtAuthGuard, AdminGuard]],
+    ['claimCredits', [JwtAuthGuard]],
+    ['transfer', [JwtAuthGuard]],
+    ['mature', [JwtAuthGuard, AdminGuard]],
+  ] as const)('guards %s with the required guards', (handler, expected) => {
+    const guards: unknown[] = Reflect.getMetadata(
+      GUARDS_METADATA,
+      BondsController.prototype[handler],
+    );
+    expect(guards).toEqual(expected);
+  });
+
   it('guards POST /:id/sweep-undistributed with JWT + Admin guards', () => {
     const guards: unknown[] = Reflect.getMetadata(
       GUARDS_METADATA,
@@ -46,5 +61,28 @@ describe('BondsController guards', () => {
 
     await expect(controller.getAccruedCredits(1, 'holder-key')).resolves.toBe(accrued);
     expect(service.getAccruedCredits).toHaveBeenCalledWith(1, 'holder-key');
+  });
+
+  it('routes the periods handler under the /bonds/:id/periods path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.getPeriods);
+    expect(path).toBe(':id/periods');
+  });
+
+  it('exposes GET /:id/periods as a read-only public endpoint', () => {
+    const guards: unknown[] | undefined = Reflect.getMetadata(
+      GUARDS_METADATA,
+      BondsController.prototype.getPeriods,
+    );
+    expect(guards).toBeUndefined();
+  });
+
+  it('delegates GET /:id/periods to the service with pagination + includeReport', async () => {
+    const periods = { data: [], meta: { page: 1, limit: 20, total: 0, totalPages: 1 } };
+    const service = { getPeriods: jest.fn().mockResolvedValue(periods) };
+    const controller = new BondsController(service as any);
+
+    const query = { page: 2, limit: 10, includeReport: true } as any;
+    await expect(controller.getPeriods(7, query)).resolves.toBe(periods);
+    expect(service.getPeriods).toHaveBeenCalledWith(7, 2, 10, true);
   });
 });
