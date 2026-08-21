@@ -37,6 +37,10 @@ pub enum DataKey {
     SlashHistory(Address),
     LockedStake(Address),
     ReportLock(u64),
+    /// Compact half-open period windows [(start, end), ...] per project.
+    /// A single Vec<(u64, u64)> per project_id lets the overlap check run
+    /// without reading each full Report from storage.
+    ProjectReportPeriods(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -345,6 +349,24 @@ impl OracleConsumer {
             return Err(OracleError::ProjectNotApproved);
         }
 
+        // Reject any report whose half-open [period_start, period_end)
+        // window overlaps an already-submitted report for the same project.
+        // Two half-open intervals [a, b) and [c, d) overlap iff a < d && c < b.
+        // We keep a compact Vec<(u64, u64)> per project so the check touches
+        // a single ledger entry rather than reading each full Report.
+        let periods_key = DataKey::ProjectReportPeriods(project_id);
+        let claimed: Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&periods_key)
+            .unwrap_or(vec![&env]);
+        for pair in claimed.iter() {
+            let (existing_start, existing_end) = pair;
+            if period_start < existing_end && existing_start < period_end {
+                return Err(OracleError::OverlappingReportPeriod);
+            }
+        }
+
         let count: u64 = env
             .storage()
             .instance()
@@ -387,6 +409,17 @@ impl OracleConsumer {
         project_reports.push_back(report_id);
         env.storage().persistent().set(&proj_key, &project_reports);
         bump_persistent(&env, &proj_key);
+
+        // Record the period in the compact overlap index.
+        let periods_key = DataKey::ProjectReportPeriods(project_id);
+        let mut periods: Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&periods_key)
+            .unwrap_or(vec![&env]);
+        periods.push_back((period_start, period_end));
+        env.storage().persistent().set(&periods_key, &periods);
+        bump_persistent(&env, &periods_key);
 
         let prc_key = DataKey::ProviderReportCount(provider.clone());
         let report_count: u64 = env.storage().persistent().get(&prc_key).unwrap_or(0);
@@ -1448,7 +1481,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1507,7 +1540,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1565,7 +1598,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1612,10 +1645,31 @@ mod test {
         let project_a = create_project_id(&env, 1);
         let project_b = create_project_id(&env, 2);
 
+        let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+        let registry = ProjectRegistryClient::new(&env, &registry_id);
+        let owner = Address::generate(&env);
+        let pa = registry.register_project(
+            &owner,
+            &make_ipfs_hash(&env, 10),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        registry.approve_project(&admin, &pa, &0);
+        let pb = registry.register_project(
+            &owner,
+            &make_ipfs_hash(&env, 11),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &1,
+        );
+        registry.approve_project(&admin, &pb, &1);
+
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
+        client.set_project_registry(&admin, &registry_id, &0);
 
-        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &1);
 
         let report_a = client.submit_report(
             &provider,

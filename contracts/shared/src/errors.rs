@@ -54,6 +54,10 @@ pub enum OracleError {
     ProjectNotApproved = 17,
     /// The configured registry could not return a decodable linkage record.
     ProjectRegistryCallFailed = 18,
+    /// The submitted report's half-open [period_start, period_end) window
+    /// overlaps an already-submitted report for the same project, which
+    /// would double-count carbon sequestered if both were verified.
+    OverlappingReportPeriod = 19,
 }
 
 #[derive(Clone, Debug, PartialEq)]

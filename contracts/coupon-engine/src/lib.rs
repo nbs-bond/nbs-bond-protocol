@@ -1246,8 +1246,8 @@ mod test {
         let report_id = oc.submit_report(
             &provider,
             &registry_project_id,
-            &1000u64,
-            &2000u64,
+            &period_start,
+            &period_end,
             &carbon,
             &biodiversity,
             &Symbol::new(env, "verra_vcs"),
@@ -1282,8 +1282,8 @@ mod test {
         oc.submit_report(
             &provider,
             &registry_project_id,
-            &1000u64,
-            &2000u64,
+            &period_start,
+            &period_end,
             &carbon,
             &biodiversity,
             &Symbol::new(env, "verra_vcs"),
