@@ -471,7 +471,7 @@ mod test {
     };
     use nbbs_bond_issuer::{BondIssuer, BondIssuerClient};
     use nbbs_coupon_engine::{CouponEngine, CouponEngineClient};
-    use nbbs_shared::{BiodiversityMetrics, BondConfig};
+    use nbbs_shared::{BiodiversityMetrics, BondConfig, ReportStatus};
 
     fn make_certificate_hash(env: &Env, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
@@ -542,7 +542,9 @@ mod test {
             &make_certificate_hash(env, 9),
             &0,
         );
-        oc_client.verify_report(admin, &report_id, &(admin_nonce + 1));
+        // Admins cannot count toward the provider threshold; verified reports
+        // in tests go through the explicit auditable override path.
+        oc_client.admin_override_report(admin, &report_id, &ReportStatus::Verified, &(admin_nonce + 1));
         report_id
     }
 

@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { MarketplaceController } from './marketplace.controller';
 import { DexService } from './dex.service';
 import { LiquidityService } from './liquidity.service';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 
 describe('MarketplaceController', () => {
   let controller: MarketplaceController;
@@ -168,4 +169,34 @@ describe('MarketplaceController', () => {
     expect(liquidityService.calculateSlippage).toHaveBeenCalledWith(1, 10);
     expect(result).toBe(expected);
   });
+});
+
+describe('MarketplaceController guards', () => {
+  const GUARDS_METADATA = '__guards__';
+
+  it.each([
+    'listBondTokens',
+    'buyBondTokens',
+    'depositQuote',
+    'withdrawQuote',
+    'cancelOrder',
+  ] as const)('guards %s with JWT authentication', (handler) => {
+    const guards: unknown[] = Reflect.getMetadata(
+      GUARDS_METADATA,
+      MarketplaceController.prototype[handler],
+    );
+    expect(guards).toEqual([JwtAuthGuard]);
+  });
+
+  it.each(['listOrders', 'getOrder', 'getPriceFeed', 'getBestPrice'] as const)(
+    'keeps %s public',
+    (handler) => {
+      expect(
+        Reflect.getMetadata(
+          GUARDS_METADATA,
+          MarketplaceController.prototype[handler],
+        ),
+      ).toBeUndefined();
+    },
+  );
 });

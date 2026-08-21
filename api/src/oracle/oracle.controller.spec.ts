@@ -11,6 +11,7 @@ import { OracleController } from './oracle.controller';
 import { RegisterProviderDto } from './dto/register-provider.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
+import { ProviderGuard } from '../common/guards/provider.guard';
 import { ProviderResponse } from './interfaces/oracle.interface';
 
 const VALID_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
@@ -24,6 +25,14 @@ describe('OracleController guards', () => {
       OracleController.prototype.registerProvider,
     );
     expect(guards).toEqual([JwtAuthGuard, AdminGuard]);
+  });
+
+  it('guards POST /reports with JWT + Provider guards', () => {
+    const guards: unknown[] = Reflect.getMetadata(
+      GUARDS_METADATA,
+      OracleController.prototype.submitReport,
+    );
+    expect(guards).toEqual([JwtAuthGuard, ProviderGuard]);
   });
 
   it('exposes GET /providers as a read-only public endpoint', () => {
@@ -40,6 +49,29 @@ describe('OracleController guards', () => {
       OracleController.prototype.registerProvider,
     );
     expect(path).toBe('providers');
+  });
+});
+
+describe('OracleController.submitReport', () => {
+  it('uses the authenticated JWT wallet as the provider address', async () => {
+    const report = { reportId: 1 } as any;
+    const oracleService = {
+      submitReport: jest.fn().mockResolvedValue(report),
+    };
+    const controller = new OracleController(
+      oracleService as any,
+      { computeStaleness: jest.fn() } as any,
+    );
+    const dto = { projectId: 'project-1' } as any;
+    const requestWithSpoofedHeader = {
+      user: { walletAddress: VALID_ADDRESS },
+      headers: { 'x-provider-address': 'GSPOOFED' },
+    } as any;
+
+    await expect(
+      controller.submitReport(dto, requestWithSpoofedHeader),
+    ).resolves.toBe(report);
+    expect(oracleService.submitReport).toHaveBeenCalledWith(dto, VALID_ADDRESS);
   });
 });
 

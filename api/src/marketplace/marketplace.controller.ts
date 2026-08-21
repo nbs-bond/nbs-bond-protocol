@@ -1,6 +1,6 @@
 import {
   Controller, Get, Post, Delete, Body, Param, Query, Req,
-  HttpCode, HttpStatus, ParseIntPipe,
+  HttpCode, HttpStatus, ParseIntPipe, UseGuards,
 } from '@nestjs/common';
 import { DexService } from './dex.service';
 import { LiquidityService } from './liquidity.service';
@@ -18,6 +18,7 @@ import {
   SlippageResponse,
 } from './interfaces/marketplace.interface';
 import { PaginatedResponse } from '../common/dto/pagination.dto';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 
 @Controller('marketplace')
 export class MarketplaceController {
@@ -42,6 +43,7 @@ export class MarketplaceController {
   }
 
   @Post('list')
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.CREATED)
   async listBondTokens(
     @Body() dto: ListBondDto,
@@ -52,6 +54,7 @@ export class MarketplaceController {
   }
 
   @Post('buy')
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async buyBondTokens(
     @Body() dto: BuyBondDto,
@@ -79,6 +82,7 @@ export class MarketplaceController {
   }
 
   @Post('deposit')
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async depositQuote(
     @Body() dto: DepositQuoteDto,
@@ -89,6 +93,7 @@ export class MarketplaceController {
   }
 
   @Post('withdraw')
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async withdrawQuote(
     @Body() dto: WithdrawQuoteDto,
@@ -99,6 +104,7 @@ export class MarketplaceController {
   }
 
   @Delete('orders/:id')
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   async cancelOrder(
     @Param('id', ParseIntPipe) id: number,
