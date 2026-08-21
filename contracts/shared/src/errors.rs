@@ -71,6 +71,10 @@ pub enum RegistryError {
     ProjectAlreadyExists = 4,
     InvalidStatusTransition = 5,
     InvalidNonce = 6,
+    OracleConsumerNotSet = 7,
+    ProjectNotApproved = 8,
+    ProjectInactive = 9,
+    CannotSuspend = 10,
 }
 
 #[derive(Clone, Debug, PartialEq)]
