@@ -132,6 +132,49 @@ fn set_nonce(env: &Env, addr: &Address, nonce: u64) {
     bump_persistent(env, &key);
 }
 
+/// Number of providers currently eligible to verify reports (active only).
+/// Removed and stake-exhausted providers remain in `ProviderList` but are
+/// flagged inactive and therefore excluded.
+fn active_provider_count(env: &Env) -> u32 {
+    let list_key = DataKey::ProviderList;
+    let providers: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&list_key)
+        .unwrap_or(vec![env]);
+    let mut count: u32 = 0;
+    for addr in providers.iter() {
+        let key = DataKey::Provider(addr);
+        if let Some(p) = env.storage().persistent().get::<DataKey, OracleProvider>(&key) {
+            if p.active {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Clamp the stored signature threshold down to the active provider count so
+/// it can never exceed the eligible verifier set. Runs after any operation
+/// that deactivates a provider (explicit removal or stake exhaustion); the
+/// threshold floors at 1 (the constructor default) when no providers remain.
+fn reconcile_signature_threshold(env: &Env) {
+    let threshold_key = DataKey::SignatureThreshold;
+    let current: u32 = env
+        .storage()
+        .instance()
+        .get(&threshold_key)
+        .unwrap_or(1);
+    let adjusted = current.min(active_provider_count(env).max(1));
+    if adjusted != current {
+        env.storage().instance().set(&threshold_key, &adjusted);
+        env.events().publish(
+            (Symbol::new(env, "signature_threshold_adjusted"),),
+            (adjusted,),
+        );
+    }
+}
+
 #[contract]
 pub struct OracleConsumer;
 
@@ -225,6 +268,10 @@ impl OracleConsumer {
         p.active = false;
         env.storage().persistent().set(&provider_key, &p);
         bump_persistent(&env, &provider_key);
+
+        // Removing a provider shrinks the eligible verifier set; clamp the
+        // threshold so it never exceeds the live set.
+        reconcile_signature_threshold(&env);
 
         env.events()
             .publish((Symbol::new(&env, "provider_removed"),), (provider,));
@@ -801,6 +848,15 @@ impl OracleConsumer {
 
         require_admin(&env, &caller)?;
 
+        // A threshold of 0 would make `verifiers.len() >= threshold` trivially
+        // true (single-signature spoofing), and a threshold above the active
+        // provider count could never be reached, permanently deadlocking every
+        // report in Pending.
+        let active = active_provider_count(&env);
+        if threshold == 0 || threshold > active {
+            return Err(OracleError::InvalidThreshold);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::SignatureThreshold, &threshold);
@@ -967,6 +1023,10 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
     }
     env.storage().persistent().set(&provider_key, &p);
     bump_persistent(env, &provider_key);
+
+    // A stake-exhausted provider is deactivated, shrinking the eligible
+    // verifier set; clamp the threshold so it never exceeds the live set.
+    reconcile_signature_threshold(env);
 
     let sh_key = DataKey::SlashHistory(provider.clone());
     let mut history: Vec<SlashRecord> = env
@@ -1638,12 +1698,174 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let provider_c = Address::generate(&env);
 
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
-        client.set_signature_threshold(&admin, &3u32, &0);
-        client.set_signature_threshold(&admin, &5u32, &1);
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &2);
+
+        // Exactly the active provider count is the maximum allowed.
+        client.set_signature_threshold(&admin, &3u32, &3);
+        assert_eq!(client.get_signature_threshold(), 3);
+
+        client.set_signature_threshold(&admin, &1u32, &4);
+        assert_eq!(client.get_signature_threshold(), 1);
+
+        client.set_signature_threshold(&admin, &3u32, &5);
+        assert_eq!(client.get_signature_threshold(), 3);
+    }
+
+    #[test]
+    fn test_set_signature_threshold_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+
+        // 0 would make `verifiers.len() >= threshold` trivially true, so a
+        // single signature would suffice; it must revert.
+        let result = client.try_set_signature_threshold(&admin, &0u32, &2);
+        assert_eq!(result, Err(Ok(OracleError::InvalidThreshold)));
+        assert_eq!(client.get_signature_threshold(), 1);
+
+        // A valid value is still accepted afterwards. The revert rolls back
+        // the nonce increment, so the same nonce can be retried.
+        client.set_signature_threshold(&admin, &2u32, &2);
+        assert_eq!(client.get_signature_threshold(), 2);
+    }
+
+    #[test]
+    fn test_set_signature_threshold_above_active_count_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+
+        // Above the active provider count the threshold could never be reached,
+        // permanently deadlocking every report in Pending; it must revert.
+        let result = client.try_set_signature_threshold(&admin, &2u32, &1);
+        assert_eq!(result, Err(Ok(OracleError::InvalidThreshold)));
+        assert_eq!(client.get_signature_threshold(), 1);
+
+        // The revert rolls back the nonce increment, so the same nonce works
+        // for a value that is within range.
+        client.set_signature_threshold(&admin, &1u32, &1);
+        assert_eq!(client.get_signature_threshold(), 1);
+    }
+
+    #[test]
+    fn test_set_signature_threshold_without_providers_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        // With no active providers even a threshold of 1 exceeds the eligible
+        // verifier set, so setting one must revert.
+        let result = client.try_set_signature_threshold(&admin, &1u32, &0);
+        assert_eq!(result, Err(Ok(OracleError::InvalidThreshold)));
+        assert_eq!(client.get_signature_threshold(), 1);
+    }
+
+    #[test]
+    fn test_remove_provider_adjusts_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let provider_c = Address::generate(&env);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &2);
+
+        client.set_signature_threshold(&admin, &3u32, &3);
+        assert_eq!(client.get_signature_threshold(), 3);
+
+        // Removing a provider shrinks the eligible verifier set, so the
+        // threshold is clamped down instead of deadlocking verification.
+        client.remove_provider(&admin, &provider_c, &4);
+        assert_eq!(client.get_signature_threshold(), 2);
+
+        client.remove_provider(&admin, &provider_b, &5);
+        assert_eq!(client.get_signature_threshold(), 1);
+
+        // The last provider can still be removed; the threshold floors at 1.
+        client.remove_provider(&admin, &provider_a, &6);
+        assert_eq!(client.get_signature_threshold(), 1);
+    }
+
+    #[test]
+    fn test_slash_deactivation_adjusts_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+
+        client.add_stake(&provider_a, &5i128, &0);
+        client.add_stake(&provider_b, &100_000i128, &0);
+
+        client.set_signature_threshold(&admin, &2u32, &2);
+        assert_eq!(client.get_signature_threshold(), 2);
+
+        let report_id = client.submit_report(
+            &provider_a,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &3);
+
+        // provider_a is slashed to zero stake and deactivated; only one
+        // eligible verifier remains, so the threshold is clamped to 1.
+        let p = client.get_provider(&provider_a);
+        assert_eq!(p.stake, 0);
+        assert!(!p.active);
+        assert_eq!(client.get_signature_threshold(), 1);
     }
 
     #[test]
@@ -2131,11 +2353,11 @@ mod test {
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
-        client.set_signature_threshold(&admin, &2u32, &0);
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &2);
 
-        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &1);
-        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &2);
-        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &3);
+        client.set_signature_threshold(&admin, &2u32, &3);
 
         let report_id = client.submit_report(
             &provider_a,
@@ -2181,11 +2403,11 @@ mod test {
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
-        client.set_signature_threshold(&admin, &2u32, &0);
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &2);
 
-        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &1);
-        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &2);
-        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &3);
+        client.set_signature_threshold(&admin, &2u32, &3);
 
         let report_id = client.submit_report(
             &provider_a,
@@ -2248,11 +2470,11 @@ mod test {
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
-        client.set_signature_threshold(&admin, &2u32, &0);
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &2);
 
-        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &1);
-        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &2);
-        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &3);
+        client.set_signature_threshold(&admin, &2u32, &3);
 
         let report_id = client.submit_report(
             &provider_a,
