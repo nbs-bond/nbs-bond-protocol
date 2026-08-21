@@ -21,6 +21,12 @@
 - Only proposals that are `Queued`, past the timelock, and still within `expires_at`
   can be executed. Executing an expired proposal is rejected with
   `GovernanceError::ProposalExpired`, blocking governance replay attacks.
+- `execute` is intentionally permissionless after quorum and the timelock. Any
+  address may trigger the already-approved proposal, so execution cannot be
+  blocked by signer availability. The executor still authenticates the call and
+  uses an address-scoped nonce to prevent replay from that address; signer
+  membership is required for proposing, voting, and cancelling, but not for
+  triggering an approved execution.
 
 ## Execution Allowlist
 
