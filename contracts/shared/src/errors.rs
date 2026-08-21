@@ -41,10 +41,7 @@ pub enum OracleError {
     InvalidSignature = 10,
     InvalidResolution = 11,
     SelfChallenge = 12,
-    /// A report's `[period_start, period_end)` overlaps an already-submitted
-    /// report for the same project.  Periods are half-open and must be
-    /// disjoint so the same carbon can never be counted (and credited) twice.
-    OverlappingReportPeriod = 13,
+    StakeLocked = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]
