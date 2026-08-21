@@ -30,6 +30,9 @@ pub const MAX_ALLOWED_CALLS: u32 = 64;
 /// never be routed through `env.invoke_contract`; `execute` dispatches it
 /// internally instead. See [`Governance::set_allowed_calls`].
 const SELF_METHOD_SET_ALLOWED_CALLS: &str = "set_allowed_calls";
+const SELF_METHOD_ADD_SIGNER: &str = "add_signer";
+const SELF_METHOD_REMOVE_SIGNER: &str = "remove_signer";
+const SELF_METHOD_UPDATE_THRESHOLD: &str = "update_threshold";
 
 /// A single `(contract, method)` pair that governance is permitted to invoke.
 ///
@@ -220,12 +223,50 @@ fn check_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), GovernanceEr
     Ok(())
 }
 
+fn read_signers(env: &Env) -> Option<Vec<Address>> {
+    let key = DataKey::Signers;
+    if let Some(signers) = env.storage().persistent().get(&key) {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        return Some(signers);
+    }
+    env.storage().instance().get(&key)
+}
+
+fn write_signers(env: &Env, signers: &Vec<Address>) {
+    let key = DataKey::Signers;
+    env.storage().persistent().set(&key, signers);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+fn read_threshold(env: &Env) -> Option<u32> {
+    let key = DataKey::Threshold;
+    if let Some(threshold) = env.storage().persistent().get(&key) {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        return Some(threshold);
+    }
+    env.storage().instance().get(&key)
+}
+
+fn write_threshold(env: &Env, threshold: u32) {
+    let key = DataKey::Threshold;
+    env.storage().persistent().set(&key, &threshold);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
 fn require_signer(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
-    let signers: Vec<Address> = env
-        .storage()
-        .instance()
-        .get(&DataKey::Signers)
-        .ok_or(GovernanceError::NotInitialized)?;
+    let signers: Vec<Address> = read_signers(env).ok_or(GovernanceError::NotInitialized)?;
     if !signers.contains(caller.clone()) {
         return Err(GovernanceError::NotSigner);
     }
@@ -385,6 +426,9 @@ fn contains_call(calls: &Vec<AllowedCall>, contract: &Address, function: &Symbol
 fn is_executable_call(env: &Env, target: &Address, method: &Symbol) -> bool {
     if target == &env.current_contract_address() {
         method == &Symbol::new(env, SELF_METHOD_SET_ALLOWED_CALLS)
+            || method == &Symbol::new(env, SELF_METHOD_ADD_SIGNER)
+            || method == &Symbol::new(env, SELF_METHOD_REMOVE_SIGNER)
+            || method == &Symbol::new(env, SELF_METHOD_UPDATE_THRESHOLD)
     } else {
         contains_call(&read_allowed_calls(env), target, method)
     }
@@ -430,23 +474,150 @@ fn apply_set_allowed_calls(
 /// Only the methods enumerated here are reachable; every other method symbol is
 /// rejected with `UnauthorizedCall`. This hard-coded set is what makes the
 /// allowlist bootstrappable without ever leaving the contract open by default.
-fn dispatch_self_call(env: &Env, method: &Symbol, args: &Vec<Val>) -> Result<(), GovernanceError> {
-    if method != &Symbol::new(env, SELF_METHOD_SET_ALLOWED_CALLS) {
-        return Err(GovernanceError::UnauthorizedCall);
+fn apply_add_signer(
+    env: &Env,
+    caller: &Address,
+    signer: &Address,
+    nonce: u64,
+) -> Result<(), GovernanceError> {
+    if caller != &env.current_contract_address() {
+        return Err(GovernanceError::Unauthorized);
     }
+    check_nonce(env, caller, nonce)?;
 
-    // set_allowed_calls(caller: Address, calls: Vec<AllowedCall>, nonce: u64)
-    if args.len() != 3 {
+    let mut signers = read_signers(env).ok_or(GovernanceError::NotInitialized)?;
+    if signers.contains(signer.clone()) {
         return Err(GovernanceError::InvalidCallArgs);
     }
-    let caller = Address::try_from_val(env, &args.get_unchecked(0))
-        .map_err(|_| GovernanceError::InvalidCallArgs)?;
-    let calls = Vec::<AllowedCall>::try_from_val(env, &args.get_unchecked(1))
-        .map_err(|_| GovernanceError::InvalidCallArgs)?;
-    let nonce = u64::try_from_val(env, &args.get_unchecked(2))
-        .map_err(|_| GovernanceError::InvalidCallArgs)?;
+    signers.push_back(signer.clone());
+    write_signers(env, &signers);
 
-    apply_set_allowed_calls(env, &caller, &calls, nonce)
+    env.events().publish(
+        (Symbol::new(env, "signer_added"),),
+        (signer.clone(), caller.clone()),
+    );
+    Ok(())
+}
+
+fn apply_remove_signer(
+    env: &Env,
+    caller: &Address,
+    signer: &Address,
+    nonce: u64,
+) -> Result<(), GovernanceError> {
+    if caller != &env.current_contract_address() {
+        return Err(GovernanceError::Unauthorized);
+    }
+    check_nonce(env, caller, nonce)?;
+
+    let mut signers = read_signers(env).ok_or(GovernanceError::NotInitialized)?;
+    let threshold = read_threshold(env).unwrap_or(1);
+
+    if !signers.contains(signer.clone()) {
+        return Err(GovernanceError::InvalidCallArgs);
+    }
+    if signers.len() <= threshold {
+        return Err(GovernanceError::InvalidCallArgs);
+    }
+
+    let mut index_to_remove = None;
+    for i in 0..signers.len() {
+        if signers.get(i).unwrap() == signer.clone() {
+            index_to_remove = Some(i);
+            break;
+        }
+    }
+    if let Some(index) = index_to_remove {
+        signers.remove(index);
+    }
+    write_signers(env, &signers);
+
+    // Note on in-flight proposals: If this signer had already voted on any currently
+    // Pending proposals, their existing votes remain stored and still count towards
+    // the threshold. Since the overall threshold remains unchanged (and valid against
+    // the new smaller set), those proposals simply need to reach the same threshold
+    // across the new signer set.
+
+    env.events().publish(
+        (Symbol::new(env, "signer_removed"),),
+        (signer.clone(), caller.clone()),
+    );
+    Ok(())
+}
+
+fn apply_update_threshold(
+    env: &Env,
+    caller: &Address,
+    new_threshold: u32,
+    nonce: u64,
+) -> Result<(), GovernanceError> {
+    if caller != &env.current_contract_address() {
+        return Err(GovernanceError::Unauthorized);
+    }
+    check_nonce(env, caller, nonce)?;
+
+    let signers = read_signers(env).ok_or(GovernanceError::NotInitialized)?;
+    if new_threshold == 0 || new_threshold > signers.len() {
+        return Err(GovernanceError::InvalidCallArgs);
+    }
+
+    write_threshold(env, new_threshold);
+
+    env.events().publish(
+        (Symbol::new(env, "threshold_updated"),),
+        (new_threshold, caller.clone()),
+    );
+    Ok(())
+}
+
+fn dispatch_self_call(env: &Env, method: &Symbol, args: &Vec<Val>) -> Result<(), GovernanceError> {
+    if method == &Symbol::new(env, SELF_METHOD_SET_ALLOWED_CALLS) {
+        if args.len() != 3 {
+            return Err(GovernanceError::InvalidCallArgs);
+        }
+        let caller = Address::try_from_val(env, &args.get_unchecked(0))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let calls = Vec::<AllowedCall>::try_from_val(env, &args.get_unchecked(1))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let nonce = u64::try_from_val(env, &args.get_unchecked(2))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        apply_set_allowed_calls(env, &caller, &calls, nonce)
+    } else if method == &Symbol::new(env, SELF_METHOD_ADD_SIGNER) {
+        if args.len() != 3 {
+            return Err(GovernanceError::InvalidCallArgs);
+        }
+        let caller = Address::try_from_val(env, &args.get_unchecked(0))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let signer = Address::try_from_val(env, &args.get_unchecked(1))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let nonce = u64::try_from_val(env, &args.get_unchecked(2))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        apply_add_signer(env, &caller, &signer, nonce)
+    } else if method == &Symbol::new(env, SELF_METHOD_REMOVE_SIGNER) {
+        if args.len() != 3 {
+            return Err(GovernanceError::InvalidCallArgs);
+        }
+        let caller = Address::try_from_val(env, &args.get_unchecked(0))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let signer = Address::try_from_val(env, &args.get_unchecked(1))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let nonce = u64::try_from_val(env, &args.get_unchecked(2))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        apply_remove_signer(env, &caller, &signer, nonce)
+    } else if method == &Symbol::new(env, SELF_METHOD_UPDATE_THRESHOLD) {
+        if args.len() != 3 {
+            return Err(GovernanceError::InvalidCallArgs);
+        }
+        let caller = Address::try_from_val(env, &args.get_unchecked(0))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let new_threshold = u32::try_from_val(env, &args.get_unchecked(1))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        let nonce = u64::try_from_val(env, &args.get_unchecked(2))
+            .map_err(|_| GovernanceError::InvalidCallArgs)?;
+        apply_update_threshold(env, &caller, new_threshold, nonce)
+    } else {
+        Err(GovernanceError::UnauthorizedCall)
+    }
 }
 
 #[contract]
@@ -485,10 +656,8 @@ impl Governance {
                 );
             }
         }
-        env.storage().instance().set(&DataKey::Signers, &signers);
-        env.storage()
-            .instance()
-            .set(&DataKey::Threshold, &threshold);
+        write_signers(&env, &signers);
+        write_threshold(&env, threshold);
         env.storage()
             .instance()
             .set(&DataKey::TimelockSeconds, &timelock_seconds);
@@ -599,11 +768,7 @@ impl Governance {
         }
         write_vote(&env, proposal_id, &caller, &VoteChoice::Approve);
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
+        let threshold: u32 = read_threshold(&env).unwrap_or(1);
 
         proposal.approval_count += 1;
         if proposal.approval_count >= threshold {
@@ -652,11 +817,7 @@ impl Governance {
         }
         write_vote(&env, proposal_id, &caller, &VoteChoice::Veto);
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
+        let threshold: u32 = read_threshold(&env).unwrap_or(1);
 
         proposal.veto_count += 1;
         if proposal.veto_count >= threshold {
@@ -815,6 +976,36 @@ impl Governance {
         apply_set_allowed_calls(&env, &caller, &calls, nonce)
     }
 
+    pub fn add_signer(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        nonce: u64,
+    ) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        apply_add_signer(&env, &caller, &signer, nonce)
+    }
+
+    pub fn remove_signer(
+        env: Env,
+        caller: Address,
+        signer: Address,
+        nonce: u64,
+    ) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        apply_remove_signer(&env, &caller, &signer, nonce)
+    }
+
+    pub fn update_threshold(
+        env: Env,
+        caller: Address,
+        new_threshold: u32,
+        nonce: u64,
+    ) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        apply_update_threshold(&env, &caller, new_threshold, nonce)
+    }
+
     /// The current execution allowlist, for dashboards and proposal review.
     pub fn get_allowed_calls(env: Env) -> Vec<AllowedCall> {
         read_allowed_calls(&env)
@@ -910,17 +1101,11 @@ impl Governance {
     }
 
     pub fn get_signers(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Signers)
-            .unwrap_or(vec![&env])
+        read_signers(&env).unwrap_or(vec![&env])
     }
 
     pub fn get_threshold(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1)
+        read_threshold(&env).unwrap_or(1)
     }
 
     pub fn get_timelock(env: Env) -> u64 {
@@ -931,9 +1116,7 @@ impl Governance {
     }
 
     pub fn is_signer(env: Env, address: Address) -> bool {
-        env.storage()
-            .instance()
-            .get::<_, Vec<Address>>(&DataKey::Signers)
+        read_signers(&env)
             .map(|signers| signers.contains(address))
             .unwrap_or(false)
     }
@@ -2589,5 +2772,408 @@ mod test {
             &0,
         );
         assert_eq!(proposal_id, 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Signer rotation tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_add_signer_happy_path() {
+        let (env, gov_client, signers) = setup();
+        let new_signer = Address::generate(&env);
+        let gov_id = gov_client.address.clone();
+
+        let initial_signers = gov_client.get_signers();
+        assert!(!initial_signers.contains(&new_signer));
+
+        // Proposal to add signer
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            new_signer.clone().into_val(&env),
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_ADD_SIGNER),
+            &proposal_args,
+            &Symbol::new(&env, "add_signer"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+        gov_client.execute(&signers.get(0).unwrap(), &proposal_id, &1);
+
+        let final_signers = gov_client.get_signers();
+        assert_eq!(final_signers.len(), initial_signers.len() + 1);
+        assert!(final_signers.contains(&new_signer));
+    }
+
+    #[test]
+    fn test_add_signer_rejects_duplicate() {
+        let (env, gov_client, signers) = setup();
+        let existing_signer = signers.get(1).unwrap(); // Already in the set
+        let gov_id = gov_client.address.clone();
+
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            existing_signer.clone().into_val(&env),
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_ADD_SIGNER),
+            &proposal_args,
+            &Symbol::new(&env, "add_signer"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+
+        let result = gov_client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
+        // InvalidCallArgs is returned by apply_add_signer if duplicate
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidCallArgs)));
+    }
+
+    #[test]
+    fn test_add_signer_rejects_direct_call() {
+        let (env, gov_client, _signers) = setup();
+        let new_signer = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        // Caller tries to invoke add_signer directly bypassing the proposal flow
+        let result = gov_client.try_add_signer(&caller, &new_signer, &0);
+        // Returns Unauthorized because caller != gov_client.address (it requires caller to be auth'd and then inside it checks if caller is current contract)
+        assert_eq!(result, Err(Ok(GovernanceError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_remove_signer_happy_path() {
+        let (env, gov_client, signers) = setup();
+        let existing_signer = signers.get(4).unwrap(); // In 3-of-5 setup, 5th signer can be removed safely (3 of 4)
+        let gov_id = gov_client.address.clone();
+
+        let initial_signers = gov_client.get_signers();
+        assert!(initial_signers.contains(&existing_signer));
+
+        // Proposal to remove signer
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            existing_signer.clone().into_val(&env),
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_REMOVE_SIGNER),
+            &proposal_args,
+            &Symbol::new(&env, "remove_signer"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+        gov_client.execute(&signers.get(0).unwrap(), &proposal_id, &1);
+
+        let final_signers = gov_client.get_signers();
+        assert_eq!(final_signers.len(), initial_signers.len() - 1);
+        assert!(!final_signers.contains(&existing_signer));
+    }
+
+    #[test]
+    fn test_remove_signer_rejects_below_threshold() {
+        // Create 2-of-3 multi-sig
+        let build = |_env: &Env| None::<(Address, Symbol)>;
+        let env = Env::default();
+        env.mock_all_auths();
+        let signers = make_signers(&env, 3); // 3 total signers
+        let threshold: u32 = 3; // 3 of 3
+        let allowed: Vec<AllowedCall> = vec![&env];
+        let contract_id = env.register(
+            Governance,
+            (&signers, &threshold, &DEFAULT_TIMELOCK_SECONDS, &allowed),
+        );
+        let gov_client = GovernanceClient::new(&env, &contract_id);
+
+        let existing_signer = signers.get(2).unwrap();
+        let gov_id = gov_client.address.clone();
+
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            existing_signer.clone().into_val(&env),
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_REMOVE_SIGNER),
+            &proposal_args,
+            &Symbol::new(&env, "remove_signer"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(0).unwrap(), &proposal_id, &1);
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+
+        let result = gov_client.try_execute(&signers.get(0).unwrap(), &proposal_id, &2);
+        // Removing a signer would drop the count below the threshold of 3
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidCallArgs)));
+    }
+
+    #[test]
+    fn test_remove_signer_rejects_missing() {
+        let (env, gov_client, signers) = setup();
+        let missing_signer = Address::generate(&env);
+        let gov_id = gov_client.address.clone();
+
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            missing_signer.clone().into_val(&env),
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_REMOVE_SIGNER),
+            &proposal_args,
+            &Symbol::new(&env, "remove_signer"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+
+        let result = gov_client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
+        // Missing signer
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidCallArgs)));
+    }
+
+    #[test]
+    fn test_update_threshold_happy_path() {
+        let (env, gov_client, signers) = setup(); // 5 signers, threshold 3
+        let gov_id = gov_client.address.clone();
+
+        // Proposal to update threshold to 4
+        let new_threshold: u32 = 4;
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            new_threshold.into_val(&env),
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_UPDATE_THRESHOLD),
+            &proposal_args,
+            &Symbol::new(&env, "update_threshold"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+        gov_client.execute(&signers.get(0).unwrap(), &proposal_id, &1);
+
+        let final_threshold = gov_client.get_threshold();
+        assert_eq!(final_threshold, 4);
+    }
+
+    #[test]
+    fn test_update_threshold_rejects_zero() {
+        let (env, gov_client, signers) = setup();
+        let gov_id = gov_client.address.clone();
+
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            0u32.into_val(&env),
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_UPDATE_THRESHOLD),
+            &proposal_args,
+            &Symbol::new(&env, "update_threshold"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+
+        let result = gov_client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidCallArgs)));
+    }
+
+    #[test]
+    fn test_update_threshold_rejects_above_signer_count() {
+        let (env, gov_client, signers) = setup(); // 5 signers
+        let gov_id = gov_client.address.clone();
+
+        let proposal_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            6u32.into_val(&env), // 6 > 5
+            0u64.into_val(&env),
+        ];
+
+        let proposal_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_UPDATE_THRESHOLD),
+            &proposal_args,
+            &Symbol::new(&env, "update_threshold"),
+            &0,
+        );
+
+        gov_client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+
+        let result = gov_client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidCallArgs)));
+    }
+
+    #[test]
+    fn test_rotation_e2e() {
+        let (env, gov_client, signers) = setup(); // Setup creates 5 signers with threshold 3.
+        let gov_id = gov_client.address.clone();
+
+        // 1. Initial State: 5 signers, threshold 3
+        let initial_signers = gov_client.get_signers();
+        assert_eq!(initial_signers.len(), 5);
+        assert_eq!(gov_client.get_threshold(), 3);
+
+        // 2. Add 6th signer
+        let new_signer = Address::generate(&env);
+        let prop1_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            new_signer.clone().into_val(&env),
+            0u64.into_val(&env),
+        ];
+        let prop1_id = gov_client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_ADD_SIGNER),
+            &prop1_args,
+            &Symbol::new(&env, "add_signer"),
+            &0,
+        );
+        gov_client.vote_approve(&signers.get(0).unwrap(), &prop1_id, &1);
+        gov_client.vote_approve(&signers.get(1).unwrap(), &prop1_id, &0);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &prop1_id, &0);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+        gov_client.execute(&signers.get(0).unwrap(), &prop1_id, &2);
+
+        let signers_after_add = gov_client.get_signers();
+        assert_eq!(signers_after_add.len(), 6);
+        assert!(signers_after_add.contains(&new_signer));
+
+        // 3. Remove 1st signer (signers[0])
+        let signer_to_remove = signers.get(0).unwrap();
+        let prop2_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            signer_to_remove.clone().into_val(&env),
+            1u64.into_val(&env), // governance contract nonce is now 1
+        ];
+        // Signer 1 proposes since Signer 0 is being removed
+        let prop2_id = gov_client.propose(
+            &signers.get(1).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_REMOVE_SIGNER),
+            &prop2_args,
+            &Symbol::new(&env, "remove_signer"),
+            &1, // nonce for signer 1 is 1 since they voted on prop1
+        );
+        // We need 3 votes total (proposer is 1 vote? No, proposer must vote explicitly)
+        // Actually, proposer doesn't automatically vote.
+        gov_client.vote_approve(&signers.get(2).unwrap(), &prop2_id, &1);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &prop2_id, &0);
+        gov_client.vote_approve(&new_signer, &prop2_id, &0); // new signer votes
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+        gov_client.execute(&signers.get(1).unwrap(), &prop2_id, &2); // execute by signer 1
+
+        let signers_after_remove = gov_client.get_signers();
+        assert_eq!(signers_after_remove.len(), 5);
+        assert!(!signers_after_remove.contains(&signer_to_remove));
+        assert_eq!(gov_client.get_threshold(), 3); // Threshold unchanged
+
+        // 4. Update threshold to 4
+        let prop3_args: Vec<Val> = vec![
+            &env,
+            gov_id.clone().into_val(&env),
+            4u32.into_val(&env),
+            2u64.into_val(&env), // governance contract nonce is now 2
+        ];
+        let prop3_id = gov_client.propose(
+            &new_signer,
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_UPDATE_THRESHOLD),
+            &prop3_args,
+            &Symbol::new(&env, "update_threshold"),
+            &1, // new signer nonce was 1
+        );
+        gov_client.vote_approve(&signers.get(1).unwrap(), &prop3_id, &3);
+        gov_client.vote_approve(&signers.get(2).unwrap(), &prop3_id, &2);
+        gov_client.vote_approve(&signers.get(3).unwrap(), &prop3_id, &1);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + DEFAULT_TIMELOCK_SECONDS);
+        gov_client.execute(&new_signer, &prop3_id, &2);
+
+        assert_eq!(gov_client.get_threshold(), 4);
     }
 }
