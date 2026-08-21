@@ -1,6 +1,10 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
+#![allow(deprecated)]
 use nbbs_shared::{ProjectStatus, RegistryError};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Symbol,
+    Vec,
+};
 
 #[derive(Clone)]
 #[contracttype]
@@ -11,6 +15,7 @@ pub enum DataKey {
     ProjectId(u64),
     Nonce(Address),
     OwnerProjects(Address),
+    OracleConsumerId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +163,158 @@ impl ProjectRegistry {
         Ok(new_id)
     }
 
+    /// Suspend an approved project (admin-only). Suspended projects cannot back new bonds
+    /// or generate credits until reinstated.
+    pub fn suspend_project(
+        env: Env,
+        caller: Address,
+        project_id: u64,
+        reason: String,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let expected_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Nonce(caller.clone()))
+            .unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        let key = project_id_to_bytes(&env, project_id);
+        let mut project: Project = env
+            .storage()
+            .instance()
+            .get(&DataKey::Project(key.clone()))
+            .ok_or(RegistryError::ProjectNotFound)?;
+
+        if project.status != ProjectStatus::Approved {
+            return Err(RegistryError::InvalidStatusTransition);
+        }
+
+        project.status = ProjectStatus::Inactive;
+        env.storage()
+            .instance()
+            .set(&DataKey::Project(key), &project);
+
+        // Emit suspension event
+        env.events()
+            .publish((symbol_short!("P_SUSPEND"),), (project_id, caller, reason));
+
+        Ok(())
+    }
+
+    /// Revoke an approved project (admin-only). Revoked projects are permanently
+    /// removed from the active registry and cannot be reinstated.
+    pub fn revoke_project(
+        env: Env,
+        caller: Address,
+        project_id: u64,
+        reason: String,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let expected_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Nonce(caller.clone()))
+            .unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        let key = project_id_to_bytes(&env, project_id);
+        let mut project: Project = env
+            .storage()
+            .instance()
+            .get(&DataKey::Project(key.clone()))
+            .ok_or(RegistryError::ProjectNotFound)?;
+
+        if project.status != ProjectStatus::Approved {
+            return Err(RegistryError::InvalidStatusTransition);
+        }
+
+        project.status = ProjectStatus::Rejected;
+        env.storage()
+            .instance()
+            .set(&DataKey::Project(key), &project);
+
+        // Emit revocation event
+        env.events()
+            .publish((symbol_short!("P_REVOKE"),), (project_id, caller, reason));
+
+        Ok(())
+    }
+
+    /// Check if a project is active (Approved and not suspended).
+    pub fn is_project_active(env: &Env, project_id: u64) -> bool {
+        let key = project_id_to_bytes(env, project_id);
+        match env
+            .storage()
+            .instance()
+            .get::<DataKey, Project>(&DataKey::Project(key))
+        {
+            Some(project) => project.status == ProjectStatus::Approved,
+            None => false,
+        }
+    }
+
+    /// Get project status for oracle integration.
+    pub fn get_project_status(env: &Env, project_id: u64) -> Result<ProjectStatus, RegistryError> {
+        let key = project_id_to_bytes(env, project_id);
+        env.storage()
+            .instance()
+            .get::<DataKey, Project>(&DataKey::Project(key))
+            .map(|project: Project| project.status)
+            .ok_or(RegistryError::ProjectNotFound)
+    }
+
+    /// Set the oracle consumer contract address (admin-only).
+    pub fn set_oracle_consumer(
+        env: Env,
+        caller: Address,
+        oracle_consumer_id: Address,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let expected_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Nonce(caller.clone()))
+            .unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleConsumerId, &oracle_consumer_id);
+
+        env.events()
+            .publish((symbol_short!("ORA_SET"),), (caller, oracle_consumer_id));
+
+        Ok(())
+    }
+
     pub fn approve_project(
         env: Env,
         caller: Address,
@@ -248,7 +405,10 @@ impl ProjectRegistry {
             .ok_or(RegistryError::ProjectNotFound)
     }
 
-    pub fn get_project_status_by_hash(env: Env, hash: BytesN<32>) -> Result<ProjectStatus, RegistryError> {
+    pub fn get_project_status_by_hash(
+        env: Env,
+        hash: BytesN<32>,
+    ) -> Result<ProjectStatus, RegistryError> {
         let count: u64 = env
             .storage()
             .instance()
@@ -310,6 +470,33 @@ impl ProjectRegistry {
             .instance()
             .get(&DataKey::ProjectCount)
             .unwrap_or(0)
+    }
+
+    /// Get project by metadata IPFS hash.
+    pub fn get_project_by_hash(
+        env: Env,
+        metadata_ipfs_hash: BytesN<32>,
+    ) -> Result<Project, RegistryError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectCount)
+            .unwrap_or(0);
+
+        for id in 1..=count {
+            let key = project_id_to_bytes(&env, id);
+            if let Some(project) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Project>(&DataKey::Project(key))
+            {
+                if project.metadata_ipfs_hash == metadata_ipfs_hash {
+                    return Ok(project);
+                }
+            }
+        }
+
+        Err(RegistryError::ProjectNotFound)
     }
 
     pub fn get_owner_projects(env: Env, owner: Address) -> Vec<u64> {

@@ -6,6 +6,7 @@ import { OracleProviderAdapter, MeasurementData } from './providers/provider.int
 import { VerraProvider } from './providers/verra.provider';
 import { SatelliteProvider } from './providers/satellite.provider';
 import { BlueCarbonProvider } from './providers/blue-carbon.provider';
+import { SchedulerRegistry } from '@nestjs/schedule';
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -60,6 +61,9 @@ function buildScheduler(overrides: {
     verra as unknown as VerraProvider,
     satellite as unknown as SatelliteProvider,
     blueCarbon as unknown as BlueCarbonProvider,
+    {
+      deleteCronJob: jest.fn(),
+    } as unknown as SchedulerRegistry,
   );
   return { scheduler, verra, satellite, blueCarbon };
 }

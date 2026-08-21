@@ -18,6 +18,7 @@ import { LoadingSpinnerComponent } from "../../shared/components/loading-spinner
 import { Bond } from "../../shared/interfaces/bond.interface";
 import { AccruedCreditsResponse } from "../../shared/interfaces/bond.interface";
 import { environment } from "../../../environments/environment";
+import { isValidStellarAddress } from "../../shared/validators/form-validators";
 
 export type ActionState<T> =
   | { status: "idle" }
@@ -258,9 +259,15 @@ export function getResult<T>(state: ActionState<T>): T | undefined {
                     id="transferTo"
                     type="text"
                     class="form-input"
-                    [(ngModel)]="transferTo"
+                    [value]="transferTo()"
+                    (input)="transferTo.set($any($event.target).value)"
                     placeholder="G... recipient public key"
                   />
+                  @if (transferTo() && !transferToValid()) {
+                    <span class="form-error">
+                      Enter a valid Stellar address (G… followed by 55 uppercase letters/digits)
+                    </span>
+                  }
                   <label class="form-label" for="transferAmount">Amount</label>
                   <input
                     id="transferAmount"
@@ -273,7 +280,8 @@ export function getResult<T>(state: ActionState<T>): T | undefined {
                   <button
                     class="btn btn-primary transfer-btn"
                     [disabled]="
-                      !transferTo ||
+                      !transferTo() ||
+                      !transferToValid() ||
                       !transferAmount ||
                       transferAmount < 1 ||
                       isTransferring()
@@ -284,8 +292,7 @@ export function getResult<T>(state: ActionState<T>): T | undefined {
                   </button>
                   @if (transferSuccess()) {
                     <div class="success-msg">
-                      Transferred {{ transferAmount }} tokens to
-                      {{ transferTo }}! Tx: {{ transferTx() }}
+                      Transferred {{ transferAmount }} tokens! Tx: {{ transferTx() }}
                     </div>
                   }
                   @if (transferError()) {
@@ -751,7 +758,8 @@ export class BondDetailComponent implements OnInit, OnDestroy {
   }
 
   subscribeAmount = 0;
-  transferTo = "";
+  transferTo = signal('');
+  readonly transferToValid = computed(() => isValidStellarAddress(this.transferTo()));
   transferAmount = 0;
 
   subscribeProgress(): number {
@@ -855,7 +863,8 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     const b = this.bond();
     if (
       !b ||
-      !this.transferTo ||
+      !this.transferTo() ||
+      !this.transferToValid() ||
       !this.transferAmount ||
       this.transferAmount < 1
     )
@@ -863,14 +872,14 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     this.transferState.set({ status: "loading" });
 
     this.apiService
-      .transferBond(b.id, this.transferTo, this.transferAmount)
+      .transferBond(b.id, this.transferTo(), this.transferAmount)
       .subscribe({
         next: (res) => {
           this.transferState.set({
             status: "success",
             result: { tx: res.transactionHash },
           });
-          this.transferTo = "";
+          this.transferTo.set('');
           this.transferAmount = 0;
         },
         error: (err) => {

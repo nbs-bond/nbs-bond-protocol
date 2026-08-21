@@ -17,9 +17,10 @@ import {
   QuoteAsset,
   QuoteBalanceResponse,
   QuoteTransactionResponse,
+  OnChainPriceQuote,
 } from './interfaces/marketplace.interface';
 import { createClient, RedisClientType } from '@redis/client';
-import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
 import { PaginatedResponse } from '../common/dto/pagination.dto';
 
 const DEX_ROUTER = () => process.env.DEX_ROUTER_ADDRESS || '';
@@ -121,7 +122,7 @@ export class DexService {
     );
 
     const orderId = Number(scValToNative(result));
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
     return this.getOrder(orderId);
   }
 
@@ -162,7 +163,7 @@ export class DexService {
       throw this.mapDexError(error);
     }
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(dto.orderId);
     return this.getOrder(dto.orderId);
   }
 
@@ -180,7 +181,7 @@ export class DexService {
       nonce,
     );
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
   }
 
   async getOrder(orderId: number): Promise<OrderResponse> {
@@ -197,6 +198,43 @@ export class DexService {
 
     await this.redis.setEx(cacheKey, 60, JSON.stringify(order));
     return order;
+  }
+
+  // `del('orders:*')` does not glob-match; SCAN for the real keys and UNLINK them.
+  private async invalidateOrderCaches(orderId: number): Promise<void> {
+    const keys = [`order:${orderId}`];
+
+    for await (const key of this.redis.scanIterator({ MATCH: 'orders:*', COUNT: 100 })) {
+      keys.push(key as unknown as string);
+    }
+
+    await this.redis.unlink(keys);
+  }
+
+  async getBestPrice(
+    bondId: number,
+    side: 'buy' | 'sell',
+    amount: number,
+  ): Promise<OnChainPriceQuote> {
+    const sideScVal = xdr.ScVal.scvVec([
+      nativeToScVal(side === 'buy' ? 'Buy' : 'Sell', { type: 'symbol' }),
+    ]);
+    const quoteScVal = await this.contractService.simulateCall({
+      contractAddress: DEX_ROUTER(),
+      method: 'get_best_price',
+      args: [
+        nativeToScVal(BigInt(bondId), { type: 'u64' }),
+        sideScVal,
+        nativeToScVal(BigInt(amount), { type: 'i128' }),
+      ],
+    });
+    const [price, total, slippageBps] = scValToNative(quoteScVal) as bigint[];
+
+    return {
+      price: Number(price),
+      total: Number(total),
+      slippageBps: Number(slippageBps),
+    };
   }
 
   async getQuoteBalance(
