@@ -31,6 +31,7 @@ pub enum DataKey {
     BondHolderRetirements(u64, Address),
     RetiredCredits(Address),
     RetiredPerBond(u64, Address),
+    RetiredByType(Address, CreditType),
     BondIssuerAddress,
     CouponEngineAddress,
     Nonce(Address),
@@ -462,6 +463,13 @@ impl CreditRetirement {
     }
 }
 
+
+
+    /// Get the total retired credits by type for a holder.
+    pub fn get_retired_by_type(env: Env, holder: Address, credit_type: CreditType) -> i128 {
+        let key = DataKey::RetiredByType(holder, credit_type);
+        read(&env, &key).unwrap_or(0)
+    }
 #[cfg(test)]
 mod test {
     use super::*;
