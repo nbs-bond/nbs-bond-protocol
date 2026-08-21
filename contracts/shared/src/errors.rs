@@ -103,6 +103,11 @@ pub enum CouponEngineError {
     Overflow = 10,
     ZeroAmount = 11,
     ProjectNotApproved = 12,
+    /// A holder's combined AccruedCredits balance didn't match the sum of
+    /// their per-type balances when claim_credits or sweep_undistributed
+    /// tried to zero it out (issue #110). Returned instead of silently
+    /// destroying the mismatched amount.
+    AccountingMismatch = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]
