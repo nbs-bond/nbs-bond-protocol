@@ -149,7 +149,11 @@ fn active_provider_count(env: &Env) -> u32 {
     let mut count: u32 = 0;
     for addr in providers.iter() {
         let key = DataKey::Provider(addr);
-        if let Some(p) = env.storage().persistent().get::<DataKey, OracleProvider>(&key) {
+        if let Some(p) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OracleProvider>(&key)
+        {
             if p.active {
                 count += 1;
             }
@@ -164,11 +168,7 @@ fn active_provider_count(env: &Env) -> u32 {
 /// threshold floors at 1 (the constructor default) when no providers remain.
 fn reconcile_signature_threshold(env: &Env) {
     let threshold_key = DataKey::SignatureThreshold;
-    let current: u32 = env
-        .storage()
-        .instance()
-        .get(&threshold_key)
-        .unwrap_or(1);
+    let current: u32 = env.storage().instance().get(&threshold_key).unwrap_or(1);
     let adjusted = current.min(active_provider_count(env).max(1));
     if adjusted != current {
         env.storage().instance().set(&threshold_key, &adjusted);

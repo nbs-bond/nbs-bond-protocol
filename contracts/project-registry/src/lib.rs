@@ -1,6 +1,10 @@
 #![no_std]
+#![allow(deprecated)]
 use nbbs_shared::{ProjectStatus, RegistryError};
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Symbol,
+    Vec,
+};
 
 #[derive(Clone)]
 #[contracttype]
@@ -11,6 +15,7 @@ pub enum DataKey {
     ProjectId(u64),
     Nonce(Address),
     OwnerProjects(Address),
+    OracleConsumerId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -238,6 +243,81 @@ impl ProjectRegistry {
             .set(&DataKey::Project(key), &project);
 
         Ok(())
+    }
+
+    /// Revoke an approved project (admin-only). Revoked projects are permanently
+    /// removed from the active registry and cannot be reinstated.
+    pub fn revoke_project(
+        env: Env,
+        caller: Address,
+        project_id: u64,
+        reason: String,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let expected_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Nonce(caller.clone()))
+            .unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        let key = project_id_to_bytes(&env, project_id);
+        let mut project: Project = env
+            .storage()
+            .instance()
+            .get(&DataKey::Project(key.clone()))
+            .ok_or(RegistryError::ProjectNotFound)?;
+
+        if project.status != ProjectStatus::Approved {
+            return Err(RegistryError::InvalidStatusTransition);
+        }
+
+        project.status = ProjectStatus::Rejected;
+        env.storage()
+            .instance()
+            .set(&DataKey::Project(key), &project);
+
+        // Emit revocation event
+        env.events()
+            .publish((symbol_short!("P_REVOKE"),), (project_id, caller, reason));
+
+        Ok(())
+    }
+
+    /// Get project by metadata IPFS hash.
+    pub fn get_project_by_hash(
+        env: Env,
+        metadata_ipfs_hash: BytesN<32>,
+    ) -> Result<Project, RegistryError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectCount)
+            .unwrap_or(0);
+
+        for id in 1..=count {
+            let key = project_id_to_bytes(&env, id);
+            if let Some(project) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Project>(&DataKey::Project(key))
+            {
+                if project.metadata_ipfs_hash == metadata_ipfs_hash {
+                    return Ok(project);
+                }
+            }
+        }
+
+        Err(RegistryError::ProjectNotFound)
     }
 
     pub fn get_project(env: Env, project_id: u64) -> Result<Project, RegistryError> {
