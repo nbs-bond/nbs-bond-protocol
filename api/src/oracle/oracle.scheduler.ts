@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron, CronExpression, SchedulerRegistry } from '@nestjs/schedule';
 import { createClient, RedisClientType } from '@redis/client';
+import { OnModuleDestroy } from '@nestjs/common';
 import { OracleService } from './oracle.service';
 import { OracleMonitoringService } from './oracle.monitoring.service';
 import { ProjectsService } from '../projects/projects.service';
@@ -43,9 +44,15 @@ export function classifyProviderFailure(error: unknown): FailureKind {
 }
 
 @Injectable()
-export class OracleScheduler {
+export class OracleScheduler implements OnModuleDestroy {
   private readonly logger = new Logger(OracleScheduler.name);
   private redis: RedisClientType;
+
+  /** Set to true on shutdown; pollOracleData checks this before starting work. */
+  private shuttingDown = false;
+
+  /** In-flight poll cycle promises — waited on during shutdown. */
+  private readonly activePollCycles = new Set<Promise<void>>();
 
   constructor(
     private readonly oracleService: OracleService,
@@ -54,6 +61,7 @@ export class OracleScheduler {
     private readonly verraProvider: VerraProvider,
     private readonly satelliteProvider: SatelliteProvider,
     private readonly blueCarbonProvider: BlueCarbonProvider,
+    private readonly schedulerRegistry: SchedulerRegistry,
   ) {
     this.redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
     this.redis.connect().catch(() => {});
@@ -61,6 +69,20 @@ export class OracleScheduler {
 
   @Cron(CronExpression.EVERY_5_MINUTES)
   async pollOracleData(): Promise<void> {
+    // Do not start a new cycle if shutdown has been requested.
+    if (this.shuttingDown) {
+      this.logger.log('Oracle poll cycle skipped — shutdown in progress');
+      return;
+    }
+
+    const cycle = this._runPollCycle();
+    this.activePollCycles.add(cycle);
+    cycle.finally(() => this.activePollCycles.delete(cycle));
+    await cycle;
+  }
+
+  /** Extracted so onModuleDestroy() can also wait for the inner work. */
+  private async _runPollCycle(): Promise<void> {
     this.logger.log('Oracle poll cycle started');
 
     const projects = await this.loadProjects();
@@ -204,6 +226,60 @@ export class OracleScheduler {
     } catch (error) {
       this.logger.warn(
         `Oracle poll: could not record dead-letter entry: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Gracefully shut down the OracleScheduler.
+   *
+   * Steps:
+   * 1. Set the shutdown flag so no new poll cycle starts from the @Cron trigger.
+   * 2. Unregister the cron jobs from NestJS's SchedulerRegistry so they cannot
+   *    fire again after this point (belt-and-suspenders alongside the flag).
+   * 3. Wait for any in-flight poll cycle to finish so we do not kill a cycle
+   *    mid-flight and leave partial dead-letter entries.
+   * 4. Quit the Redis connection cleanly.
+   *
+   * Called automatically by NestJS when app.enableShutdownHooks() is active
+   * and the process receives SIGTERM/SIGINT.
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.shuttingDown = true;
+
+    // Stop the scheduled cron jobs so they cannot fire while we are waiting
+    // for in-flight cycles to complete.
+    for (const jobName of ['pollOracleData', 'monitorProviderReliability']) {
+      try {
+        this.schedulerRegistry.deleteCronJob(jobName);
+        this.logger.log(`OracleScheduler: cron job '${jobName}' unregistered`);
+      } catch {
+        // Job may not be registered in test environments — ignore.
+      }
+    }
+
+    // Wait for any currently-running poll cycle to finish.
+    if (this.activePollCycles.size > 0) {
+      this.logger.log(
+        `OracleScheduler: waiting for ${this.activePollCycles.size} in-flight poll cycle(s) to complete`,
+      );
+      await Promise.allSettled([...this.activePollCycles]);
+      this.logger.log('OracleScheduler: all in-flight poll cycles finished');
+    }
+
+    // Close the Redis connection gracefully.
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('OracleScheduler: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `OracleScheduler: error closing Redis connection: ${error?.message ?? error}`,
       );
     }
   }

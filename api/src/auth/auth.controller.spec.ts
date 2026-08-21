@@ -74,6 +74,8 @@ describe("AuthController", () => {
     const expected = {
       walletAddress: "G123",
       kycStatus: "VERIFIED" as any,
+      stale: false,
+      cachedAt: "2026-01-01T00:00:00.000Z",
       createdAt: "2026-01-01",
     };
     authService.getProfile.mockResolvedValue(expected);

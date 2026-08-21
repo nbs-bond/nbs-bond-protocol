@@ -41,6 +41,11 @@ pub enum OracleError {
     InvalidSignature = 10,
     InvalidResolution = 11,
     SelfChallenge = 12,
+    StakeLocked = 13,
+    /// The signature threshold is out of range: `0` would make a single
+    /// signature trivially sufficient, and a value above the active provider
+    /// count could never be reached, permanently deadlocking verification.
+    InvalidThreshold = 14,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +75,10 @@ pub enum RegistryError {
     ProjectAlreadyExists = 4,
     InvalidStatusTransition = 5,
     InvalidNonce = 6,
+    OracleConsumerNotSet = 7,
+    ProjectNotApproved = 8,
+    ProjectInactive = 9,
+    CannotSuspend = 10,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,7 +112,11 @@ pub enum CouponEngineError {
     Overflow = 10,
     ZeroAmount = 11,
     ProjectNotApproved = 12,
-    InvalidPeriodIndex = 13,
+    /// A holder's combined AccruedCredits balance didn't match the sum of
+    /// their per-type balances when claim_credits or sweep_undistributed
+    /// tried to zero it out (issue #110). Returned instead of silently
+    /// destroying the mismatched amount.
+    AccountingMismatch = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,4 +143,11 @@ pub enum GovernanceError {
     /// be decoded into the expected types, or whose values were out of range
     /// (for example an allowlist longer than `MAX_ALLOWED_CALLS`).
     InvalidCallArgs = 13,
+    /// A nonce's "ever initialized" marker exists but the nonce entry itself
+    /// is missing (issue #189). Since both are always written and
+    /// TTL-extended together, this combination can only mean the nonce was
+    /// lost to archival — never that the address simply hasn't transacted
+    /// before, which is what makes it safe to treat as an error instead of
+    /// silently resetting replay protection to 0.
+    NonceArchived = 14,
 }

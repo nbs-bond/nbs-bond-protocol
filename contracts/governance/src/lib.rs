@@ -54,6 +54,13 @@ pub enum DataKey {
     ProposalCount,
     Vote(u64, Address),
     Nonce(Address),
+    /// Marker set alongside `Nonce` (issue #189) on every write, always
+    /// TTL-extended at the same time with the same parameters — so the two
+    /// entries always share an expiration ledger. Lets `get_nonce`
+    /// distinguish a signer who has genuinely never transacted (both
+    /// entries absent, legitimately 0) from one whose nonce existed and was
+    /// lost to archival (marker present, nonce absent — an error).
+    NonceInitialized(Address),
     /// The execution allowlist: a deduplicated `Vec<AllowedCall>`. Held in
     /// **persistent** storage rather than instance storage — the allowlist is
     /// the contract's security boundary and must outlive any instance-storage
@@ -115,7 +122,58 @@ fn storage_version(env: &Env) -> u32 {
 /// fallback read is what keeps a signer's pre-migration nonce honoured
 /// instead of silently resetting to 0, which would let a stale signed
 /// request replay.
-fn get_nonce(env: &Env, addr: &Address) -> u64 {
+/// Write a nonce and its "ever initialized" marker together, always
+/// extending both to the maximum TTL window in lockstep (issue #189).
+/// Because the two entries are always written and extended at exactly the
+/// same time with exactly the same parameters, they always share the same
+/// expiration ledger.
+fn write_nonce(env: &Env, addr: &Address, nonce: u64) {
+    let key = DataKey::Nonce(addr.clone());
+    env.storage().persistent().set(&key, &nonce);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+
+    let marker_key = DataKey::NonceInitialized(addr.clone());
+    env.storage().persistent().set(&marker_key, &true);
+    env.storage().persistent().extend_ttl(
+        &marker_key,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL_EXTEND_TO,
+    );
+}
+
+fn has_nonce_marker(env: &Env, addr: &Address) -> bool {
+    let marker_key = DataKey::NonceInitialized(addr.clone());
+    if env.storage().persistent().has(&marker_key) {
+        env.storage().persistent().extend_ttl(
+            &marker_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Nonces (issue #189): a nonce found in persistent storage has its TTL
+/// extended right here on every read, on top of the extension `set_nonce`
+/// already applies on every write — so any nonce that's ever been touched
+/// stays alive as long as its owner transacts at least once within each
+/// TTL window.
+///
+/// A nonce found only in legacy instance storage (from before issue #103
+/// moved nonces to persistent storage) is self-healed into persistent
+/// storage immediately, protecting it the same way from this read onward.
+///
+/// If neither backend has an entry, `has_nonce_marker` distinguishes a
+/// signer who has simply never transacted (legitimately 0) from one whose
+/// nonce existed and was lost to archival: the marker surviving with the
+/// nonce missing can only mean the latter, since the two are always written
+/// and TTL-extended together — so that combination is an error instead of a
+/// silent reset of replay protection.
+fn get_nonce(env: &Env, addr: &Address) -> Result<u64, GovernanceError> {
     let key = DataKey::Nonce(addr.clone());
     if let Some(nonce) = env.storage().persistent().get(&key) {
         env.storage().persistent().extend_ttl(
@@ -123,24 +181,42 @@ fn get_nonce(env: &Env, addr: &Address) -> u64 {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
-        return nonce;
+        return Ok(nonce);
     }
-    env.storage().instance().get(&key).unwrap_or(0)
+
+    if let Some(nonce) = env.storage().instance().get::<_, u64>(&key) {
+        write_nonce(env, addr, nonce);
+        return Ok(nonce);
+    }
+
+    if has_nonce_marker(env, addr) {
+        return Err(GovernanceError::NonceArchived);
+    }
+
+    Ok(0)
 }
 
 fn set_nonce(env: &Env, addr: &Address, nonce: u64) {
-    let key = DataKey::Nonce(addr.clone());
-    env.storage().persistent().set(&key, &nonce);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+    write_nonce(env, addr, nonce);
 }
 
 fn check_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), GovernanceError> {
-    if nonce != get_nonce(env, addr) {
+    let current = get_nonce(env, addr)?;
+    if nonce != current {
         return Err(GovernanceError::InvalidNonce);
     }
     set_nonce(env, addr, nonce + 1);
+
+    // Extending the whole contract instance's TTL here (issue #189) means
+    // every governance call that consumes a nonce also keeps
+    // Signers/Threshold/TimelockSeconds/StorageVersion alive, and — more to
+    // this issue's point — keeps any not-yet-migrated legacy instance nonce
+    // for a different, currently-dormant address alive too, as long as some
+    // governance activity happens at least this often.
+    env.storage()
+        .instance()
+        .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+
     Ok(())
 }
 
@@ -295,6 +371,25 @@ fn contains_call(calls: &Vec<AllowedCall>, contract: &Address, function: &Symbol
     false
 }
 
+/// Whether `propose` (and later `execute`) would permit `(target, method)`.
+///
+/// Mirrors `execute`'s own dispatch structure exactly (issue #190): a
+/// self-targeted proposal is only ever routed to the one recognised
+/// self-administration method (`dispatch_self_call` rejects anything else
+/// with `UnauthorizedCall`, and can't be reached via `invoke_contract` at
+/// all since Soroban forbids re-entry); anything else must appear in the
+/// on-chain allowlist. Sharing this exact structure is what guarantees a
+/// proposal accepted by `propose` is one `execute` can actually attempt —
+/// modulo the vote count, the timelock, and (for self-targeted calls) the
+/// argument payload, none of which this checks.
+fn is_executable_call(env: &Env, target: &Address, method: &Symbol) -> bool {
+    if target == &env.current_contract_address() {
+        method == &Symbol::new(env, SELF_METHOD_SET_ALLOWED_CALLS)
+    } else {
+        contains_call(&read_allowed_calls(env), target, method)
+    }
+}
+
 /// Apply a `set_allowed_calls` request.
 ///
 /// Shared by the public [`Governance::set_allowed_calls`] entrypoint and by
@@ -416,6 +511,19 @@ impl Governance {
         check_nonce(&env, &caller, nonce)?;
         require_signer(&env, &caller)?;
 
+        // issue #190: propose previously accepted any (target, method) pair,
+        // while execute only permits ones that pass `is_executable_call`. A
+        // proposal for anything else could clear the full vote and timelock
+        // only to revert at execute with UnauthorizedCall — and because
+        // Soroban reverts all storage on that error, the proposal's status
+        // stayed Queued forever (cancel only works on Pending, so it became
+        // permanently stuck dead weight). Rejecting the same pair here,
+        // before a proposal — or any votes on it — ever exists, closes that
+        // off: nothing un-executable can be created in the first place.
+        if !is_executable_call(&env, &target, &method) {
+            return Err(GovernanceError::UnauthorizedCall);
+        }
+
         let count: u64 = read_proposal_count(&env);
         let proposal_id = count + 1;
         write_proposal_count(&env, proposal_id);
@@ -472,6 +580,17 @@ impl Governance {
             return Err(GovernanceError::NotPending);
         }
 
+        // issue #191: a proposal whose expires_at has passed must stop
+        // accruing votes, even though its status is still nominally Pending
+        // — Soroban's revert-on-error semantics mean this call can't persist
+        // an Expired status transition (any write here would be rolled back
+        // along with the Err return), so this check is what actually closes
+        // the gap: rejecting the vote is what keeps an expired proposal from
+        // ever reaching Queued, since that's the only path there.
+        if is_expired(&env, &proposal) {
+            return Err(GovernanceError::ProposalExpired);
+        }
+
         // Guard checks presence of ANY prior choice, not a specific value —
         // this is what fixes the veto-bypass bug (#121): a stored `Veto` is
         // just as "already voted" as a stored `Approve`.
@@ -516,6 +635,12 @@ impl Governance {
 
         if proposal.status != ProposalStatus::Pending {
             return Err(GovernanceError::NotPending);
+        }
+
+        // issue #191: same expiry gate as vote_approve — a veto on an
+        // expired proposal must revert rather than accrue.
+        if is_expired(&env, &proposal) {
+            return Err(GovernanceError::ProposalExpired);
         }
 
         // Same presence check as vote_approve — this is the line that was
@@ -614,9 +739,13 @@ impl Governance {
         // `transfer`, another contract's `set_admin`, an `upgrade` — and the
         // timelock would only delay it, never stop it.
         //
-        // The (target, method) pair must therefore appear in the on-chain
-        // allowlist, and the check happens *before* the dispatch, so a rejected
-        // proposal never reaches the target at all.
+        // `propose` now applies this exact same check up front (issue #190),
+        // so in the ordinary case a Queued proposal always passes here too.
+        // This check still matters as defense-in-depth for the one scenario
+        // propose can't rule out: the allowlist itself changing (via a
+        // set_allowed_calls proposal) between this proposal being queued and
+        // it being executed. The check happens *before* the dispatch, so a
+        // rejected proposal never reaches the target at all.
         if proposal.target == env.current_contract_address() {
             // Self-administration. Soroban forbids re-entry, so this cannot go
             // through invoke_contract; dispatch_self_call handles it internally
@@ -813,7 +942,10 @@ impl Governance {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, BytesN, IntoVal};
+    use soroban_sdk::{
+        testutils::storage::Persistent as _, testutils::Address as _, testutils::Ledger as _,
+        BytesN, IntoVal,
+    };
 
     fn make_signers(env: &Env, count: u32) -> Vec<Address> {
         let mut signers: Vec<Address> = vec![&env];
@@ -824,8 +956,11 @@ mod test {
     }
 
     /// A 3-of-5 governance contract with an empty allowlist — the deny-by-
-    /// default starting point. Used by every test that never reaches a
-    /// successful `execute`.
+    /// default starting point. Used by tests that specifically care about the
+    /// empty/deny-by-default state itself; anything that needs to actually
+    /// propose against an external target should use `setup_with_allowlist`
+    /// instead (issue #190: `propose` now validates against the allowlist, so
+    /// a plain `setup()` + an arbitrary unlisted target no longer proposes).
     fn setup() -> (Env, GovernanceClient<'static>, Vec<Address>) {
         let (env, client, signers, _) = setup_with_allowlist(&|_env| None);
         (env, client, signers)
@@ -861,6 +996,20 @@ mod test {
         );
         let client = GovernanceClient::new(&env, &contract_id);
         (env, client, signers, seeded.map(|(c, _)| c))
+    }
+
+    /// A 3-of-5 governance contract whose allowlist is seeded with exactly
+    /// one pair: `(some fresh address, "set_something")`. This is the default
+    /// target/method every plain propose/vote/execute-plumbing test uses when
+    /// it doesn't care about allowlist mechanics itself — since issue #190,
+    /// `propose` validates against the allowlist just like `execute` always
+    /// has, so those tests need a genuinely allowlisted target to propose
+    /// against at all.
+    fn setup_proposable() -> (Env, GovernanceClient<'static>, Vec<Address>, Address) {
+        let (env, client, signers, target) = setup_with_allowlist(&|env| {
+            Some((Address::generate(env), Symbol::new(env, "set_something")))
+        });
+        (env, client, signers, target.unwrap())
     }
 
     fn make_target(env: &Env) -> Address {
@@ -962,9 +1111,8 @@ mod test {
 
     #[test]
     fn test_propose_and_quorum_queues() {
-        let (env, client, signers) = setup();
+        let (env, client, signers, target) = setup_proposable();
         env.ledger().set_timestamp(1_000_000);
-        let target = make_target(&env);
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1000,8 +1148,7 @@ mod test {
 
     #[test]
     fn test_veto_quorum_rejects() {
-        let (env, client, signers) = setup();
-        let target = make_target(&env);
+        let (env, client, signers, target) = setup_proposable();
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1027,8 +1174,7 @@ mod test {
 
     #[test]
     fn test_duplicate_vote_rejected() {
-        let (env, client, signers) = setup();
-        let target = make_target(&env);
+        let (env, client, signers, target) = setup_proposable();
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1049,8 +1195,7 @@ mod test {
 
     #[test]
     fn test_vote_on_non_pending_rejected() {
-        let (env, client, signers) = setup();
-        let target = make_target(&env);
+        let (env, client, signers, target) = setup_proposable();
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1071,8 +1216,7 @@ mod test {
 
     #[test]
     fn test_cancel_pending_proposal() {
-        let (env, client, signers) = setup();
-        let target = make_target(&env);
+        let (env, client, signers, target) = setup_proposable();
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1093,9 +1237,8 @@ mod test {
 
     #[test]
     fn test_execute_requires_timelock_elapsed() {
-        let (env, client, signers) = setup();
+        let (env, client, signers, target) = setup_proposable();
         env.ledger().set_timestamp(1_000_000);
-        let target = make_target(&env);
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1117,15 +1260,18 @@ mod test {
         env.ledger()
             .set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS);
         let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
+        // This target has no contract behind it, so a real dispatch would
+        // panic; the timelock/allowlist gates above are what's under test.
+        // "set_something" is allowlisted (setup_proposable), so execute gets
+        // past UnauthorizedCall and fails when it actually tries to invoke.
         assert!(result.is_err());
         assert_ne!(result, Err(Ok(GovernanceError::TimelockNotElapsed)));
     }
 
     #[test]
     fn test_execute_not_queued_rejected() {
-        let (env, client, signers) = setup();
+        let (env, client, signers, target) = setup_proposable();
         env.ledger().set_timestamp(1_000_000);
-        let target = make_target(&env);
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1144,9 +1290,8 @@ mod test {
 
     #[test]
     fn test_execute_rejected_proposal_rejected() {
-        let (env, client, signers) = setup();
+        let (env, client, signers, target) = setup_proposable();
         env.ledger().set_timestamp(1_000_000);
-        let target = make_target(&env);
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1185,9 +1330,8 @@ mod test {
 
     #[test]
     fn test_proposal_expires_at_creation() {
-        let (env, client, signers) = setup();
+        let (env, client, signers, target) = setup_proposable();
         env.ledger().set_timestamp(1_000_000);
-        let target = make_target(&env);
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1209,9 +1353,8 @@ mod test {
 
     #[test]
     fn test_execute_expired_proposal_rejected() {
-        let (env, client, signers) = setup();
+        let (env, client, signers, target) = setup_proposable();
         env.ledger().set_timestamp(1_000_000);
-        let target = make_target(&env);
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -1384,16 +1527,37 @@ mod test {
             ],
         );
 
+        // set_signature_threshold validates 1 <= threshold <= active provider
+        // count, so register three providers (via governance, the oracle's
+        // admin) before proposing a threshold of 3. Each call consumes the
+        // governance nonce on the oracle contract.
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let provider_c = Address::generate(&env);
+        oracle.register_provider(
+            &gov_id,
+            &provider_a,
+            &Symbol::new(&env, "verra_vcs"),
+            &0,
+        );
+        oracle.register_provider(
+            &gov_id,
+            &provider_b,
+            &Symbol::new(&env, "satellite"),
+            &1,
+        );
+        oracle.register_provider(&gov_id, &provider_c, &Symbol::new(&env, "iot"), &2);
+
         // Encode full args for set_signature_threshold(caller, threshold, nonce):
         //   caller    = gov_id  (governance is the admin)
         //   threshold = 3
-        //   nonce     = 0       (first call from governance address on oracle)
+        //   nonce     = 3       (three prior governance calls on the oracle)
         let new_threshold: u32 = 3;
         let proposal_args: Vec<Val> = vec![
             &env,
             gov_id.clone().into_val(&env),
             new_threshold.into_val(&env),
-            0u64.into_val(&env),
+            3u64.into_val(&env),
         ];
 
         let proposal_id = gov_client.propose(
@@ -1524,16 +1688,24 @@ mod test {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // Execution allowlist (issue #146)
+    // Execution allowlist (issue #146) & propose-time validation (issue #190)
     //
     // execute passed proposal.target / proposal.method / proposal.args straight
     // to env.invoke_contract with no validation, so a proposal that cleared the
     // multi-sig could call any method on any contract the governance address
-    // administers. The tests below pin the allowlist that now gates it.
+    // administers. propose now applies the identical check up front, so a
+    // proposal for a non-allowlisted pair is rejected before it ever exists —
+    // closing the "stuck Queued forever" bug this used to leave behind.
     // ──────────────────────────────────────────────────────────────────────────
 
     /// Drive a proposal from creation through quorum and the timelock, and
-    /// return the result of `execute` so assertions can focus on the allowlist.
+    /// return the result so assertions can focus on the allowlist gate.
+    ///
+    /// Since issue #190, that gate is usually hit at `propose` rather than
+    /// `execute` — `try_propose` is used here so a propose-time rejection is
+    /// surfaced through the same `Result` shape a caller would previously
+    /// have seen from `try_execute`, keeping this helper's callers agnostic
+    /// to exactly which step rejected.
     ///
     /// `nonces` is `(proposer_nonce, voter_nonce)`: signer 0 both proposes and
     /// executes while the voters only vote, so the two advance independently.
@@ -1553,14 +1725,23 @@ mod test {
     > {
         let (proposer_nonce, voter_nonce) = nonces;
         let started_at = env.ledger().timestamp();
-        let proposal_id = client.propose(
+        let proposal_id = match client.try_propose(
             &signers.get(0).unwrap(),
             target,
             &method,
             &args,
             &Symbol::new(env, "desc"),
             &proposer_nonce,
-        );
+        ) {
+            Ok(Ok(id)) => id,
+            Ok(Err(conv_err)) => {
+                unreachable!(
+                    "unexpected conversion error decoding proposal id: {:?}",
+                    conv_err
+                )
+            }
+            Err(contract_err) => return Err(contract_err),
+        };
         client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &voter_nonce);
         client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &voter_nonce);
         client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &voter_nonce);
@@ -1575,40 +1756,44 @@ mod test {
     }
 
     #[test]
-    fn test_execute_rejects_method_outside_allowlist() {
+    fn test_propose_rejects_method_outside_allowlist() {
         // Governance is created with an allowlist holding exactly one pair:
-        // (target, "approve_project").
+        // (target, "approve_project"). A proposal for a DIFFERENT method on
+        // that same contract is now rejected at propose — no proposal is
+        // ever created, so there's nothing left to get stuck at Queued.
         let (env, client, signers, target) = setup_with_allowlist(&|env| {
             Some((Address::generate(env), Symbol::new(env, "approve_project")))
         });
         let target = target.unwrap();
-        env.ledger().set_timestamp(1_000_000);
 
-        // A proposal for a DIFFERENT method on that same contract clears the
-        // multi-sig and the timelock, and is still refused at execution.
-        let result = propose_and_execute(
-            &env,
-            &client,
-            &signers,
+        let result = client.try_propose(
+            &signers.get(0).unwrap(),
             &target,
-            Symbol::new(&env, "set_admin"),
-            args_for(&env, 42),
-            (0, 0),
+            &Symbol::new(&env, "set_admin"),
+            &args_for(&env, 42),
+            &Symbol::new(&env, "desc"),
+            &0,
         );
         assert_eq!(result, Err(Ok(GovernanceError::UnauthorizedCall)));
 
-        // Rejection reverts the whole transaction, so the proposal is left
-        // Queued rather than Executed and cannot be retried into success.
-        assert_eq!(client.get_proposal(&1).status, ProposalStatus::Queued);
+        // No proposal was ever created.
+        assert_eq!(
+            client.try_get_proposal(&1),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(client.proposal_count(), 0);
     }
 
     #[test]
     fn test_execute_rejects_allowed_method_on_different_contract() {
         // The allowlist is pair-wise: allowing "approve_project" on one contract
-        // must not allow it on another. `target` here is a bare generated
-        // address with no contract behind it — reaching invoke_contract would
-        // panic rather than return UnauthorizedCall, which is also what proves
-        // the check runs *before* the dispatch.
+        // must not allow it on another. `other_contract` here is a bare
+        // generated address with no contract behind it — reaching
+        // invoke_contract would panic rather than return UnauthorizedCall,
+        // which is also what proves the check runs *before* the dispatch.
+        // (Since issue #190 this is now caught at propose, same as the test
+        // above — kept as a distinct test because it's a distinct pairing
+        // rule: allowed-method-wrong-contract, not wrong-method-same-contract.)
         let (env, client, signers, _allowed) = setup_with_allowlist(&|env| {
             Some((Address::generate(env), Symbol::new(env, "approve_project")))
         });
@@ -1630,7 +1815,9 @@ mod test {
     #[test]
     fn test_execute_denies_everything_when_allowlist_empty() {
         // Deny by default: a contract deployed with no allowlist executes
-        // nothing until a set_allowed_calls proposal has cleared.
+        // nothing until a set_allowed_calls proposal has cleared. Uses plain
+        // setup() deliberately — this test's whole point is an empty
+        // allowlist, so it must NOT use setup_proposable's seeded one.
         let (env, client, signers) = setup();
         env.ledger().set_timestamp(1_000_000);
 
@@ -1720,7 +1907,7 @@ mod test {
     fn test_self_proposal_for_unknown_method_rejected() {
         // Targeting the governance contract itself only reaches its
         // self-administration methods; anything else is refused rather than
-        // dispatched.
+        // dispatched. Since issue #190 this is now caught at propose.
         let env = Env::default();
         env.mock_all_auths();
         let signers = make_signers(&env, 5);
@@ -1743,6 +1930,7 @@ mod test {
             (0, 0),
         );
         assert_eq!(result, Err(Ok(GovernanceError::UnauthorizedCall)));
+        assert_eq!(client.proposal_count(), 0);
     }
 
     #[test]
@@ -1759,8 +1947,9 @@ mod test {
         let client = GovernanceClient::new(&env, &gov_id);
         env.ledger().set_timestamp(1_000_000);
 
-        // Right method, wrong arity — a malformed self-call must be rejected
-        // cleanly, not stored or half-applied.
+        // Right method (SELF_METHOD_SET_ALLOWED_CALLS passes propose's #190
+        // gate), wrong arity — a malformed self-call must be rejected
+        // cleanly at execute, not stored or half-applied.
         let result = propose_and_execute(
             &env,
             &client,
@@ -1817,7 +2006,10 @@ mod test {
     fn test_self_proposal_with_wrong_caller_rejected() {
         // The caller encoded at position 0 must be the governance address
         // itself; a proposal that names a signer instead cannot smuggle the
-        // signer's own nonce into a config change.
+        // signer's own nonce into a config change. The method itself
+        // (SELF_METHOD_SET_ALLOWED_CALLS) is correct, so this clears
+        // propose's #190 gate and is rejected at execute instead, on the
+        // caller check inside apply_set_allowed_calls.
         let env = Env::default();
         env.mock_all_auths();
         let signers = make_signers(&env, 5);
@@ -1935,8 +2127,7 @@ mod test {
 
     #[test]
     fn test_get_vote_distinguishes_approve_veto_and_never_voted() {
-        let (env, client, signers) = setup();
-        let target = make_target(&env);
+        let (env, client, signers, target) = setup_proposable();
         let signer_a = signers.get(1).unwrap();
         let signer_b = signers.get(2).unwrap();
 
@@ -1982,8 +2173,7 @@ mod test {
         // with `.unwrap_or(false)` that the function itself overwrites with
         // `false`, so a repeated veto from the same signer never tripped the
         // guard, letting one signer inflate veto_count on their own.
-        let (env, client, signers) = setup();
-        let target = make_target(&env);
+        let (env, client, signers, target) = setup_proposable();
         let signer_a = signers.get(1).unwrap();
 
         let proposal_1 = client.propose(
@@ -2003,6 +2193,60 @@ mod test {
 
         // veto_count must not have been inflated by the rejected second call.
         assert_eq!(client.get_proposal(&proposal_1).veto_count, 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Vote expiry (issue #191)
+    //
+    // Previously expiry was only checked at execute — a Pending proposal past
+    // its expires_at kept accepting votes and could still reach Queued, only
+    // to fail (uselessly) at execute. The tests below pin that voting itself
+    // now rejects an expired proposal, and that this is what stops it from
+    // ever reaching Queued.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_vote_approve_rejects_after_expiry() {
+        let (env, client, signers, target) = setup_proposable();
+        env.ledger().set_timestamp(1_000_000);
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        // One approval before expiry — stays Pending, below threshold.
+        client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        assert_eq!(client.get_proposal(&proposal_id).approval_count, 1);
+        // Advance past the proposal's own TTL, frozen at creation.
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+        // A further vote on the now-expired proposal must revert instead of
+        // silently accruing.
+        let result = client.try_vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+        // The rejected vote must not have moved the count.
+        assert_eq!(client.get_proposal(&proposal_id).approval_count, 1);
+    }
+    #[test]
+    fn test_vote_veto_rejects_after_expiry() {
+        let (env, client, signers, target) = setup_proposable();
+        env.ledger().set_timestamp(1_000_000);
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+        let result = client.try_vote_veto(&signers.get(1).unwrap(), &proposal_id, &0);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+        assert_eq!(client.get_proposal(&proposal_id).veto_count, 0);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -2065,9 +2309,8 @@ mod test {
     fn test_new_proposals_go_straight_to_persistent_storage() {
         // Proposals created after this fix should never touch instance
         // storage at all — that's the whole point of the fix.
-        let (env, client, signers) = setup();
+        let (env, client, signers, target) = setup_proposable();
         env.ledger().set_timestamp(1_000_000);
-        let target = make_target(&env);
 
         let proposal_id = client.propose(
             &signers.get(0).unwrap(),
@@ -2089,5 +2332,283 @@ mod test {
                 .has(&DataKey::Proposal(proposal_id)));
             assert!(env.storage().persistent().has(&DataKey::ProposalCount));
         });
+    }
+
+    #[test]
+    fn test_expired_proposal_cannot_reach_queued() {
+        // A proposal one vote short of threshold, left to expire, must never
+        // transition to Queued no matter how many more votes are attempted —
+        // Queued is only ever reached through vote_approve, and that path is
+        // now closed once the proposal has expired.
+        let (env, client, signers, target) = setup_proposable();
+        env.ledger().set_timestamp(1_000_000);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        // One vote short of the 3-signer threshold; still Pending.
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Pending
+        );
+
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+
+        let result = client.try_vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Pending
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // propose-time allowlist validation (issue #190)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_propose_rejects_non_allowlisted_external_call() {
+        // Core regression for issue #190: propose must apply the same
+        // contains_call gate execute always has, so a proposal that could
+        // never succeed is never created in the first place — nothing to get
+        // stuck at Queued.
+        let (env, client, signers) = setup(); // empty allowlist
+        let target = Address::generate(&env);
+
+        let result = client.try_propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "transfer"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(GovernanceError::UnauthorizedCall)));
+        assert_eq!(client.proposal_count(), 0);
+    }
+
+    #[test]
+    fn test_propose_rejects_self_target_with_unknown_method() {
+        // Mirrors the external-call gate for self-targeted proposals: only
+        // the one recognised self-administration method may be proposed
+        // against the governance contract's own address.
+        let env = Env::default();
+        env.mock_all_auths();
+        let signers = make_signers(&env, 5);
+        let threshold: u32 = 3;
+        let empty: Vec<AllowedCall> = vec![&env];
+        let gov_id = env.register(
+            Governance,
+            (&signers, &threshold, &DEFAULT_TIMELOCK_SECONDS, &empty),
+        );
+        let client = GovernanceClient::new(&env, &gov_id);
+
+        let result = client.try_propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, "propose"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(GovernanceError::UnauthorizedCall)));
+        assert_eq!(client.proposal_count(), 0);
+    }
+
+    #[test]
+    fn test_propose_accepts_allowlisted_call() {
+        // Sanity check the fix isn't over-broad: a genuinely allowlisted
+        // pair must still be proposable.
+        let (env, client, signers, target) = setup_with_allowlist(&|env| {
+            Some((Address::generate(env), Symbol::new(env, "approve_project")))
+        });
+        let target = target.unwrap();
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "approve_project"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(proposal_id, 1);
+    }
+
+    #[test]
+    fn test_propose_accepts_self_administration_method() {
+        // The one recognised self-administration method must still be
+        // proposable against the governance contract's own address, since
+        // that's the entire bootstrap path for the allowlist itself.
+        let (env, client, signers) = setup();
+        let gov_id = client.address.clone();
+
+        let calls: Vec<AllowedCall> = vec![
+            &env,
+            AllowedCall {
+                contract: Address::generate(&env),
+                function: Symbol::new(&env, "transfer"),
+            },
+        ];
+        let args = set_allowed_calls_args(&env, &gov_id, &calls, 0);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &gov_id,
+            &Symbol::new(&env, SELF_METHOD_SET_ALLOWED_CALLS),
+            &args,
+            &Symbol::new(&env, "allowlist"),
+            &0,
+        );
+        assert_eq!(proposal_id, 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Nonce liveness (issue #189)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_nonce_survives_near_ttl_expiry_and_is_refreshed_on_use() {
+        let (env, client, signers, target) = setup_proposable();
+        let contract_addr = client.address.clone();
+        let nonce_key = DataKey::Nonce(signers.get(0).unwrap());
+
+        client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        let initial_ttl = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&nonce_key)
+        });
+        assert!(initial_ttl > 0);
+
+        // Simulate a long idle period: advance to just before the nonce
+        // entry would be archived, with nobody having touched it since.
+        env.ledger().set_sequence_number(1 + initial_ttl - 5);
+        let ttl_before_use = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&nonce_key)
+        });
+        assert!(ttl_before_use <= 10);
+
+        // Signer 0 transacts again — must succeed by reading nonce 1 back
+        // (not silently reset to 0), and must refresh the TTL.
+        client.cancel(&signers.get(0).unwrap(), &1, &1);
+
+        let ttl_after_use = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&nonce_key)
+        });
+        assert!(ttl_after_use > ttl_before_use);
+    }
+
+    #[test]
+    fn test_legacy_instance_nonce_self_heals_into_persistent_storage() {
+        let (env, client, signers, target) = setup_proposable();
+
+        // Simulate a nonce recorded before issue #103 moved nonces to
+        // persistent storage.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Nonce(signers.get(0).unwrap()), &3u64);
+        });
+
+        // The legacy value must be honoured, not silently treated as 0.
+        let result = client.try_propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidNonce)));
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &3,
+        );
+        assert_eq!(proposal_id, 1);
+
+        // The value must now live in persistent storage, protected by the
+        // same extend_ttl guarantee every other nonce gets.
+        env.as_contract(&client.address, || {
+            let key = DataKey::Nonce(signers.get(0).unwrap());
+            assert!(env.storage().persistent().has(&key));
+            let stored: u64 = env.storage().persistent().get(&key).unwrap();
+            assert_eq!(stored, 4);
+        });
+    }
+
+    #[test]
+    fn test_archived_nonce_errors_instead_of_resetting_to_zero() {
+        let (env, client, signers, target) = setup_proposable();
+
+        // Signer 0 transacts once, establishing a nonce and its marker
+        // together.
+        client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        // Simulate the nonce entry itself being lost while the marker (same
+        // TTL, extended at the same time) survives — the only way this
+        // combination arises in practice is the anomaly this check exists
+        // to catch.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Nonce(signers.get(0).unwrap()));
+        });
+
+        // An attacker replaying the original nonce must be rejected with
+        // NonceArchived, not silently accepted as if the nonce were 0.
+        let result = client.try_propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(GovernanceError::NonceArchived)));
+    }
+
+    #[test]
+    fn test_first_time_signer_nonce_defaults_to_zero_not_error() {
+        // A signer who has genuinely never transacted must still get a
+        // legitimate starting nonce of 0 — the marker check must not
+        // false-positive on ordinary first use.
+        let (env, client, signers, target) = setup_proposable();
+
+        let proposal_id = client.propose(
+            &signers.get(1).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(proposal_id, 1);
     }
 }

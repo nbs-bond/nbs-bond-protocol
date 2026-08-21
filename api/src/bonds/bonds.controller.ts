@@ -1,5 +1,5 @@
 import {
-  Controller, Get, Post, Body, Param, Query,
+  Controller, Get, Post, Body, Param, Query, Req,
   HttpCode, HttpStatus, UseGuards, ParseIntPipe,
 } from '@nestjs/common';
 import { BondsService } from './bonds.service';
@@ -12,6 +12,7 @@ import { PaginationDto } from '../common/dto/pagination.dto';
 import { PeriodsQueryDto } from './dto/periods-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
+import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
 import {
   BondResponse,
   SubscriptionResponse,
@@ -73,14 +74,23 @@ export class BondsController {
     return this.bondsService.distributeCoupon(id, dto);
   }
 
+  /**
+   * Claims the caller's accrued coupon credits for bond `:id`.
+   *
+   * The claiming address is taken from the authenticated session (the JWT
+   * `sub` claim), never from an unverified request field: `investorAddress`
+   * in the body is optional and, when present, must match the session address
+   * or the request is rejected with 403.
+   */
   @Post(':id/claim')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async claimCredits(
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: ClaimCreditsDto,
+    @Req() req: AuthenticatedRequest,
   ): Promise<ClaimCreditsResponse> {
-    return this.bondsService.claimCredits(id, dto);
+    return this.bondsService.claimCredits(id, dto, req.user.walletAddress);
   }
 
   @Get(':id/undistributed')
