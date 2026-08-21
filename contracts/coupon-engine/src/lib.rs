@@ -606,9 +606,16 @@ impl CouponEngine {
         holder: Address,
         credit_type: CreditType,
     ) -> i128 {
+        // BlueCarbon credits are stored under CreditType::Carbon (they share
+        // the same per-type bucket). Resolve the lookup key the same way
+        // deduct_credits does so callers get the real balance.
+        let storage_type = match credit_type {
+            CreditType::BlueCarbon => CreditType::Carbon,
+            other => other,
+        };
         env.storage()
             .persistent()
-            .get(&DataKey::AccruedCreditsByType(bond_id, holder, credit_type))
+            .get(&DataKey::AccruedCreditsByType(bond_id, holder, storage_type))
             .unwrap_or(0)
     }
 
@@ -817,9 +824,14 @@ impl CouponEngine {
     /// nonzero; for a Basket bond both may be. Always sums to
     /// `get_undistributed_total`.
     pub fn get_undistributed_by_type(env: Env, bond_id: u64, credit_type: CreditType) -> i128 {
+        // BlueCarbon shares Carbon storage — same resolution as above.
+        let storage_type = match credit_type {
+            CreditType::BlueCarbon => CreditType::Carbon,
+            other => other,
+        };
         env.storage()
             .persistent()
-            .get(&DataKey::UndistributedByType(bond_id, credit_type))
+            .get(&DataKey::UndistributedByType(bond_id, storage_type))
             .unwrap_or(0)
     }
 
@@ -1469,6 +1481,66 @@ mod test {
             &nbbs_shared::CreditType::Biodiversity,
         );
         assert_eq!(by_type, total);
+    }
+
+    #[test]
+    fn test_distribute_blue_carbon_bond_by_type_getter() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 9);
+        let holder = Address::generate(&t._env);
+
+        let bond_id = issue_and_subscribe_with_type(
+            &t._env,
+            &t,
+            &project_id,
+            nbbs_shared::CreditType::BlueCarbon,
+            &holder,
+            10_000,
+        );
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        let credit_type = t.client.get_bond_credit_type(&bond_id);
+        assert_eq!(credit_type, nbbs_shared::CreditType::BlueCarbon);
+
+        let report_id = submit_verified_report(
+            &t._env,
+            &t,
+            &project_id,
+            100_000,
+            BiodiversityMetrics::Absent,
+            0,
+        );
+        let holders = holders_with_balances(&t._env, &t, bond_id, &[&holder]);
+
+        let result = t
+            .client
+            .distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
+        assert_eq!(result.total_credits, 100);
+
+        let accrued = t.client.accrued_credits(&bond_id, &holder);
+        assert_eq!(accrued, 100);
+
+        // The by-type getter must resolve BlueCarbon → Carbon storage and
+        // return the real balance, not the never-written BlueCarbon key.
+        let by_type_blue = t.client.accrued_credits_by_type(
+            &bond_id,
+            &holder,
+            &nbbs_shared::CreditType::BlueCarbon,
+        );
+        assert_eq!(by_type_blue, 100);
+
+        // Carbon lookup resolves to the same shared bucket.
+        let by_type_carbon = t.client.accrued_credits_by_type(
+            &bond_id,
+            &holder,
+            &nbbs_shared::CreditType::Carbon,
+        );
+        assert_eq!(by_type_carbon, 100);
     }
 
     #[test]
