@@ -332,18 +332,21 @@ impl OracleConsumer {
     ) -> Result<(), OracleError> {
         caller.require_auth();
 
-        let is_admin = require_admin(&env, &caller).is_ok();
-        if !is_admin {
-            let provider_key = DataKey::Provider(caller.clone());
-            let p: OracleProvider = env
-                .storage()
-                .persistent()
-                .get(&provider_key)
-                .ok_or(OracleError::Unauthorized)?;
-            bump_persistent(&env, &provider_key);
-            if !p.active {
-                return Err(OracleError::Unauthorized);
-            }
+        // Only registered, active providers participate in consensus
+        // verification. The admin is deliberately NOT exempt: an admin
+        // signature must never count toward the verifier threshold, so a
+        // compromised admin cannot mint credits against fabricated reports.
+        // Admins who need to force a status change must use the explicit,
+        // event-emitting `admin_override_report` path instead.
+        let provider_key = DataKey::Provider(caller.clone());
+        let p: OracleProvider = env
+            .storage()
+            .persistent()
+            .get(&provider_key)
+            .ok_or(OracleError::Unauthorized)?;
+        bump_persistent(&env, &provider_key);
+        if !p.active {
+            return Err(OracleError::Unauthorized);
         }
 
         let expected_nonce = get_nonce(&env, &caller);
@@ -414,6 +417,58 @@ impl OracleConsumer {
                 (report_id,),
             );
         }
+
+        Ok(())
+    }
+
+    /// Explicit, auditable admin override, distinct from provider consensus.
+    ///
+    /// Admin-only: sets a `Pending` report directly to `Verified` or
+    /// `Rejected`, bypassing the signature threshold by design. Unlike
+    /// `verify_report`, this path never appends the admin to the verifier
+    /// list and never touches `VerificationCount`, and it emits its own
+    /// `report_admin_override` event so overrides are traceable on-chain.
+    pub fn admin_override_report(
+        env: Env,
+        caller: Address,
+        report_id: u64,
+        status: ReportStatus,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        if status != ReportStatus::Verified && status != ReportStatus::Rejected {
+            return Err(OracleError::InvalidResolution);
+        }
+
+        let report_key = DataKey::Report(report_id);
+        let mut report: Report = env
+            .storage()
+            .persistent()
+            .get(&report_key)
+            .ok_or(OracleError::ReportNotFound)?;
+
+        if report.status != ReportStatus::Pending {
+            return Err(OracleError::ReportAlreadyVerified);
+        }
+
+        report.status = status;
+        report.verified_at = env.ledger().timestamp();
+        env.storage().persistent().set(&report_key, &report);
+        bump_persistent(&env, &report_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "report_admin_override"),),
+            (report_id, status as u32),
+        );
 
         Ok(())
     }
@@ -546,6 +601,9 @@ impl OracleConsumer {
             .get(&report_key)
             .ok_or(OracleError::ReportNotFound)?;
         report.status = resolution;
+        if resolution == ReportStatus::Verified {
+            report.verified_at = env.ledger().timestamp();
+        }
         env.storage().persistent().set(&report_key, &report);
         bump_persistent(&env, &report_key);
 
@@ -555,7 +613,7 @@ impl OracleConsumer {
 
         env.events().publish(
             (Symbol::new(&env, "challenge_resolved"),),
-            (report_id,),
+            (report_id, resolution as u32),
         );
 
         Ok(())
@@ -867,6 +925,7 @@ mod test {
 
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
+        let verifier = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
@@ -874,6 +933,7 @@ mod test {
 
         env.ledger().set_timestamp(1_000_000);
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &verifier, &Symbol::new(&env, "satellite"), &1);
 
         let report_id = client.submit_report(
             &provider,
@@ -894,14 +954,14 @@ mod test {
         assert_eq!(stored.carbon_sequestered, 100_000);
 
         env.ledger().set_timestamp(1_000_001);
-        client.verify_report(&admin, &report_id, &1);
+        client.verify_report(&verifier, &report_id, &0);
 
         let verified = client.get_report(&report_id);
         assert_eq!(verified.status, ReportStatus::Verified);
         assert_eq!(verified.verified_at, 1_000_001);
 
         let providers = client.list_providers();
-        assert_eq!(providers.len(), 1);
+        assert_eq!(providers.len(), 2);
         assert_eq!(providers.get(0).unwrap(), provider);
 
         let project_reports = client.get_project_reports(&project_id);
@@ -1209,12 +1269,14 @@ mod test {
 
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
+        let verifier = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &verifier, &Symbol::new(&env, "satellite"), &1);
 
         let report_id = client.submit_report(
             &provider,
@@ -1228,7 +1290,7 @@ mod test {
             &0,
         );
 
-        client.verify_report(&admin, &report_id, &1);
+        client.verify_report(&verifier, &report_id, &0);
 
         let result = client.try_verify_report(&provider, &report_id, &1);
         assert_eq!(result, Err(Ok(OracleError::ReportAlreadyVerified)));
@@ -1241,6 +1303,7 @@ mod test {
 
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
+        let verifier = Address::generate(&env);
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
@@ -1248,6 +1311,7 @@ mod test {
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &verifier, &Symbol::new(&env, "satellite"), &1);
 
         let report_id = client.submit_report(
             &provider,
@@ -1261,7 +1325,7 @@ mod test {
             &0,
         );
 
-        client.verify_report(&admin, &report_id, &1);
+        client.verify_report(&verifier, &report_id, &0);
 
         let result = client.try_challenge_report(
             &challenger,
@@ -2016,13 +2080,14 @@ mod test {
     }
 
     #[test]
-    fn test_admin_verification_counts_once() {
+    fn test_admin_verify_report_rejected() {
         let env = Env::default();
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
         let provider_a = Address::generate(&env);
         let provider_b = Address::generate(&env);
+        let provider_c = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
@@ -2030,31 +2095,218 @@ mod test {
 
         client.set_signature_threshold(&admin, &2u32, &0);
 
-        let report_id = register_provider_and_submit(
-            &env,
-            &client,
-            &admin,
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &1);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &2);
+        client.register_provider(&admin, &provider_c, &Symbol::new(&env, "iot"), &3);
+
+        let report_id = client.submit_report(
             &provider_a,
             &project_id,
-            0,
-            1,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
         );
 
-        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &2);
+        // Admin is not a registered provider: the admin's signature must not
+        // count toward the threshold, so `verify_report` rejects it outright.
+        let result = client.try_verify_report(&admin, &report_id, &4);
+        assert_eq!(result, Err(Ok(OracleError::Unauthorized)));
+        assert_eq!(client.get_verification_count(&report_id), 0);
+        assert_eq!(client.get_report_verifiers(&report_id).len(), 0);
 
-        client.verify_report(&admin, &report_id, &3);
-        assert_eq!(client.get_verification_count(&report_id), 1);
-        assert_eq!(
-            client.get_report(&report_id).status,
-            ReportStatus::Pending
-        );
-
+        // With threshold 2, two independent provider signatures are required.
         client.verify_report(&provider_b, &report_id, &0);
+        assert_eq!(client.get_verification_count(&report_id), 1);
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
+
+        client.verify_report(&provider_c, &report_id, &0);
         assert_eq!(client.get_verification_count(&report_id), 2);
-        assert_eq!(
-            client.get_report(&report_id).status,
-            ReportStatus::Verified
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Verified);
+    }
+
+    #[test]
+    fn test_admin_override_verifies_pending_report() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
         );
+
+        env.ledger().set_timestamp(2_000_000);
+        client.admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+
+        let report = client.get_report(&report_id);
+        assert_eq!(report.status, ReportStatus::Verified);
+        assert_eq!(report.verified_at, 2_000_000);
+        // The override is distinct from provider consensus: no verifier is
+        // recorded and the threshold count stays untouched.
+        assert_eq!(client.get_verification_count(&report_id), 0);
+        assert_eq!(client.get_report_verifiers(&report_id).len(), 0);
+    }
+
+    #[test]
+    fn test_admin_override_rejects_pending_report() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.admin_override_report(&admin, &report_id, &ReportStatus::Rejected, &1);
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Rejected);
+        assert_eq!(client.get_verification_count(&report_id), 0);
+    }
+
+    #[test]
+    fn test_admin_override_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        let result = client.try_admin_override_report(
+            &stranger,
+            &report_id,
+            &ReportStatus::Verified,
+            &0,
+        );
+        assert_eq!(result, Err(Ok(OracleError::Unauthorized)));
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
+    }
+
+    #[test]
+    fn test_admin_override_terminal_report_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+
+        // Already terminal: a second override must fail rather than flip the
+        // status back and forth.
+        let result = client.try_admin_override_report(
+            &admin,
+            &report_id,
+            &ReportStatus::Rejected,
+            &2,
+        );
+        assert_eq!(result, Err(Ok(OracleError::ReportAlreadyVerified)));
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Verified);
+    }
+
+    #[test]
+    fn test_admin_override_rejects_invalid_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        for invalid in [ReportStatus::Pending, ReportStatus::Challenged] {
+            let result = client.try_admin_override_report(&admin, &report_id, &invalid, &1);
+            assert_eq!(result, Err(Ok(OracleError::InvalidResolution)));
+        }
+
+        let report = client.get_report(&report_id);
+        assert_eq!(report.status, ReportStatus::Pending);
     }
 
     #[test]

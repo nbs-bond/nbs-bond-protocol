@@ -37,7 +37,8 @@ pub fn register_provider(...)
 pub fn add_stake(...)              // commit provider collateral
 pub fn withdraw_stake(...)         // partial withdrawal of own stake
 pub fn submit_report(...)
-pub fn verify_report(...)            // independent verifier endorsement
+pub fn verify_report(...)            // independent provider verifier endorsement (admin excluded)
+pub fn admin_override_report(...)    // explicit auditable admin override; emits report_admin_override
 pub fn challenge_report(...)
 pub fn resolve_challenge(...)        // admin verdict; Rejected slashes 10% stake
 pub fn set_signature_threshold(...)  // required independent verifications

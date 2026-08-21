@@ -1226,7 +1226,9 @@ mod test {
             &make_ipfs_hash(env, 1),
             &0,
         );
-        oc.verify_report(&t.admin, &report_id, &(admin_nonce + 1));
+        // Admins cannot count toward the provider threshold; verified reports
+        // in tests go through the explicit auditable override path.
+        oc.admin_override_report(&t.admin, &report_id, &ReportStatus::Verified, &(admin_nonce + 1));
         report_id
     }
 

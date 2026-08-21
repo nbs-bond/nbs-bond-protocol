@@ -23,18 +23,29 @@ Register → Whitelisted → Submit Reports → Challenge Window → Verify/Reje
 A report only reaches `Verified` status after **independent verifications** meet the configured threshold:
 
 - `set_signature_threshold(threshold)` sets the minimum number of distinct verifiers required (defaults to `1`).
-- Any admin or active provider may call `verify_report`. Each call records the verifier under `ReportVerifiers(report_id)` and increments `VerificationCount(report_id)`.
+- Only **registered, active providers** may call `verify_report`; the admin is deliberately **not** exempt. Each call records the verifier under `ReportVerifiers(report_id)` and increments `VerificationCount(report_id)`.
 - Verifying the **same** report twice by the same address is a no-op (deduplicated, no double counting).
 - A provider cannot verify its **own** report (`InvalidSignature`) — this guarantees the threshold represents genuinely independent sources.
 - A report whose status is no longer `Pending` (challenged, already verified) cannot be re-verified.
 - `get_report_verifiers(report_id)` and `get_verification_count(report_id)` expose the audit trail on-chain.
 
-The admin can verify a report and it counts toward the threshold, but the submitting provider's own signature never does.
+Because the admin is never counted as a verifier, **no single admin signature can verify a report** — even with the default threshold of `1`, a report needs at least one independent provider endorsement, and with threshold ≥ 2 it needs that many providers. The submitting provider's own signature never counts either.
+
+## Admin Override
+
+`admin_override_report(report_id, status)` is the **only** path by which the admin can force a `Pending` report to a terminal state (`Verified` or `Rejected`) without provider consensus. It is deliberately distinct from `verify_report`:
+
+- Admin-only, nonce-guarded, and requires a terminal `status` (anything else is `InvalidResolution`).
+- Never appends the admin to `ReportVerifiers` and never touches `VerificationCount`.
+- Cannot flip an already-terminal report (`ReportAlreadyVerified`), so a `Verified` report cannot be silently downgraded.
+- Emits its own **`report_admin_override`** event carrying `(report_id, status)` so every override is traceable on-chain.
+
+This gives a compromised/coerced admin no silent path to mint credits: any override leaves an explicit, auditable trail distinct from the provider-consensus verification that `CouponEngine`/`BondIssuer` rely on.
 
 ## Challenge Mechanism
 - 72-hour window from submission
 - Any address can challenge with counter-evidence (IPFS hash)
-- Admin resolves via on-chain vote (`resolve_challenge`), settling the report to `Rejected` or `Verified`
+- Admin resolves via on-chain vote (`resolve_challenge`), settling the report to `Rejected` or `Verified`; the `challenge_resolved` event carries the chosen resolution so the verdict is auditable
 
 ## Staking & Slashing
 Providers stake collateral that is at risk if their reports are overturned:

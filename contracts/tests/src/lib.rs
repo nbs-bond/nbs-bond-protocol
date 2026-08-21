@@ -163,7 +163,9 @@ mod integration {
             );
             assert_eq!(report_id, 1);
 
-            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts
+                .oc_client
+                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
 
             let report = contracts.oc_client.get_report(&report_id);
             assert_eq!(report.status, ReportStatus::Verified);
@@ -307,7 +309,9 @@ mod integration {
                 .try_distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2, &true);
             assert_eq!(rejected, Err(Ok(CouponEngineError::ReportNotVerified)));
 
-            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts
+                .oc_client
+                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
 
             let result = contracts
                 .ce_client
@@ -377,7 +381,9 @@ mod integration {
             let report = contracts.oc_client.get_report(&report_id);
             assert_eq!(report.methodology, Symbol::new(&env, "blue_carbon"));
 
-            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts
+                .oc_client
+                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
             assert_eq!(
                 contracts.oc_client.get_report(&report_id).status,
                 ReportStatus::Verified
@@ -461,7 +467,9 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts
+                .oc_client
+                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
 
             contracts
                 .ce_client
@@ -539,7 +547,9 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts
+                .oc_client
+                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
 
             contracts
                 .ce_client
@@ -631,7 +641,9 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts
+                .oc_client
+                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
             contracts
                 .ce_client
                 .register_bond(&admin, &bond_id, &project_id, &1);
@@ -784,6 +796,7 @@ mod integration {
             let alice = Address::generate(&env);
             let oracle_a = Address::generate(&env);
             let oracle_b = Address::generate(&env);
+            let oracle_c = Address::generate(&env);
             let contracts = deploy_contracts(&env, &admin);
 
             let project_id = make_project_id(&env, 1);
@@ -812,6 +825,12 @@ mod integration {
                 &Symbol::new(&env, "verra_vcs"),
                 &2,
             );
+            contracts.oc_client.register_provider(
+                &admin,
+                &oracle_c,
+                &Symbol::new(&env, "satellite"),
+                &3,
+            );
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle_a,
@@ -830,13 +849,21 @@ mod integration {
                 .try_verify_report(&oracle_a, &report_id, &1);
             assert_eq!(self_result, Err(Ok(OracleError::InvalidSignature)));
 
-            contracts.oc_client.verify_report(&admin, &report_id, &3);
+            // The admin is not a registered provider: a single admin signature
+            // must not verify the report or count toward the threshold.
+            let admin_result = contracts
+                .oc_client
+                .try_verify_report(&admin, &report_id, &4);
+            assert_eq!(admin_result, Err(Ok(OracleError::Unauthorized)));
+            assert_eq!(contracts.oc_client.get_verification_count(&report_id), 0);
+
+            contracts.oc_client.verify_report(&oracle_b, &report_id, &0);
 
             let pending = contracts.oc_client.get_report(&report_id);
             assert_eq!(pending.status, ReportStatus::Pending);
             assert_eq!(contracts.oc_client.get_verification_count(&report_id), 1);
 
-            contracts.oc_client.verify_report(&oracle_b, &report_id, &0);
+            contracts.oc_client.verify_report(&oracle_c, &report_id, &0);
 
             let verified = contracts.oc_client.get_report(&report_id);
             assert_eq!(verified.status, ReportStatus::Verified);
@@ -1240,7 +1267,9 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts.oc_client.verify_report(&admin, &report_id, &1);
+            contracts
+                .oc_client
+                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
 
             contracts
                 .ce_client
@@ -1544,7 +1573,9 @@ mod integration {
                     &make_ipfs_hash(&env, 1),
                     &0,
                 );
-                contracts.oc_client.verify_report(&admin, &report_id, &1);
+                contracts
+                    .oc_client
+                    .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
 
                 contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
