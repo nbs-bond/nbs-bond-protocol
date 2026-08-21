@@ -2,6 +2,8 @@ import {
   Injectable,
   BadRequestException,
   UnauthorizedException,
+  Logger,
+  OnModuleDestroy,
 } from "@nestjs/common";
 import { JwtService } from "@nestjs/jwt";
 import { createClient, RedisClientType } from "@redis/client";
@@ -17,7 +19,8 @@ import {
 } from "./interfaces/auth.interface";
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleDestroy {
+  private readonly logger = new Logger(AuthService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -88,5 +91,27 @@ export class AuthService {
       cachedAt: kyc.cachedAt,
       createdAt: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Gracefully close the Redis connection when the NestJS module is torn down.
+   * Called automatically by NestJS when app.enableShutdownHooks() is active
+   * and the process receives SIGTERM/SIGINT.
+   */
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('AuthService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `AuthService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

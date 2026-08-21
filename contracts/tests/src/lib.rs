@@ -810,27 +810,25 @@ mod integration {
             );
             contracts.pr_client.approve_project(&admin, &pid, &0);
 
-            contracts
-                .oc_client
-                .set_signature_threshold(&admin, &2u32, &0);
             contracts.oc_client.register_provider(
                 &admin,
                 &oracle_a,
                 &Symbol::new(&env, "verra_vcs"),
-                &1,
+                &0,
             );
             contracts.oc_client.register_provider(
                 &admin,
                 &oracle_b,
                 &Symbol::new(&env, "verra_vcs"),
-                &2,
+                &1,
             );
             contracts.oc_client.register_provider(
                 &admin,
                 &oracle_c,
                 &Symbol::new(&env, "satellite"),
-                &3,
+                &2,
             );
+            contracts.oc_client.set_signature_threshold(&admin, &2u32, &3);
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle_a,

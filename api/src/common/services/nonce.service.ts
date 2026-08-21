@@ -1,4 +1,4 @@
-import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, Logger, InternalServerErrorException, OnModuleDestroy } from '@nestjs/common';
 import { createClient, RedisClientType } from '@redis/client';
 import { randomBytes } from 'crypto';
 import {
@@ -32,10 +32,18 @@ const SYNC_LOCK_WAIT_TIMEOUT_MS = 3_000;
 const SYNC_LOCK_POLL_INTERVAL_MS = 100;
 
 @Injectable()
-export class NonceService {
+export class NonceService implements OnModuleDestroy {
   private readonly logger = new Logger(NonceService.name);
   private readonly redis: RedisClientType;
   private readonly sorobanRpc: rpc.Server;
+
+  /**
+   * Tracks all active lock keys (nonce_lock:*) currently held by THIS
+   * process instance.  When the process shuts down, onModuleDestroy()
+   * iterates this set and releases every lock so other replicas can
+   * proceed immediately instead of waiting for the auto-expire TTL.
+   */
+  private readonly heldLocks = new Map<string, string>(); // lockKey → lockToken
 
   constructor() {
     this.redis = createClient({
@@ -272,6 +280,9 @@ export class NonceService {
     });
 
     if (acquired) {
+      // Register the lock so onModuleDestroy() can release it on SIGTERM.
+      this.heldLocks.set(lockKey, lockToken);
+
       // We hold the lock — run sync() and then release.
       try {
         await this.sync(contractAddress, address);
@@ -303,6 +314,8 @@ export class NonceService {
               `next(): failed to release sync lock for ${lockKey}: ${err?.message ?? err}`,
             );
           });
+        // Deregister the lock regardless of whether the DEL succeeded.
+        this.heldLocks.delete(lockKey);
       }
     } else {
       // Another request holds the lock and is currently running sync().
@@ -331,6 +344,64 @@ export class NonceService {
       throw new InternalServerErrorException(
         `Timed out waiting for nonce key to be seeded for ${address} on ${contractAddress}. ` +
           `A concurrent sync() may have failed or the RPC is too slow.`,
+      );
+    }
+  }
+
+  /**
+   * Gracefully shut down the NonceService.
+   *
+   * Steps:
+   * 1. Release every distributed nonce lock currently held by this process.
+   *    Without this, other API replicas would need to wait up to
+   *    SYNC_LOCK_TTL_MS (5 s) for the auto-expire before they can acquire
+   *    the lock and seed the nonce key.
+   * 2. Quit the Redis connection cleanly (QUIT command) so the server can
+   *    reclaim the connection slot immediately.
+   *
+   * Called automatically by NestJS when app.enableShutdownHooks() is active
+   * and the process receives SIGTERM/SIGINT.
+   */
+  async onModuleDestroy(): Promise<void> {
+    // Release all held locks using the same check-and-delete Lua script used
+    // in syncWithLock().  If the lock has already auto-expired or been
+    // released by the finally block, the Lua script returns 0 harmlessly.
+    const releaseLua = `
+      if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    for (const [lockKey, lockToken] of this.heldLocks) {
+      try {
+        await this.redis.eval(releaseLua, {
+          keys: [lockKey],
+          arguments: [lockToken],
+        });
+        this.logger.log(`NonceService: released lock ${lockKey} on shutdown`);
+      } catch (err) {
+        this.logger.warn(
+          `NonceService: failed to release lock ${lockKey} on shutdown: ${err?.message ?? err}`,
+        );
+      }
+    }
+    this.heldLocks.clear();
+
+    // Close the Redis connection gracefully.
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('NonceService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `NonceService: error closing Redis connection: ${error?.message ?? error}`,
       );
     }
   }
