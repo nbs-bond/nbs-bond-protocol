@@ -12,6 +12,7 @@ import { OrderStatus, OrderResponse } from './interfaces/marketplace.interface';
 describe('DexService', () => {
   let service: DexService;
   let contractService: { simulateCall: jest.Mock; invokeContractMethod: jest.Mock };
+  let redisMock: any;
 
   const simulateCallMock = jest.fn();
   const invokeContractMethodMock = jest.fn();
@@ -75,7 +76,7 @@ describe('DexService', () => {
     // Replace the internal Redis client with an in-memory stub so tests do not
     // attempt real network connections and never hang.
     const store = new Map<string, string>();
-    const redisMock = {
+    redisMock = {
       get: jest.fn(async (key: string) => store.get(key) ?? null),
       set: jest.fn(async () => 'OK'),
       setEx: jest.fn(async (key: string, _ttl: number, value: string) => {
@@ -83,6 +84,18 @@ describe('DexService', () => {
         return 'OK';
       }),
       del: jest.fn(async () => 1),
+      unlink: jest.fn(async (keys: string[]) => {
+        keys.forEach((key) => store.delete(key));
+        return keys.length;
+      }),
+      scanIterator: jest.fn(({ MATCH }: { MATCH: string }) => {
+        const prefix = MATCH.replace(/\*$/, '');
+        const matched = [...store.keys()].filter((key) => key.startsWith(prefix));
+        return (async function* () {
+          for (const key of matched) yield key;
+        })();
+      }),
+      __store: store,
     };
     (service as any).redis = redisMock;
   });
@@ -762,6 +775,102 @@ describe('DexService', () => {
 
       // args[2] = amount (i128)
       expect(scValToNative(args[2])).toBe(BigInt(1500));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Cache invalidation — order:* and orders:* caches must be evicted so a
+  // follow-up getOrder/listOrders never serves pre-trade state. `del('orders:*')`
+  // is a no-op against a real Redis (it's not a glob), so this locks in the
+  // SCAN + UNLINK replacement.
+  // ---------------------------------------------------------------------------
+
+  describe('cache invalidation', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      (redisMock.__store as Map<string, string>).clear();
+    });
+
+    describe('invalidateOrderCaches', () => {
+      it('unlinks the order detail key and every matching orders:* list key', async () => {
+        const store = redisMock.__store as Map<string, string>;
+        store.set('order:5', JSON.stringify({ id: 5 }));
+        store.set('orders:all:all:1:20', JSON.stringify({ data: [] }));
+        store.set('orders:1:Open:1:20', JSON.stringify({ data: [] }));
+        store.set('unrelated:key', 'keep-me');
+
+        await (service as any).invalidateOrderCaches(5);
+
+        expect(store.has('order:5')).toBe(false);
+        expect(store.has('orders:all:all:1:20')).toBe(false);
+        expect(store.has('orders:1:Open:1:20')).toBe(false);
+        expect(store.has('unrelated:key')).toBe(true);
+
+        expect(redisMock.unlink).toHaveBeenCalledTimes(1);
+        const unlinkedKeys = redisMock.unlink.mock.calls[0][0];
+        expect(unlinkedKeys.sort()).toEqual(
+          ['order:5', 'orders:1:Open:1:20', 'orders:all:all:1:20'].sort(),
+        );
+      });
+
+      it('still unlinks the order detail key when there are no cached list pages', async () => {
+        await (service as any).invalidateOrderCaches(9);
+
+        expect(redisMock.unlink).toHaveBeenCalledWith(['order:9']);
+      });
+    });
+
+    it('buyBondTokens invalidates caches for the purchased order after the trade lands', async () => {
+      jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
+      jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
+        address: SELLER,
+        asset: 'USDC',
+        balance: 1_000,
+      });
+      invokeContractMethodMock.mockResolvedValue({
+        result: nativeToScVal(true),
+        transactionHash: 'txhash',
+        successful: true,
+      });
+      const invalidateSpy = jest.spyOn(service as any, 'invalidateOrderCaches');
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+      await service.buyBondTokens(dto, SELLER);
+
+      expect(invalidateSpy).toHaveBeenCalledWith(1);
+      // Must run before the post-trade getOrder re-read, not after.
+      const invalidateOrderIndex = invalidateSpy.mock.invocationCallOrder[0];
+      const getOrderCalls = (service.getOrder as jest.Mock).mock.invocationCallOrder;
+      expect(invalidateOrderIndex).toBeLessThan(getOrderCalls[getOrderCalls.length - 1]);
+    });
+
+    it('cancelOrder invalidates caches for the cancelled order', async () => {
+      invokeContractMethodMock.mockResolvedValue({ transactionHash: 'txhash' });
+      const invalidateSpy = jest.spyOn(service as any, 'invalidateOrderCaches');
+
+      await service.cancelOrder(3, SELLER);
+
+      expect(invalidateSpy).toHaveBeenCalledWith(3);
+    });
+
+    it('listBondTokens invalidates caches for the newly created order', async () => {
+      invokeContractMethodMock.mockResolvedValue({
+        result: nativeToScVal(BigInt(11), { type: 'u64' }),
+        transactionHash: 'txhash',
+        successful: true,
+      });
+      jest.spyOn(service, 'getOrder').mockResolvedValue({ ...STUB_ORDER, id: 11 });
+      const invalidateSpy = jest.spyOn(service as any, 'invalidateOrderCaches');
+
+      const dto: ListBondDto = {
+        bondId: 1,
+        amount: 100,
+        pricePerToken: 10,
+        quoteAsset: 'USDC',
+      };
+      await service.listBondTokens(dto, SELLER);
+
+      expect(invalidateSpy).toHaveBeenCalledWith(11);
     });
   });
 

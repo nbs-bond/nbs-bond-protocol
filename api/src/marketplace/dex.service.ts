@@ -122,7 +122,7 @@ export class DexService {
     );
 
     const orderId = Number(scValToNative(result));
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
     return this.getOrder(orderId);
   }
 
@@ -163,7 +163,7 @@ export class DexService {
       throw this.mapDexError(error);
     }
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(dto.orderId);
     return this.getOrder(dto.orderId);
   }
 
@@ -181,7 +181,7 @@ export class DexService {
       nonce,
     );
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
   }
 
   async getOrder(orderId: number): Promise<OrderResponse> {
@@ -198,6 +198,17 @@ export class DexService {
 
     await this.redis.setEx(cacheKey, 60, JSON.stringify(order));
     return order;
+  }
+
+  // `del('orders:*')` does not glob-match; SCAN for the real keys and UNLINK them.
+  private async invalidateOrderCaches(orderId: number): Promise<void> {
+    const keys = [`order:${orderId}`];
+
+    for await (const key of this.redis.scanIterator({ MATCH: 'orders:*', COUNT: 100 })) {
+      keys.push(key as unknown as string);
+    }
+
+    await this.redis.unlink(keys);
   }
 
   async getBestPrice(
