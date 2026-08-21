@@ -1,4 +1,10 @@
-import { Injectable, CanActivate, ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { AuthenticatedUser } from '../interfaces/authenticated-request.interface';
 
 @Injectable()
@@ -13,7 +19,7 @@ export class ProviderGuard implements CanActivate {
 
     const providers = (process.env.ORACLE_PROVIDER_WHITELIST || '').split(',').filter(Boolean);
     if (!providers.includes(user.walletAddress)) {
-      throw new UnauthorizedException('Provider access required');
+      throw new ForbiddenException('Provider access required');
     }
 
     return true;

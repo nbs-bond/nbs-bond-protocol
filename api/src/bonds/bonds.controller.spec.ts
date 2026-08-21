@@ -5,6 +5,21 @@ import { AdminGuard } from '../common/guards/admin.guard';
 describe('BondsController guards', () => {
   const GUARDS_METADATA = '__guards__';
 
+  it.each([
+    ['create', [JwtAuthGuard, AdminGuard]],
+    ['subscribe', [JwtAuthGuard]],
+    ['distributeCoupon', [JwtAuthGuard, AdminGuard]],
+    ['claimCredits', [JwtAuthGuard]],
+    ['transfer', [JwtAuthGuard]],
+    ['mature', [JwtAuthGuard, AdminGuard]],
+  ] as const)('guards %s with the required guards', (handler, expected) => {
+    const guards: unknown[] = Reflect.getMetadata(
+      GUARDS_METADATA,
+      BondsController.prototype[handler],
+    );
+    expect(guards).toEqual(expected);
+  });
+
   it('guards POST /:id/sweep-undistributed with JWT + Admin guards', () => {
     const guards: unknown[] = Reflect.getMetadata(
       GUARDS_METADATA,

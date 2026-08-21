@@ -1,9 +1,9 @@
-import { Test, TestingModule } from '@nestjs/testing';
-import { AuthController } from './auth.controller';
-import { AuthService } from './auth.service';
-import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
+import { Test, TestingModule } from "@nestjs/testing";
+import { AuthController } from "./auth.controller";
+import { AuthService } from "./auth.service";
+import { AuthenticatedRequest } from "../common/interfaces/authenticated-request.interface";
 
-describe('AuthController', () => {
+describe("AuthController", () => {
   let controller: AuthController;
   let authService: jest.Mocked<AuthService>;
 
@@ -27,19 +27,27 @@ describe('AuthController', () => {
     authService = module.get(AuthService);
   });
 
-  it('should generate challenge', async () => {
-    const expected = { challenge: 'test-challenge', nonce: 'test-nonce' };
+  it("should generate challenge", async () => {
+    const expected = { challenge: "test-challenge", nonce: "test-nonce" };
     authService.generateChallenge.mockResolvedValue(expected);
 
-    const result = await controller.challenge({ address: 'G123' });
+    const result = await controller.challenge({ address: "G123" });
 
-    expect(authService.generateChallenge).toHaveBeenCalledWith('G123');
+    expect(authService.generateChallenge).toHaveBeenCalledWith("G123");
     expect(result).toBe(expected);
   });
 
-  it('should verify signature', async () => {
-    const expected = { accessToken: 'token', tokenType: 'Bearer', expiresIn: '7d' };
-    const dto = { address: 'G123', originalChallenge: 'c', signedChallenge: 's' };
+  it("should verify signature", async () => {
+    const expected = {
+      accessToken: "token",
+      tokenType: "Bearer",
+      expiresIn: "1h",
+    };
+    const dto = {
+      address: "G123",
+      originalChallenge: "c",
+      signedChallenge: "s",
+    };
     authService.verifySignature.mockResolvedValue(expected);
 
     const result = await controller.verify(dto);
@@ -48,28 +56,34 @@ describe('AuthController', () => {
     expect(result).toBe(expected);
   });
 
-  it('should refresh token', async () => {
-    const expected = { accessToken: 'new-token', tokenType: 'Bearer', expiresIn: '7d' };
+  it("should refresh token", async () => {
+    const expected = {
+      accessToken: "new-token",
+      tokenType: "Bearer",
+      expiresIn: "1h",
+    };
     authService.refreshToken.mockResolvedValue(expected);
 
-    const result = await controller.refresh({ accessToken: 'old-token' });
+    const result = await controller.refresh({ accessToken: "old-token" });
 
-    expect(authService.refreshToken).toHaveBeenCalledWith('old-token');
+    expect(authService.refreshToken).toHaveBeenCalledWith("old-token");
     expect(result).toBe(expected);
   });
 
-  it('should return profile for authenticated request', async () => {
+  it("should return profile for authenticated request", async () => {
     const expected = {
-      walletAddress: 'G123',
-      kycStatus: 'VERIFIED' as any,
-      createdAt: '2026-01-01',
+      walletAddress: "G123",
+      kycStatus: "VERIFIED" as any,
+      createdAt: "2026-01-01",
     };
     authService.getProfile.mockResolvedValue(expected);
 
-    const req = { user: { walletAddress: 'G123', kycStatus: 'VERIFIED' } } as unknown as AuthenticatedRequest;
+    const req = {
+      user: { walletAddress: "G123", kycStatus: "VERIFIED" },
+    } as unknown as AuthenticatedRequest;
     const result = await controller.profile(req);
 
-    expect(authService.getProfile).toHaveBeenCalledWith('G123');
+    expect(authService.getProfile).toHaveBeenCalledWith("G123");
     expect(result).toBe(expected);
   });
 });
