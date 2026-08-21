@@ -1,7 +1,10 @@
 #![no_std]
 #![allow(deprecated)]
+use nbbs_project_registry::ProjectRegistryClient;
 use nbbs_shared::{BiodiversityMetrics, OracleError, ReportStatus};
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 pub const CHALLENGE_WINDOW_SECONDS: u64 = 259200;
 pub const SLASH_PENALTY_PPM: i128 = 100_000;
@@ -28,6 +31,7 @@ pub enum DataKey {
     ChallengeWindow,
     Nonce(Address),
     ProviderReportCount(Address),
+    ProjectRegistry,
     ProviderChallenges(Address),
     SlashHistory(Address),
     LockedStake(Address),
@@ -616,6 +620,27 @@ impl OracleConsumer {
 
         if resolution == ReportStatus::Rejected {
             slash_provider(&env, &report.provider, report_id);
+
+            // Revoke the associated project if the report is rejected
+            // Check if project registry is configured
+            let registry_id: Option<Address> =
+                env.storage().instance().get(&DataKey::ProjectRegistry);
+
+            if let Some(registry_id) = registry_id {
+                let registry_client = ProjectRegistryClient::new(&env, &registry_id);
+                let project_id = report.project_id;
+                // Try to revoke the project using the oracle function
+                // Get the numeric project ID from the IPFS hash
+                // Use get_project_by_hash to get the full project
+                // The client returns Project directly (panics on error)
+                let project = registry_client.get_project_by_hash(&project_id);
+                registry_client.revoke_project(
+                    &env.current_contract_address(),
+                    &project.id,
+                    &String::from_str(&env, "Project revoked due to rejected oracle report"),
+                    &0,
+                );
+            }
         }
 
         env.events().publish(
@@ -990,6 +1015,32 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
     );
 }
 
+/// Set the project registry contract address (admin-only).
+pub fn set_project_registry(
+    env: Env,
+    caller: Address,
+    registry_id: Address,
+    nonce: u64,
+) -> Result<(), OracleError> {
+    caller.require_auth();
+
+    let expected_nonce = get_nonce(&env, &caller);
+    if nonce != expected_nonce {
+        return Err(OracleError::InvalidNonce);
+    }
+    set_nonce(&env, &caller, expected_nonce + 1);
+
+    require_admin(&env, &caller)?;
+
+    env.storage()
+        .instance()
+        .set(&DataKey::ProjectRegistry, &registry_id);
+
+    env.events()
+        .publish((Symbol::new(&env, "registry_set"),), (caller, registry_id));
+
+    Ok(())
+}
 #[cfg(test)]
 mod test {
     use super::*;

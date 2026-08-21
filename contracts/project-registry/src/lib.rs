@@ -472,6 +472,33 @@ impl ProjectRegistry {
             .unwrap_or(0)
     }
 
+    /// Get project by metadata IPFS hash.
+    pub fn get_project_by_hash(
+        env: Env,
+        metadata_ipfs_hash: BytesN<32>,
+    ) -> Result<Project, RegistryError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectCount)
+            .unwrap_or(0);
+
+        for id in 1..=count {
+            let key = project_id_to_bytes(&env, id);
+            if let Some(project) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Project>(&DataKey::Project(key))
+            {
+                if project.metadata_ipfs_hash == metadata_ipfs_hash {
+                    return Ok(project);
+                }
+            }
+        }
+
+        Err(RegistryError::ProjectNotFound)
+    }
+
     pub fn get_owner_projects(env: Env, owner: Address) -> Vec<u64> {
         env.storage()
             .instance()
