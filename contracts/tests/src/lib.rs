@@ -72,6 +72,16 @@ mod integration {
 
         let oc_addr = env.register(OracleConsumer, (admin.clone(),));
         let oc_client = OracleConsumerClient::new(env, &oc_addr);
+        env.as_contract(&oc_addr, || {
+            env.storage()
+                .instance()
+                .set(&nbbs_oracle_consumer::DataKey::ProjectRegistry, &pr_addr);
+        });
+        env.as_contract(&pr_addr, || {
+            env.storage()
+                .instance()
+                .set(&nbbs_project_registry::DataKey::OracleConsumerId, &oc_addr);
+        });
 
         let ce_addr = env.register(
             CouponEngine,
@@ -152,7 +162,7 @@ mod integration {
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -163,9 +173,12 @@ mod integration {
             );
             assert_eq!(report_id, 1);
 
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             let report = contracts.oc_client.get_report(&report_id);
             assert_eq!(report.status, ReportStatus::Verified);
@@ -288,7 +301,7 @@ mod integration {
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -309,9 +322,12 @@ mod integration {
                 .try_distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2, &true);
             assert_eq!(rejected, Err(Ok(CouponEngineError::ReportNotVerified)));
 
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             let result = contracts
                 .ce_client
@@ -367,7 +383,7 @@ mod integration {
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &86_000_000i128,
@@ -381,9 +397,12 @@ mod integration {
             let report = contracts.oc_client.get_report(&report_id);
             assert_eq!(report.methodology, Symbol::new(&env, "blue_carbon"));
 
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
             assert_eq!(
                 contracts.oc_client.get_report(&report_id).status,
                 ReportStatus::Verified
@@ -458,7 +477,7 @@ mod integration {
             );
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -467,9 +486,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             contracts
                 .ce_client
@@ -538,7 +560,7 @@ mod integration {
             );
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -547,9 +569,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             contracts
                 .ce_client
@@ -632,7 +657,7 @@ mod integration {
             // 9_000_000 kg → 9_000 credits (1 tonne == 1 credit, 1_000 tokens each → 1_000 credits/holder)
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &9_000_000i128,
@@ -641,9 +666,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
             contracts
                 .ce_client
                 .register_bond(&admin, &bond_id, &project_id, &1);
@@ -739,8 +767,6 @@ mod integration {
             let challenger = Address::generate(&env);
             let contracts = deploy_contracts(&env, &admin);
 
-            let project_id = make_project_id(&env, 1);
-
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
@@ -759,7 +785,7 @@ mod integration {
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -799,8 +825,6 @@ mod integration {
             let oracle_c = Address::generate(&env);
             let contracts = deploy_contracts(&env, &admin);
 
-            let project_id = make_project_id(&env, 1);
-
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
@@ -828,11 +852,13 @@ mod integration {
                 &Symbol::new(&env, "satellite"),
                 &2,
             );
-            contracts.oc_client.set_signature_threshold(&admin, &2u32, &3);
+            contracts
+                .oc_client
+                .set_signature_threshold(&admin, &2u32, &3);
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle_a,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -879,8 +905,6 @@ mod integration {
             let challenger = Address::generate(&env);
             let contracts = deploy_contracts(&env, &admin);
 
-            let project_id = make_project_id(&env, 1);
-
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
@@ -900,7 +924,7 @@ mod integration {
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -1256,7 +1280,7 @@ mod integration {
 
             let report_id = contracts.oc_client.submit_report(
                 &oracle,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -1265,9 +1289,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             contracts
                 .ce_client
@@ -1359,7 +1386,7 @@ mod integration {
 
             let result = contracts.oc_client.try_submit_report(
                 &bob,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -1381,8 +1408,6 @@ mod integration {
             let rogue = Address::generate(&env);
             let contracts = deploy_contracts(&env, &admin);
 
-            let project_id = make_project_id(&env, 1);
-
             let pid = contracts.pr_client.register_project(
                 &alice,
                 &make_ipfs_hash(&env, 1),
@@ -1394,7 +1419,7 @@ mod integration {
 
             let result = contracts.oc_client.try_submit_report(
                 &rogue,
-                &project_id,
+                &pid,
                 &1000u64,
                 &2000u64,
                 &100_000i128,
@@ -1562,7 +1587,7 @@ mod integration {
                 );
                 let report_id = contracts.oc_client.submit_report(
                     &oracle,
-                    &project_id,
+                    &pid,
                     &1000u64,
                     &2000u64,
                     &carbon,
@@ -1630,7 +1655,6 @@ mod integration {
                 let challenger = Address::generate(&env);
                 let contracts = deploy_contracts(&env, &admin);
 
-                let project_id = make_project_id(&env, 1);
                 let pid = contracts.pr_client.register_project(
                     &alice,
                     &make_ipfs_hash(&env, 1),
@@ -1650,7 +1674,7 @@ mod integration {
 
                 let report_id = contracts.oc_client.submit_report(
                     &oracle,
-                    &project_id,
+                    &pid,
                     &1000u64,
                     &2000u64,
                     &100_000i128,

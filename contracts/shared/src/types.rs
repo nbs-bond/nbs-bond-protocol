@@ -40,7 +40,8 @@ pub type OrderId = u64;
 #[derive(Clone)]
 #[contracttype]
 pub struct OracleReport {
-    pub project_id: BytesN<32>,
+    pub project_id: u64,
+    pub project_metadata_hash: BytesN<32>,
     pub period_start: u64,
     pub period_end: u64,
     pub carbon_sequestered: i128,

@@ -9,7 +9,8 @@ Register → Whitelisted → Submit Reports → Challenge Window → Verify/Reje
 ## Report Format
 ```
 {
-  project_id: BytesN<32>,
+  project_id: u64,
+  project_metadata_hash: BytesN<32>,
   period_start: u64,
   period_end: u64,
   carbon_sequestered: i128,
@@ -18,6 +19,15 @@ Register → Whitelisted → Submit Reports → Challenge Window → Verify/Reje
   ipfs_evidence_hash: BytesN<32>,
 }
 ```
+
+`project_id` is the canonical numeric `Project.id` assigned by
+`ProjectRegistry`. `OracleConsumer` resolves it through the configured registry
+and accepts reports only while the project is `Approved`. The
+`project_metadata_hash` copied from that registry record and the report's
+`ipfs_evidence_hash` are content hashes with separate meanings; neither is used
+as project identity. This report-schema and project-index change is a breaking
+upgrade for previously stored oracle reports. Existing deployments must migrate
+or redeploy; the repository's testnet seed flow uses a clean redeployment.
 
 ## Multi-Source Verification Threshold
 A report only reaches `Verified` status after **independent verifications** meet the configured threshold:
