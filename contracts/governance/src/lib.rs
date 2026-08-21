@@ -1,17 +1,21 @@
 #![no_std]
 #![allow(deprecated)]
+use nbbs_shared::{GovernanceError, VoteChoice};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, Env, Symbol, TryFromVal, Val, Vec,
 };
-use nbbs_shared::{GovernanceError, VoteChoice};
 
 pub const DEFAULT_TIMELOCK_SECONDS: u64 = 172_800;
 pub const DEFAULT_PROPOSAL_TTL_SECONDS: u64 = 2_592_000;
 
-/// TTL bump parameters for the persistent allowlist entry, matching the
+/// TTL bump parameters for persistent-storage entries, matching the
 /// convention used by the other contracts in the workspace.
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
 const PERSISTENT_TTL_EXTEND_TO: u32 = 2_073_600;
+
+/// `StorageVersion` value once `migrate_storage` has copied any legacy
+/// instance-stored proposals/counter into persistent storage (issue #103).
+const STORAGE_VERSION_PERSISTENT: u32 = 1;
 
 /// Upper bound on the number of `(contract, method)` pairs the allowlist may
 /// hold. `execute` scans the list linearly on every call, so an unbounded list
@@ -55,6 +59,16 @@ pub enum DataKey {
     /// the contract's security boundary and must outlive any instance-storage
     /// archival of the rest of the governance state.
     AllowedCalls,
+    /// Storage migration marker (issue #103). Lives in instance storage since
+    /// it's a single small flag, not something that grows. Absent (or `0`)
+    /// means some Proposal/ProposalCount entries may still be sitting in
+    /// legacy instance storage; `STORAGE_VERSION_PERSISTENT` means
+    /// `migrate_storage` has already copied over everything it could find.
+    /// Reads of Proposal/ProposalCount/Vote/Nonce fall back to instance
+    /// storage regardless of this flag, so no data is ever lost even if
+    /// `migrate_storage` is never called — the flag just lets `migrate_storage`
+    /// itself skip redundant work.
+    StorageVersion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -87,17 +101,39 @@ pub struct Proposal {
     pub timelock_seconds: u64,
 }
 
-fn get_nonce(env: &Env, addr: &Address) -> u64 {
+fn storage_version(env: &Env) -> u32 {
     env.storage()
         .instance()
-        .get(&DataKey::Nonce(addr.clone()))
+        .get(&DataKey::StorageVersion)
         .unwrap_or(0)
 }
 
+/// Nonces (issue #103): always read/written through persistent storage now,
+/// with a fallback read to instance storage for any nonce recorded before
+/// this fix shipped. Nonces are keyed by address, so — unlike proposals —
+/// they can't be enumerated and bulk-copied by `migrate_storage`; the
+/// fallback read is what keeps a signer's pre-migration nonce honoured
+/// instead of silently resetting to 0, which would let a stale signed
+/// request replay.
+fn get_nonce(env: &Env, addr: &Address) -> u64 {
+    let key = DataKey::Nonce(addr.clone());
+    if let Some(nonce) = env.storage().persistent().get(&key) {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        return nonce;
+    }
+    env.storage().instance().get(&key).unwrap_or(0)
+}
+
 fn set_nonce(env: &Env, addr: &Address, nonce: u64) {
+    let key = DataKey::Nonce(addr.clone());
+    env.storage().persistent().set(&key, &nonce);
     env.storage()
-        .instance()
-        .set(&DataKey::Nonce(addr.clone()), &nonce);
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
 }
 
 fn check_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), GovernanceError> {
@@ -122,6 +158,76 @@ fn require_signer(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
 
 fn is_expired(env: &Env, proposal: &Proposal) -> bool {
     env.ledger().timestamp() >= proposal.expires_at
+}
+
+/// Proposals, the proposal counter, and votes (issue #103): all three now
+/// live in persistent storage, since instance storage has a hard 100KB cap
+/// and a governance contract with a few hundred proposals would hit it and
+/// become permanently unusable — no new proposals, no votes, no execution.
+/// Reads fall back to instance storage so anything created before this fix
+/// stays readable; `migrate_storage` additionally bulk-copies proposals and
+/// the counter forward since those are enumerable by id.
+fn read_proposal(env: &Env, proposal_id: u64) -> Option<Proposal> {
+    let key = DataKey::Proposal(proposal_id);
+    if let Some(proposal) = env.storage().persistent().get(&key) {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        return Some(proposal);
+    }
+    env.storage().instance().get(&key)
+}
+
+fn write_proposal(env: &Env, proposal_id: u64, proposal: &Proposal) {
+    let key = DataKey::Proposal(proposal_id);
+    env.storage().persistent().set(&key, proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+fn read_proposal_count(env: &Env) -> u64 {
+    if let Some(count) = env.storage().persistent().get(&DataKey::ProposalCount) {
+        return count;
+    }
+    env.storage()
+        .instance()
+        .get(&DataKey::ProposalCount)
+        .unwrap_or(0)
+}
+
+fn write_proposal_count(env: &Env, count: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ProposalCount, &count);
+    env.storage().persistent().extend_ttl(
+        &DataKey::ProposalCount,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL_EXTEND_TO,
+    );
+}
+
+fn read_vote(env: &Env, proposal_id: u64, voter: &Address) -> Option<VoteChoice> {
+    let key = DataKey::Vote(proposal_id, voter.clone());
+    if let Some(choice) = env.storage().persistent().get(&key) {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        return Some(choice);
+    }
+    env.storage().instance().get(&key)
+}
+
+fn write_vote(env: &Env, proposal_id: u64, voter: &Address, choice: &VoteChoice) {
+    let key = DataKey::Vote(proposal_id, voter.clone());
+    env.storage().persistent().set(&key, choice);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
 }
 
 /// Bump the persistent allowlist entry's TTL so the security boundary cannot
@@ -211,8 +317,10 @@ fn apply_set_allowed_calls(
     // proposal listed a pair twice.
     let stored = write_allowed_calls(env, calls)?;
 
-    env.events()
-        .publish((Symbol::new(env, "allowed_calls_set"),), (stored, caller.clone()));
+    env.events().publish(
+        (Symbol::new(env, "allowed_calls_set"),),
+        (stored, caller.clone()),
+    );
     Ok(())
 }
 
@@ -227,11 +335,7 @@ fn apply_set_allowed_calls(
 /// Only the methods enumerated here are reachable; every other method symbol is
 /// rejected with `UnauthorizedCall`. This hard-coded set is what makes the
 /// allowlist bootstrappable without ever leaving the contract open by default.
-fn dispatch_self_call(
-    env: &Env,
-    method: &Symbol,
-    args: &Vec<Val>,
-) -> Result<(), GovernanceError> {
+fn dispatch_self_call(env: &Env, method: &Symbol, args: &Vec<Val>) -> Result<(), GovernanceError> {
     if method != &Symbol::new(env, SELF_METHOD_SET_ALLOWED_CALLS) {
         return Err(GovernanceError::UnauthorizedCall);
     }
@@ -244,8 +348,8 @@ fn dispatch_self_call(
         .map_err(|_| GovernanceError::InvalidCallArgs)?;
     let calls = Vec::<AllowedCall>::try_from_val(env, &args.get_unchecked(1))
         .map_err(|_| GovernanceError::InvalidCallArgs)?;
-    let nonce =
-        u64::try_from_val(env, &args.get_unchecked(2)).map_err(|_| GovernanceError::InvalidCallArgs)?;
+    let nonce = u64::try_from_val(env, &args.get_unchecked(2))
+        .map_err(|_| GovernanceError::InvalidCallArgs)?;
 
     apply_set_allowed_calls(env, &caller, &calls, nonce)
 }
@@ -287,7 +391,9 @@ impl Governance {
             }
         }
         env.storage().instance().set(&DataKey::Signers, &signers);
-        env.storage().instance().set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &threshold);
         env.storage()
             .instance()
             .set(&DataKey::TimelockSeconds, &timelock_seconds);
@@ -310,15 +416,9 @@ impl Governance {
         check_nonce(&env, &caller, nonce)?;
         require_signer(&env, &caller)?;
 
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProposalCount)
-            .unwrap_or(0);
+        let count: u64 = read_proposal_count(&env);
         let proposal_id = count + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::ProposalCount, &proposal_id);
+        write_proposal_count(&env, proposal_id);
 
         let timelock_seconds: u64 = env
             .storage()
@@ -345,9 +445,7 @@ impl Governance {
             executed_at: 0,
             timelock_seconds,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        write_proposal(&env, proposal_id, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_created"),),
@@ -367,31 +465,20 @@ impl Governance {
         check_nonce(&env, &caller, nonce)?;
         require_signer(&env, &caller)?;
 
-        let mut proposal: Proposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal: Proposal =
+            read_proposal(&env, proposal_id).ok_or(GovernanceError::ProposalNotFound)?;
 
         if proposal.status != ProposalStatus::Pending {
             return Err(GovernanceError::NotPending);
         }
 
-        let vote_key = DataKey::Vote(proposal_id, caller.clone());
         // Guard checks presence of ANY prior choice, not a specific value —
         // this is what fixes the veto-bypass bug (#121): a stored `Veto` is
         // just as "already voted" as a stored `Approve`.
-        if env
-            .storage()
-            .instance()
-            .get::<_, VoteChoice>(&vote_key)
-            .is_some()
-        {
+        if read_vote(&env, proposal_id, &caller).is_some() {
             return Err(GovernanceError::AlreadyVoted);
         }
-        env.storage()
-            .instance()
-            .set(&vote_key, &VoteChoice::Approve);
+        write_vote(&env, proposal_id, &caller, &VoteChoice::Approve);
 
         let threshold: u32 = env
             .storage()
@@ -404,9 +491,7 @@ impl Governance {
             proposal.status = ProposalStatus::Queued;
             proposal.queued_at = env.ledger().timestamp();
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        write_proposal(&env, proposal_id, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "vote_cast"),),
@@ -426,30 +511,21 @@ impl Governance {
         check_nonce(&env, &caller, nonce)?;
         require_signer(&env, &caller)?;
 
-        let mut proposal: Proposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal: Proposal =
+            read_proposal(&env, proposal_id).ok_or(GovernanceError::ProposalNotFound)?;
 
         if proposal.status != ProposalStatus::Pending {
             return Err(GovernanceError::NotPending);
         }
 
-        let vote_key = DataKey::Vote(proposal_id, caller.clone());
         // Same presence check as vote_approve — this is the line that was
         // broken before: reading with `.unwrap_or(false)` against a key that
         // this function itself writes `false` into meant a veto vote could
         // never trip its own "already voted" guard.
-        if env
-            .storage()
-            .instance()
-            .get::<_, VoteChoice>(&vote_key)
-            .is_some()
-        {
+        if read_vote(&env, proposal_id, &caller).is_some() {
             return Err(GovernanceError::AlreadyVoted);
         }
-        env.storage().instance().set(&vote_key, &VoteChoice::Veto);
+        write_vote(&env, proposal_id, &caller, &VoteChoice::Veto);
 
         let threshold: u32 = env
             .storage()
@@ -461,9 +537,7 @@ impl Governance {
         if proposal.veto_count >= threshold {
             proposal.status = ProposalStatus::Rejected;
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        write_proposal(&env, proposal_id, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_rejected"),),
@@ -483,20 +557,15 @@ impl Governance {
         check_nonce(&env, &caller, nonce)?;
         require_signer(&env, &caller)?;
 
-        let mut proposal: Proposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal: Proposal =
+            read_proposal(&env, proposal_id).ok_or(GovernanceError::ProposalNotFound)?;
 
         if proposal.status != ProposalStatus::Pending {
             return Err(GovernanceError::NotPending);
         }
 
         proposal.status = ProposalStatus::Cancelled;
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        write_proposal(&env, proposal_id, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
@@ -515,11 +584,8 @@ impl Governance {
         caller.require_auth();
         check_nonce(&env, &caller, nonce)?;
 
-        let mut proposal: Proposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal: Proposal =
+            read_proposal(&env, proposal_id).ok_or(GovernanceError::ProposalNotFound)?;
 
         if proposal.status != ProposalStatus::Queued {
             return Err(GovernanceError::NotQueued);
@@ -557,7 +623,11 @@ impl Governance {
             // and only recognises the governance contract's own config methods.
             dispatch_self_call(&env, &proposal.method, &proposal.args)?;
         } else {
-            if !contains_call(&read_allowed_calls(&env), &proposal.target, &proposal.method) {
+            if !contains_call(
+                &read_allowed_calls(&env),
+                &proposal.target,
+                &proposal.method,
+            ) {
                 return Err(GovernanceError::UnauthorizedCall);
             }
 
@@ -572,9 +642,7 @@ impl Governance {
 
         proposal.status = ProposalStatus::Executed;
         proposal.executed_at = now;
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        write_proposal(&env, proposal_id, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
@@ -630,11 +698,67 @@ impl Governance {
         contains_call(&read_allowed_calls(&env), &contract, &function)
     }
 
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
+    /// Copy any proposals and the proposal counter still sitting in legacy
+    /// instance storage into persistent storage (issue #103), and mark the
+    /// migration done. Idempotent — safe to call more than once, and safe to
+    /// call on a contract that has no legacy data at all (returns `Ok(0)`).
+    ///
+    /// Votes and nonces don't get an explicit copy step: they're keyed by
+    /// address, so there's no way to enumerate and bulk-copy them the way
+    /// proposals (keyed by sequential id) can be. `get_vote`/`get_nonce` (and
+    /// every internal read) already fall back to instance storage for any
+    /// pre-migration entry, so nothing is lost — this function just moves the
+    /// enumerable part forward proactively.
+    ///
+    /// Returns the number of proposals copied.
+    pub fn migrate_storage(env: Env, caller: Address) -> Result<u64, GovernanceError> {
+        caller.require_auth();
+        require_signer(&env, &caller)?;
+
+        if storage_version(&env) >= STORAGE_VERSION_PERSISTENT {
+            return Ok(0);
+        }
+
+        let mut migrated: u64 = 0;
+        if let Some(count) = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::ProposalCount)
+        {
+            if env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&DataKey::ProposalCount)
+                .is_none()
+            {
+                write_proposal_count(&env, count);
+            }
+            for id in 1..=count {
+                let key = DataKey::Proposal(id);
+                if env
+                    .storage()
+                    .persistent()
+                    .get::<_, Proposal>(&key)
+                    .is_some()
+                {
+                    continue;
+                }
+                if let Some(proposal) = env.storage().instance().get::<_, Proposal>(&key) {
+                    write_proposal(&env, id, &proposal);
+                    migrated += 1;
+                }
+            }
+        }
+
         env.storage()
             .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)
+            .set(&DataKey::StorageVersion, &STORAGE_VERSION_PERSISTENT);
+
+        Ok(migrated)
+    }
+
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
+        read_proposal(&env, proposal_id).ok_or(GovernanceError::ProposalNotFound)
     }
 
     /// Returns the signer's recorded choice on `proposal_id`, or `None` if
@@ -649,16 +773,11 @@ impl Governance {
     /// `bool`. Any off-chain consumer reading `get_vote` must be updated to
     /// handle `Option<VoteChoice>` instead of `bool`.
     pub fn get_vote(env: Env, proposal_id: u64, signer: Address) -> Option<VoteChoice> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Vote(proposal_id, signer))
+        read_vote(&env, proposal_id, &signer)
     }
 
     pub fn proposal_count(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ProposalCount)
-            .unwrap_or(0)
+        read_proposal_count(&env)
     }
 
     pub fn get_signers(env: Env) -> Vec<Address> {
@@ -719,7 +838,12 @@ mod test {
     /// test can propose against it. Returning `None` seeds an empty allowlist.
     fn setup_with_allowlist(
         build: &dyn Fn(&Env) -> Option<(Address, Symbol)>,
-    ) -> (Env, GovernanceClient<'static>, Vec<Address>, Option<Address>) {
+    ) -> (
+        Env,
+        GovernanceClient<'static>,
+        Vec<Address>,
+        Option<Address>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let signers = make_signers(&env, 5);
@@ -744,7 +868,12 @@ mod test {
     }
 
     /// Build the argument list a `set_allowed_calls` proposal must carry.
-    fn set_allowed_calls_args(env: &Env, gov_id: &Address, calls: &Vec<AllowedCall>, gov_nonce: u64) -> Vec<Val> {
+    fn set_allowed_calls_args(
+        env: &Env,
+        gov_id: &Address,
+        calls: &Vec<AllowedCall>,
+        gov_nonce: u64,
+    ) -> Vec<Val> {
         vec![
             env,
             gov_id.clone().into_val(env),
@@ -787,7 +916,10 @@ mod test {
         for i in 1..=threshold {
             gov.vote_approve(&signers.get(i).unwrap(), &proposal_id, &0);
         }
-        assert_eq!(gov.get_proposal(&proposal_id).status, ProposalStatus::Queued);
+        assert_eq!(
+            gov.get_proposal(&proposal_id).status,
+            ProposalStatus::Queued
+        );
 
         env.ledger()
             .set_timestamp(started_at + DEFAULT_TIMELOCK_SECONDS);
@@ -977,11 +1109,13 @@ mod test {
         client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
         client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
 
-        env.ledger().set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS - 1);
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS - 1);
         let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
         assert_eq!(result, Err(Ok(GovernanceError::TimelockNotElapsed)));
 
-        env.ledger().set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS);
         let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
         assert!(result.is_err());
         assert_ne!(result, Err(Ok(GovernanceError::TimelockNotElapsed)));
@@ -1002,7 +1136,8 @@ mod test {
             &0,
         );
 
-        env.ledger().set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS);
         let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
         assert_eq!(result, Err(Ok(GovernanceError::NotQueued)));
     }
@@ -1026,7 +1161,8 @@ mod test {
         client.vote_veto(&signers.get(2).unwrap(), &proposal_id, &0);
         client.vote_veto(&signers.get(3).unwrap(), &proposal_id, &0);
 
-        env.ledger().set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_TIMELOCK_SECONDS);
         let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
         assert_eq!(result, Err(Ok(GovernanceError::NotQueued)));
     }
@@ -1065,7 +1201,10 @@ mod test {
         let proposal = client.get_proposal(&proposal_id);
         assert_eq!(proposal.status, ProposalStatus::Pending);
         assert_eq!(proposal.created_at, 1_000_000);
-        assert_eq!(proposal.expires_at, 1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS);
+        assert_eq!(
+            proposal.expires_at,
+            1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS
+        );
     }
 
     #[test]
@@ -1085,10 +1224,14 @@ mod test {
         client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
         client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
         client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
-        assert_eq!(client.get_proposal(&proposal_id).status, ProposalStatus::Queued);
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Queued
+        );
 
         // Advance past the per-proposal TTL frozen at creation (also past the timelock).
-        env.ledger().set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
 
         // Execution of an expired proposal is always rejected.
         let result = client.try_execute(&signers.get(0).unwrap(), &proposal_id, &1);
@@ -1366,7 +1509,8 @@ mod test {
         gov_client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &1);
 
         // Governance's own timelock must also elapse.
-        env.ledger().set_timestamp(maturity_date + 1 + DEFAULT_TIMELOCK_SECONDS);
+        env.ledger()
+            .set_timestamp(maturity_date + 1 + DEFAULT_TIMELOCK_SECONDS);
 
         gov_client.execute(&signers.get(0).unwrap(), &proposal_id, &3);
 
@@ -1423,15 +1567,20 @@ mod test {
 
         env.ledger()
             .set_timestamp(started_at + DEFAULT_TIMELOCK_SECONDS);
-        client.try_execute(&signers.get(0).unwrap(), &proposal_id, &(proposer_nonce + 1))
+        client.try_execute(
+            &signers.get(0).unwrap(),
+            &proposal_id,
+            &(proposer_nonce + 1),
+        )
     }
 
     #[test]
     fn test_execute_rejects_method_outside_allowlist() {
         // Governance is created with an allowlist holding exactly one pair:
         // (target, "approve_project").
-        let (env, client, signers, target) =
-            setup_with_allowlist(&|env| Some((Address::generate(env), Symbol::new(env, "approve_project"))));
+        let (env, client, signers, target) = setup_with_allowlist(&|env| {
+            Some((Address::generate(env), Symbol::new(env, "approve_project")))
+        });
         let target = target.unwrap();
         env.ledger().set_timestamp(1_000_000);
 
@@ -1460,8 +1609,9 @@ mod test {
         // address with no contract behind it — reaching invoke_contract would
         // panic rather than return UnauthorizedCall, which is also what proves
         // the check runs *before* the dispatch.
-        let (env, client, signers, _allowed) =
-            setup_with_allowlist(&|env| Some((Address::generate(env), Symbol::new(env, "approve_project"))));
+        let (env, client, signers, _allowed) = setup_with_allowlist(&|env| {
+            Some((Address::generate(env), Symbol::new(env, "approve_project")))
+        });
         env.ledger().set_timestamp(1_000_000);
 
         let other_contract = Address::generate(&env);
@@ -1498,8 +1648,9 @@ mod test {
 
     #[test]
     fn test_constructor_seeds_allowlist() {
-        let (env, client, _signers, target) =
-            setup_with_allowlist(&|env| Some((Address::generate(env), Symbol::new(env, "approve_project"))));
+        let (env, client, _signers, target) = setup_with_allowlist(&|env| {
+            Some((Address::generate(env), Symbol::new(env, "approve_project")))
+        });
         let target = target.unwrap();
 
         let allowed = client.get_allowed_calls();
@@ -1514,9 +1665,10 @@ mod test {
 
         assert!(client.is_call_allowed(&target, &Symbol::new(&env, "approve_project")));
         assert!(!client.is_call_allowed(&target, &Symbol::new(&env, "set_admin")));
-        assert!(
-            !client.is_call_allowed(&Address::generate(&env), &Symbol::new(&env, "approve_project"))
-        );
+        assert!(!client.is_call_allowed(
+            &Address::generate(&env),
+            &Symbol::new(&env, "approve_project")
+        ));
     }
 
     #[test]
@@ -1712,9 +1864,18 @@ mod test {
         // The same pair listed three times collapses to one entry.
         let duplicated: Vec<AllowedCall> = vec![
             &env,
-            AllowedCall { contract: contract.clone(), function: function.clone() },
-            AllowedCall { contract: contract.clone(), function: function.clone() },
-            AllowedCall { contract: contract.clone(), function: function.clone() },
+            AllowedCall {
+                contract: contract.clone(),
+                function: function.clone(),
+            },
+            AllowedCall {
+                contract: contract.clone(),
+                function: function.clone(),
+            },
+            AllowedCall {
+                contract: contract.clone(),
+                function: function.clone(),
+            },
         ];
         let gov_id = env.register(
             Governance,
@@ -1801,8 +1962,6 @@ mod test {
         client.vote_veto(&signer_a, &proposal_1, &0);
         client.vote_approve(&signer_a, &proposal_2, &1);
 
-        // Assertion central del acceptance criteria: get_vote distingue los
-        // tres estados observables.
         assert_eq!(
             client.get_vote(&proposal_1, &signer_a),
             Some(VoteChoice::Veto)
@@ -1844,5 +2003,91 @@ mod test {
 
         // veto_count must not have been inflated by the rejected second call.
         assert_eq!(client.get_proposal(&proposal_1).veto_count, 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Persistent storage migration (issue #103)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_migrate_storage_preserves_legacy_proposal() {
+        let (env, client, signers) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let target = make_target(&env);
+
+        // Simulate a proposal + counter that predate this fix by writing them
+        // directly into instance storage, bypassing propose() (which now
+        // always writes to persistent storage).
+        env.as_contract(&client.address, || {
+            let proposal = Proposal {
+                id: 1,
+                proposer: signers.get(0).unwrap(),
+                target: target.clone(),
+                method: Symbol::new(&env, "legacy_call"),
+                args: vec![&env],
+                description: Symbol::new(&env, "legacy"),
+                status: ProposalStatus::Pending,
+                approval_count: 0,
+                veto_count: 0,
+                created_at: 1_000_000,
+                expires_at: 1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS,
+                queued_at: 0,
+                executed_at: 0,
+                timelock_seconds: DEFAULT_TIMELOCK_SECONDS,
+            };
+            env.storage()
+                .instance()
+                .set(&DataKey::Proposal(1u64), &proposal);
+            env.storage().instance().set(&DataKey::ProposalCount, &1u64);
+        });
+
+        // Readable via the legacy fallback even before migration runs.
+        let proposal = client.get_proposal(&1);
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(proposal.method, Symbol::new(&env, "legacy_call"));
+        assert_eq!(client.proposal_count(), 1);
+
+        // Run the migration.
+        let migrated = client.migrate_storage(&signers.get(0).unwrap());
+        assert_eq!(migrated, 1);
+
+        // Still readable — now served from persistent storage.
+        let proposal = client.get_proposal(&1);
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(client.proposal_count(), 1);
+
+        // Calling migrate again is a safe no-op.
+        let migrated_again = client.migrate_storage(&signers.get(0).unwrap());
+        assert_eq!(migrated_again, 0);
+    }
+
+    #[test]
+    fn test_new_proposals_go_straight_to_persistent_storage() {
+        // Proposals created after this fix should never touch instance
+        // storage at all — that's the whole point of the fix.
+        let (env, client, signers) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let target = make_target(&env);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        env.as_contract(&client.address, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .has(&DataKey::Proposal(proposal_id)));
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&DataKey::Proposal(proposal_id)));
+            assert!(env.storage().persistent().has(&DataKey::ProposalCount));
+        });
     }
 }
