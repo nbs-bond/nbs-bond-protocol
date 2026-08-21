@@ -94,3 +94,15 @@ An upgrade that renames an administered method should be paired with a
 - `get_allowed_calls() -> Vec<AllowedCall>` — the current allowlist.
 - `is_call_allowed(contract, function) -> bool` — whether `execute` would
   currently permit a call, so a proposer can check before spending a vote cycle.
+
+## Signer Rotation
+
+The governance contract supports modifying its own multi-sig configuration via the standard proposal lifecycle. This allows the committee to securely rotate keys, add new members, remove compromised keys, or adjust the threshold without deploying a new governance contract or relying on a central admin.
+
+The following operations are supported and act as self-administered methods (dispatched internally by `execute` similarly to `set_allowed_calls`):
+
+- **`add_signer(caller, signer, nonce)`**: Adds a new address to the set of signers. Fails if the address is already a signer.
+- **`remove_signer(caller, signer, nonce)`**: Removes an existing address from the set of signers. Fails if removing the signer would cause the total number of signers to fall below the current threshold.
+- **`update_threshold(caller, new_threshold, nonce)`**: Updates the multi-sig vote threshold. Fails if the new threshold is `0` or greater than the current number of signers.
+
+> **Note on In-Flight Proposals**: If a signer is removed while proposals are pending, their previous votes on those pending proposals remain recorded and still count towards the threshold. The proposal can still execute as long as it reaches the configured threshold.
