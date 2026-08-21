@@ -1527,16 +1527,37 @@ mod test {
             ],
         );
 
+        // set_signature_threshold validates 1 <= threshold <= active provider
+        // count, so register three providers (via governance, the oracle's
+        // admin) before proposing a threshold of 3. Each call consumes the
+        // governance nonce on the oracle contract.
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let provider_c = Address::generate(&env);
+        oracle.register_provider(
+            &gov_id,
+            &provider_a,
+            &Symbol::new(&env, "verra_vcs"),
+            &0,
+        );
+        oracle.register_provider(
+            &gov_id,
+            &provider_b,
+            &Symbol::new(&env, "satellite"),
+            &1,
+        );
+        oracle.register_provider(&gov_id, &provider_c, &Symbol::new(&env, "iot"), &2);
+
         // Encode full args for set_signature_threshold(caller, threshold, nonce):
         //   caller    = gov_id  (governance is the admin)
         //   threshold = 3
-        //   nonce     = 0       (first call from governance address on oracle)
+        //   nonce     = 3       (three prior governance calls on the oracle)
         let new_threshold: u32 = 3;
         let proposal_args: Vec<Val> = vec![
             &env,
             gov_id.clone().into_val(&env),
             new_threshold.into_val(&env),
-            0u64.into_val(&env),
+            3u64.into_val(&env),
         ];
 
         let proposal_id = gov_client.propose(

@@ -1,6 +1,7 @@
 import { Test } from '@nestjs/testing';
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   InternalServerErrorException,
   UnauthorizedException,
@@ -951,48 +952,41 @@ describe('BondsService', () => {
   });
 });
 
-describe('BondsService.transfer', () => {
-  const SENDER_KEYPAIR = Keypair.random();
-  const SENDER = SENDER_KEYPAIR.publicKey();
-  const RECIPIENT = Keypair.random().publicKey();
-  const STRANGER = Keypair.random().publicKey();
-  const BOND_ID = 7;
+describe('BondsService.claimCredits', () => {
+  const INVESTOR_SECRET = Keypair.random();
+  const INVESTOR = INVESTOR_SECRET.publicKey();
+  const OTHER_HOLDER = Keypair.random().publicKey();
 
-  const buildTransferService = async (opts: {
-    balance?: number;
-    balanceFails?: boolean;
-    sendError?: Error;
+  const buildClaimService = async (opts: {
+    accrued: number;
+    claimed?: number;
+    invokeError?: Error;
   }) => {
     const simulateCall = jest.fn(({ method }: { method: string }) => {
-      if (method === 'get_holder_balance') {
-        if (opts.balanceFails) {
-          return Promise.reject(new Error('rpc unavailable'));
-        }
+      if (method === 'accrued_credits') {
         return Promise.resolve(
-          nativeToScVal(BigInt(opts.balance ?? 0), { type: 'i128' }),
+          nativeToScVal(BigInt(opts.accrued), { type: 'i128' }),
         );
       }
       return Promise.resolve(nativeToScVal(BigInt(0), { type: 'i128' }));
     });
 
-    const sendTransaction = opts.sendError
-      ? jest.fn().mockRejectedValue(opts.sendError)
+    const invokeContractMethod = opts.invokeError
+      ? jest.fn().mockRejectedValue(opts.invokeError)
       : jest.fn().mockResolvedValue({
-          result: xdr.ScVal.scvVoid(),
-          transactionHash: 'transfer-tx',
+          result: nativeToScVal(BigInt(opts.claimed ?? opts.accrued), {
+            type: 'i128',
+          }),
+          transactionHash: 'tx-hash',
           successful: true,
         });
 
-    const invokeContractMethod = jest.fn();
-    const next = jest.fn().mockResolvedValue(0);
+    const next = jest.fn().mockResolvedValue(4);
 
     const moduleRef = await Test.createTestingModule({
       providers: [
         BondsService,
-        {
-          provide: ContractService,
-          useValue: { simulateCall, sendTransaction, invokeContractMethod },
-        },
+        { provide: ContractService, useValue: { simulateCall, invokeContractMethod } },
         {
           provide: StellarService,
           useValue: {
@@ -1008,169 +1002,132 @@ describe('BondsService.transfer', () => {
 
     return {
       svc: moduleRef.get(BondsService) as BondsService,
-      sendTransaction,
+      simulateCall,
       invokeContractMethod,
       next,
     };
   };
 
   beforeEach(() => {
-    process.env.INVESTOR_SECRET_KEY = SENDER_KEYPAIR.secret();
-    (createClient() as any).sAdd.mockClear();
+    process.env.INVESTOR_SECRET_KEY = INVESTOR_SECRET.secret();
   });
 
   afterAll(() => {
     delete process.env.INVESTOR_SECRET_KEY;
   });
 
-  it('transfers from the authenticated session address', async () => {
-    const { svc, sendTransaction } = await buildTransferService({ balance: 500 });
-
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER),
-    ).resolves.toEqual({
-      bondId: BOND_ID,
-      fromAddress: SENDER,
-      toAddress: RECIPIENT,
-      amount: 100,
-      transactionHash: 'transfer-tx',
+  it('claims for the authenticated session address and reports the on-chain amount', async () => {
+    const { svc, invokeContractMethod } = await buildClaimService({
+      accrued: 250,
+      claimed: 250,
     });
 
-    const call = sendTransaction.mock.calls[0][0];
-    expect(call.method).toBe('transfer');
-    expect(call.sourceSecretKey).toBe(SENDER_KEYPAIR.secret());
-    expect(scValToNative(call.args[0])).toBe(SENDER);
-    expect(scValToNative(call.args[1])).toBe(RECIPIENT);
-    expect(Number(scValToNative(call.args[2]))).toBe(BOND_ID);
-    expect(Number(scValToNative(call.args[3]))).toBe(100);
+    await expect(svc.claimCredits(3, {}, INVESTOR)).resolves.toEqual({
+      bondId: 3,
+      investorAddress: INVESTOR,
+      credits: 250,
+      transactionHash: 'tx-hash',
+    });
+
+    const [contract, method, secret, args, nonce] =
+      invokeContractMethod.mock.calls[0];
+    expect(method).toBe('claim_credits');
+    expect(contract).toBe(process.env.COUPON_ENGINE_ADDRESS || '');
+    expect(secret).toBe(INVESTOR_SECRET.secret());
+    expect(scValToNative(args[0])).toBe(INVESTOR);
+    expect(Number(scValToNative(args[1]))).toBe(3);
+    expect(nonce).toBe(4);
   });
 
-  it('submits exactly the four arguments BondIssuer.transfer declares', async () => {
-    const { svc, sendTransaction, invokeContractMethod, next } =
-      await buildTransferService({ balance: 500 });
+  it('returns the amount the contract actually zeroed, not the pre-read balance', async () => {
+    const { svc } = await buildClaimService({ accrued: 250, claimed: 180 });
 
-    await svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER);
+    const response = await svc.claimCredits(3, {}, INVESTOR);
 
-    // BondIssuer.transfer takes no nonce (issue #13): appending one via
-    // invokeContractMethod would be an arity error on-chain.
-    expect(sendTransaction.mock.calls[0][0].args).toHaveLength(4);
-    expect(invokeContractMethod).not.toHaveBeenCalled();
-    expect(next).not.toHaveBeenCalled();
+    expect(response.credits).toBe(180);
   });
 
-  it('records both parties in the off-chain holder set', async () => {
-    const { svc } = await buildTransferService({ balance: 500 });
-
-    await svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER);
-
-    const sAdd = (createClient() as any).sAdd as jest.Mock;
-    expect(sAdd).toHaveBeenCalledWith(`bond:${BOND_ID}:holders`, RECIPIENT);
-    expect(sAdd).toHaveBeenCalledWith(`bond:${BOND_ID}:holders`, SENDER);
-  });
-
-  it('accepts a fromAddress identical to the session address', async () => {
-    const { svc } = await buildTransferService({ balance: 500 });
+  it('accepts a body address identical to the session address', async () => {
+    const { svc } = await buildClaimService({ accrued: 10 });
 
     await expect(
-      svc.transfer(
-        BOND_ID,
-        { fromAddress: SENDER, toAddress: RECIPIENT, amount: 100 },
-        SENDER,
-      ),
-    ).resolves.toMatchObject({ fromAddress: SENDER });
+      svc.claimCredits(1, { investorAddress: INVESTOR }, INVESTOR),
+    ).resolves.toMatchObject({ investorAddress: INVESTOR });
   });
 
-  it('rejects a fromAddress that is not the authenticated wallet with 403', async () => {
-    const { svc, sendTransaction } = await buildTransferService({ balance: 500 });
+  it('rejects a body address that is not the authenticated wallet with 403', async () => {
+    const { svc, invokeContractMethod } = await buildClaimService({ accrued: 10 });
 
     await expect(
-      svc.transfer(
-        BOND_ID,
-        { fromAddress: STRANGER, toAddress: RECIPIENT, amount: 100 },
-        SENDER,
-      ),
+      svc.claimCredits(1, { investorAddress: OTHER_HOLDER }, INVESTOR),
     ).rejects.toBeInstanceOf(ForbiddenException);
-    expect(sendTransaction).not.toHaveBeenCalled();
+    expect(invokeContractMethod).not.toHaveBeenCalled();
   });
 
-  it('rejects a session without a valid Stellar address with 401', async () => {
-    const { svc } = await buildTransferService({ balance: 500 });
+  it('rejects a session that carries no valid Stellar address with 401', async () => {
+    const { svc } = await buildClaimService({ accrued: 10 });
 
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, 'nope'),
-    ).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(svc.claimCredits(1, {}, 'not-an-address')).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
   });
 
   it('rejects a caller the API holds no signing key for with 403', async () => {
-    const { svc, sendTransaction } = await buildTransferService({ balance: 500 });
+    const { svc, invokeContractMethod } = await buildClaimService({ accrued: 10 });
 
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, STRANGER),
-    ).rejects.toBeInstanceOf(ForbiddenException);
-    expect(sendTransaction).not.toHaveBeenCalled();
+    await expect(svc.claimCredits(1, {}, OTHER_HOLDER)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+    expect(invokeContractMethod).not.toHaveBeenCalled();
   });
 
   it('fails with 500 when no investor signing key is configured', async () => {
     delete process.env.INVESTOR_SECRET_KEY;
-    const { svc } = await buildTransferService({ balance: 500 });
+    const { svc } = await buildClaimService({ accrued: 10 });
 
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER),
-    ).rejects.toBeInstanceOf(InternalServerErrorException);
+    await expect(svc.claimCredits(1, {}, INVESTOR)).rejects.toBeInstanceOf(
+      InternalServerErrorException,
+    );
   });
 
-  it('rejects a transfer to the sender with 400', async () => {
-    const { svc, sendTransaction } = await buildTransferService({ balance: 500 });
-
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: SENDER, amount: 100 }, SENDER),
-    ).rejects.toBeInstanceOf(BadRequestException);
-    expect(sendTransaction).not.toHaveBeenCalled();
-  });
-
-  it('rejects a transfer larger than the holder balance with 400', async () => {
-    const { svc, sendTransaction } = await buildTransferService({ balance: 40 });
-
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER),
-    ).rejects.toThrow('holder has 40, tried to transfer 100');
-    expect(sendTransaction).not.toHaveBeenCalled();
-  });
-
-  it('lets the contract decide when the balance cannot be read', async () => {
-    const { svc, sendTransaction } = await buildTransferService({
-      balanceFails: true,
+  it('short-circuits without submitting a transaction when nothing is accrued', async () => {
+    const { svc, invokeContractMethod, next } = await buildClaimService({
+      accrued: 0,
     });
 
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER),
-    ).resolves.toMatchObject({ transactionHash: 'transfer-tx' });
-    expect(sendTransaction).toHaveBeenCalled();
+    await expect(svc.claimCredits(5, {}, INVESTOR)).resolves.toEqual({
+      bondId: 5,
+      investorAddress: INVESTOR,
+      credits: 0,
+      transactionHash: '',
+    });
+    expect(invokeContractMethod).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
   });
 
-  it('maps a matured bond to a 400 explaining transfers are closed', async () => {
-    const { svc } = await buildTransferService({
-      balance: 500,
-      sendError: new BadRequestException(
-        'Transaction simulation failed: host error (contract error code 5)',
+  it('maps an on-chain accounting mismatch to 409 Conflict', async () => {
+    const { svc } = await buildClaimService({
+      accrued: 100,
+      invokeError: new BadRequestException(
+        'Transaction simulation failed: host error (contract error code 13)',
       ),
     });
 
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER),
-    ).rejects.toThrow(`Bond #${BOND_ID} has matured`);
+    await expect(svc.claimCredits(2, {}, INVESTOR)).rejects.toBeInstanceOf(
+      ConflictException,
+    );
   });
 
-  it('maps an unknown bond to a 400 naming the bond', async () => {
-    const { svc } = await buildTransferService({
-      balance: 500,
-      sendError: new BadRequestException(
+  it('maps an unknown bond to 400', async () => {
+    const { svc } = await buildClaimService({
+      accrued: 100,
+      invokeError: new BadRequestException(
         'Transaction simulation failed: host error (contract error code 4)',
       ),
     });
 
-    await expect(
-      svc.transfer(BOND_ID, { toAddress: RECIPIENT, amount: 100 }, SENDER),
-    ).rejects.toThrow(`Bond #${BOND_ID} does not exist`);
+    await expect(svc.claimCredits(99, {}, INVESTOR)).rejects.toThrow(
+      'Bond #99 does not exist',
+    );
   });
 });

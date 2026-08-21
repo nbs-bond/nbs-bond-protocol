@@ -63,26 +63,24 @@ describe('BondsController guards', () => {
     expect(service.getAccruedCredits).toHaveBeenCalledWith(1, 'holder-key');
   });
 
-  it('passes the authenticated wallet address to the transfer service call', async () => {
-    const transferred = {
+  it('passes the authenticated wallet address to the claim service call', async () => {
+    const claimed = {
       bondId: 4,
-      fromAddress: 'GSENDER',
-      toAddress: 'GRECIPIENT',
-      amount: 10,
+      investorAddress: 'GINVESTOR',
+      credits: 10,
       transactionHash: 'tx',
     };
-    const service = { transfer: jest.fn().mockResolvedValue(transferred) };
+    const service = { claimCredits: jest.fn().mockResolvedValue(claimed) };
     const controller = new BondsController(service as any);
-    const dto = { toAddress: 'GRECIPIENT', amount: 10 };
-    const req = { user: { walletAddress: 'GSENDER' } } as any;
+    const req = { user: { walletAddress: 'GINVESTOR' } } as any;
 
-    await expect(controller.transfer(4, dto, req)).resolves.toBe(transferred);
-    expect(service.transfer).toHaveBeenCalledWith(4, dto, 'GSENDER');
+    await expect(controller.claimCredits(4, {}, req)).resolves.toBe(claimed);
+    expect(service.claimCredits).toHaveBeenCalledWith(4, {}, 'GINVESTOR');
   });
 
-  it('routes the transfer handler under the /bonds/:id/transfer path', () => {
-    const path = Reflect.getMetadata('path', BondsController.prototype.transfer);
-    expect(path).toBe(':id/transfer');
+  it('routes the claim handler under the /bonds/:id/claim path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.claimCredits);
+    expect(path).toBe(':id/claim');
   });
 
   it('routes the periods handler under the /bonds/:id/periods path', () => {

@@ -42,6 +42,10 @@ pub enum OracleError {
     InvalidResolution = 11,
     SelfChallenge = 12,
     StakeLocked = 13,
+    /// The signature threshold is out of range: `0` would make a single
+    /// signature trivially sufficient, and a value above the active provider
+    /// count could never be reached, permanently deadlocking verification.
+    InvalidThreshold = 14,
 }
 
 #[derive(Clone, Debug, PartialEq)]

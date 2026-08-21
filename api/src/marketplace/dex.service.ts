@@ -17,9 +17,10 @@ import {
   QuoteAsset,
   QuoteBalanceResponse,
   QuoteTransactionResponse,
+  OnChainPriceQuote,
 } from './interfaces/marketplace.interface';
 import { createClient, RedisClientType } from '@redis/client';
-import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
 import { PaginatedResponse } from '../common/dto/pagination.dto';
 
 const DEX_ROUTER = () => process.env.DEX_ROUTER_ADDRESS || '';
@@ -197,6 +198,32 @@ export class DexService {
 
     await this.redis.setEx(cacheKey, 60, JSON.stringify(order));
     return order;
+  }
+
+  async getBestPrice(
+    bondId: number,
+    side: 'buy' | 'sell',
+    amount: number,
+  ): Promise<OnChainPriceQuote> {
+    const sideScVal = xdr.ScVal.scvVec([
+      nativeToScVal(side === 'buy' ? 'Buy' : 'Sell', { type: 'symbol' }),
+    ]);
+    const quoteScVal = await this.contractService.simulateCall({
+      contractAddress: DEX_ROUTER(),
+      method: 'get_best_price',
+      args: [
+        nativeToScVal(BigInt(bondId), { type: 'u64' }),
+        sideScVal,
+        nativeToScVal(BigInt(amount), { type: 'i128' }),
+      ],
+    });
+    const [price, total, slippageBps] = scValToNative(quoteScVal) as bigint[];
+
+    return {
+      price: Number(price),
+      total: Number(total),
+      slippageBps: Number(slippageBps),
+    };
   }
 
   async getQuoteBalance(

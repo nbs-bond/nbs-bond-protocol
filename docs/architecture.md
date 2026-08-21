@@ -157,7 +157,7 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | POST | /bonds/:id/subscribe | Subscribe to bond |
 | GET | /bonds/:id/holders | List token holders |
 | POST | /bonds/:id/coupon | Trigger coupon distribution (by report_id) |
-| POST | /bonds/:id/claim | Claim accrued credits |
+| POST | /bonds/:id/claim | Claim accrued credits (JWT; claims for the session wallet only) |
 | GET | /bonds/:id/undistributed | Get undistributed coupon dust total |
 | GET | /bonds/:id/periods | Coupon period history (paginated, optional `?include_report=true`) |
 | POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust (admin only) |
@@ -176,38 +176,27 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | GET | /oracle/stats/:providerAddress | Provider stats + slash/challenge history |
 | GET | /oracle/monitoring/staleness | Per-project/provider staleness metric |
 
-### POST /bonds/:id/transfer
+### POST /bonds/:id/claim
 
-Moves bond tokens from the authenticated holder to another address by calling
-`BondIssuer.transfer` directly.
+Claims the caller's accrued coupon credits on `CouponEngine` and zeroes the
+holder's `AccruedCredits` balance for the bond.
 
-- **Not a sale.** This is a unilateral token transfer. There is no escrow and
-  no quote-asset leg, so nothing here is atomic with a payment: the tokens
-  move whether or not the sender is ever paid. Delivery-versus-payment is the
-  DEX's job (`POST /marketplace/list` + `POST /marketplace/buy`), where the
-  order only settles after the token transfer succeeds.
-- **Identity.** The sending address is the `sub` claim of the JWT. The
-  optional `fromAddress` body field is only cross-checked against it: a
+- **Identity.** The claiming address is the `sub` claim of the JWT. The
+  optional `investorAddress` body field is only cross-checked against it: a
   mismatch returns **403** (an authorisation failure), a malformed address
   returns **400**.
-- **Signing.** The API signs with `INVESTOR_SECRET_KEY`, so it can only send
-  from that wallet; any other authenticated caller gets **403**. Accepting a
+- **Signing.** The API signs with `INVESTOR_SECRET_KEY`, so it can only claim
+  for that wallet; any other authenticated caller gets **403**. Accepting a
   wallet-signed XDR is the intended replacement for this server-side custody.
-- **Pre-flight.** A transfer to the sender's own address, a non-positive
-  amount, or an amount above the sender's on-chain balance is rejected with
-  **400** before anything is submitted. A balance that cannot be read is left
-  to the contract rather than assumed to be zero.
-- **Replay exposure (issue #13).** `BondIssuer.transfer` does not take a
-  nonce, unlike `subscribe` and the CouponEngine entrypoints, so the call is
-  submitted without one. Until #13 adds a nonce to `transfer`, a captured
-  authorisation entry for this call can be replayed on-chain; the API layer
-  cannot close that gap on its own.
-- **Confirmation.** `transactionHash` is returned only after `ContractService`
-  has polled the transaction to a terminal ledger state, so it never names a
-  transaction that later failed.
+- **Amount.** `credits` is the value `claim_credits` returned — the balance it
+  actually zeroed — so partial retirements and concurrent accruals are always
+  reflected. Nothing is served from cache.
+- **No-op claims.** When nothing is accrued the endpoint returns
+  `credits: 0` with an empty `transactionHash` instead of submitting a
+  transaction that would consume a nonce and a fee for no effect.
 
 ```json
-{ "bondId": 1, "fromAddress": "G...", "toAddress": "G...", "amount": 250, "transactionHash": "..." }
+{ "bondId": 1, "investorAddress": "G...", "credits": 500, "transactionHash": "..." }
 ```
 
 ## Frontend

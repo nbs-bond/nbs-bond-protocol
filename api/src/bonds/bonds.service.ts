@@ -1,6 +1,7 @@
 import {
   Injectable,
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   InternalServerErrorException,
   UnauthorizedException,
@@ -54,6 +55,14 @@ const BOND_ERROR_CODE = {
   ProjectNotApproved: 8,
   Overflow: 9,
   ReportNotVerified: 10,
+};
+
+const COUPON_ERROR_CODE = {
+  NotInitialized: 1,
+  Unauthorized: 2,
+  InvalidNonce: 3,
+  BondNotFound: 4,
+  AccountingMismatch: 13,
 };
 
 @Injectable()
@@ -333,57 +342,184 @@ export class BondsService {
     };
   }
 
-  async claimCredits(id: number, dto: ClaimCreditsDto): Promise<ClaimCreditsResponse> {
-    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
-    const nonce = await this.nonceService.next(COUPON_ENGINE(), dto.investorAddress);
-
-    const { result, transactionHash } = await this.contractService.invokeContractMethod(
-      COUPON_ENGINE(), 'claim_credits', investorSecret,
-      [
-        Address.fromString(dto.investorAddress).toScVal(),
-        nativeToScVal(BigInt(id), { type: 'u64' }),
-      ],
-      nonce,
+  /**
+   * Claims a bondholder's accrued coupon credits on CouponEngine.
+   *
+   * `sessionAddress` comes from the authenticated JWT (`sub`), which is the
+   * only trusted source of the claimant's identity; `dto.investorAddress` is
+   * optional and merely cross-checked against it (403 on mismatch) so the
+   * frontend can keep sending the wallet address it already has.
+   *
+   * The claimed amount is whatever CouponEngine.claim_credits returns for
+   * this call — the balance it just zeroed — so partial retirements or
+   * concurrent accruals are always reflected; no cached figure is used.
+   * When nothing is accrued the endpoint short-circuits with `credits: 0`
+   * rather than burning a nonce and a transaction fee on a no-op claim.
+   */
+  async claimCredits(
+    id: number,
+    dto: ClaimCreditsDto,
+    sessionAddress: string,
+  ): Promise<ClaimCreditsResponse> {
+    const investorAddress = this.resolveCallerAddress(
+      sessionAddress,
+      dto.investorAddress,
+      'investorAddress',
     );
+    const investorSecret = this.getSigningSecretFor(
+      investorAddress,
+      'Claiming',
+    );
+
+    const accrued = await this.readAccruedTotal(id, investorAddress);
+    if (accrued <= 0) {
+      return {
+        bondId: id,
+        investorAddress,
+        credits: 0,
+        transactionHash: '',
+      };
+    }
+
+    const nonce = await this.nonceService.next(COUPON_ENGINE(), investorAddress);
+
+    let result: xdr.ScVal;
+    let transactionHash: string | undefined;
+    try {
+      ({ result, transactionHash } = await this.contractService.invokeContractMethod(
+        COUPON_ENGINE(), 'claim_credits', investorSecret,
+        [
+          Address.fromString(investorAddress).toScVal(),
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+        ],
+        nonce,
+      ));
+    } catch (error) {
+      throw this.mapClaimError(error, id);
+    }
 
     return {
       bondId: id,
-      investorAddress: dto.investorAddress,
+      investorAddress,
       credits: Number(scValToNative(result)),
       transactionHash: transactionHash || '',
     };
   }
 
   /**
-   * Peer-to-peer transfer of bond tokens between two holders.
-   *
-   * This is a unilateral token movement, NOT a sale: there is no escrow and
-   * no quote-asset leg, so the transfer is not atomic with any payment.
-   * Delivery-versus-payment is the DEX's job (see MarketplaceController);
-   * callers of this endpoint are moving their own tokens off-DEX and settle
-   * the cash leg out of band.
-   *
-   * `sessionAddress` comes from the authenticated JWT (`sub`) and is the only
-   * trusted source of the sender's identity; `dto.fromAddress` is optional
-   * and merely cross-checked against it (403 on mismatch).
-   *
-   * REPLAY EXPOSURE (issue #13): `BondIssuer.transfer` does not take a nonce,
-   * unlike `subscribe`, `issue_bond` and the CouponEngine entrypoints, so the
-   * call is submitted without one -- passing a nonce argument the contract
-   * does not declare would simply fail with a host arity error. Until #13
-   * adds a nonce to `transfer`, a captured authorisation entry for this call
-   * can be replayed on-chain. Once #13 lands, this method should switch to
-   * `invokeContractMethod` with `nonceService.next(BOND_ISSUER(), from)`.
+   * Current (unclaimed) combined credit balance for `holder` on bond `id`.
+   * Read straight from the contract on every call, so it reflects any
+   * retirement or accrual that happened since the last response was cached.
    */
-  async transfer(
-    id: number,
-    dto: TransferBondDto,
+  private async readAccruedTotal(id: number, holder: string): Promise<number> {
+    const totalScVal = await this.contractService.simulateCall({
+      contractAddress: COUPON_ENGINE(), method: 'accrued_credits',
+      args: [
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        Address.fromString(holder).toScVal(),
+      ],
+    });
+    return Number(scValToNative(totalScVal));
+  }
+
+  /**
+   * Resolves the address an authenticated request acts for.
+   *
+   * The session address (JWT `sub`) always wins. A body-supplied address is
+   * accepted only when it is identical; a mismatch is an authorisation
+   * failure (403), not a malformed request (400), because the request is
+   * well-formed — the caller simply is not that address.
+   */
+  private resolveCallerAddress(
     sessionAddress: string,
-  ): Promise<TransferResponse> {
-    const fromAddress = this.resolveCallerAddress(
-      sessionAddress,
-      dto.fromAddress,
-      'fromAddress',
+    suppliedAddress: string | undefined,
+    field: string,
+  ): string {
+    if (!sessionAddress || !/^G[A-Z2-7]{55}$/.test(sessionAddress)) {
+      throw new UnauthorizedException(
+        'Authenticated session does not carry a valid Stellar address',
+      );
+    }
+    if (suppliedAddress && suppliedAddress !== sessionAddress) {
+      throw new ForbiddenException(
+        `${field} does not match the authenticated wallet address`,
+      );
+    }
+    return sessionAddress;
+  }
+
+  /**
+   * Returns the secret key the API signs investor transactions with, after
+   * checking it actually belongs to `address`.
+   *
+   * The API holds a single investor key (INVESTOR_SECRET_KEY), so it can only
+   * sign for that one wallet. Any other authenticated caller gets a 403 rather
+   * than a confusing on-chain auth failure. Accepting a pre-signed XDR from
+   * the wallet is the intended replacement for this server-side custody.
+   */
+  private getSigningSecretFor(address: string, action: string): string {
+    const secret = process.env.INVESTOR_SECRET_KEY || '';
+    if (!secret) {
+      throw new InternalServerErrorException(
+        'Investor signing key is not configured on this deployment',
+      );
+    }
+
+    let signerAddress: string;
+    try {
+      signerAddress = this.stellarService.getKeypairFromSecret(secret).publicKey();
+    } catch {
+      throw new InternalServerErrorException(
+        'Investor signing key is not a valid Stellar secret key',
+      );
+    }
+
+    if (signerAddress !== address) {
+      throw new ForbiddenException(
+        `${action} is temporarily limited to the configured investor wallet`,
+      );
+    }
+    return secret;
+  }
+
+  private mapClaimError(error: unknown, bondId: number): Error {
+    const code = this.extractContractErrorCode(error);
+
+    if (code === COUPON_ERROR_CODE.AccountingMismatch) {
+      return new ConflictException(
+        `Bond #${bondId} has inconsistent credit accounting on-chain; ` +
+        'the claim was rejected rather than settling a mismatched amount.',
+      );
+    }
+    if (code === COUPON_ERROR_CODE.BondNotFound) {
+      return new BadRequestException(`Bond #${bondId} does not exist`);
+    }
+    if (error instanceof Error) {
+      return error;
+    }
+    return new BadRequestException('Failed to claim credits');
+  }
+
+  /** Pulls the numeric contract error code out of a ContractService error. */
+  private extractContractErrorCode(error: unknown): number | undefined {
+    if (!(error instanceof Error)) return undefined;
+    const match = error.message.match(/error code (\d+)/);
+    return match ? Number(match[1]) : undefined;
+  }
+
+  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
+    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
+    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
+
+    const { transactionHash } = await this.contractService.invokeContractMethod(
+      BOND_ISSUER(), 'transfer', investorSecret,
+      [
+        Address.fromString(dto.fromAddress).toScVal(),
+        Address.fromString(dto.toAddress).toScVal(),
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+      ],
+      nonce,
     );
 
     if (dto.toAddress === fromAddress) {

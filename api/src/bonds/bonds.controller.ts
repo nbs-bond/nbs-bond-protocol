@@ -74,14 +74,23 @@ export class BondsController {
     return this.bondsService.distributeCoupon(id, dto);
   }
 
+  /**
+   * Claims the caller's accrued coupon credits for bond `:id`.
+   *
+   * The claiming address is taken from the authenticated session (the JWT
+   * `sub` claim), never from an unverified request field: `investorAddress`
+   * in the body is optional and, when present, must match the session address
+   * or the request is rejected with 403.
+   */
   @Post(':id/claim')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async claimCredits(
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: ClaimCreditsDto,
+    @Req() req: AuthenticatedRequest,
   ): Promise<ClaimCreditsResponse> {
-    return this.bondsService.claimCredits(id, dto);
+    return this.bondsService.claimCredits(id, dto, req.user.walletAddress);
   }
 
   @Get(':id/undistributed')
