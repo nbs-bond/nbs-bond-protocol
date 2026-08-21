@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { ForbiddenException, Injectable, Logger, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { createClient, RedisClientType } from '@redis/client';
 import { KycStatus } from '../common/interfaces/authenticated-request.interface';
 
@@ -25,6 +25,14 @@ const DEFAULT_TTL_SECONDS: Record<KycStatus, number> = {
   // No record / rejected is cached longer than pending.
   [KycStatus.NONE]: 6 * 60 * 60,
 };
+
+/**
+ * Maximum age (seconds) of a stale-cache fallback before it is no longer
+ * considered trustworthy for KYC-gated operations such as bond subscription.
+ * A revoked/expired KYC can otherwise be served for hours or days while the
+ * circuit breaker is open.
+ */
+const DEFAULT_STALE_THRESHOLD_SECONDS = 24 * 60 * 60;
 
 function envPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -55,6 +63,18 @@ export interface KycProviderHealth {
   /** Provider-estimated seconds until the service recovers, when exposed. */
   recoverySeconds?: number;
 }
+
+/** A resolved KYC status plus its freshness metadata. */
+export interface KycStatusResult {
+  status: KycStatus;
+  /** True when the status was served from the outage fallback (last known). */
+  stale: boolean;
+  /** ISO timestamp of when the served status was recorded. */
+  cachedAt: string;
+}
+
+/** Circuit breaker states. */
+export type CircuitBreakerState = 'closed' | 'open' | 'halfOpen';
 
 /** Thin HTTP client for the external KYC provider. */
 export interface KycProviderClient {
@@ -122,35 +142,75 @@ export class HttpKycProviderClient implements KycProviderClient {
   }
 }
 
-/** Simple failure-counting circuit breaker for the KYC provider. */
+/**
+ * Failure-counting circuit breaker for the KYC provider with a `halfOpen`
+ * state. After `threshold` consecutive failures the breaker opens and refuses
+ * calls for `cooldownMs`. Once the cooldown elapses it becomes half-open and
+ * lets a single probe request through: a success closes the circuit, a failure
+ * reopens it for another full cooldown.
+ */
 export class KycCircuitBreaker {
   private consecutiveFailures = 0;
   private openedAt = 0;
+  private state: CircuitBreakerState = 'closed';
+  private probeInFlight = false;
 
   constructor(
     private readonly threshold = envPositiveInt('KYC_CIRCUIT_THRESHOLD', 3),
     private readonly cooldownMs = envPositiveInt('KYC_CIRCUIT_COOLDOWN_MS', 30_000),
   ) {}
 
-  get isOpen(): boolean {
-    if (this.openedAt === 0) return false;
-    return Date.now() - this.openedAt < this.cooldownMs;
+  /** Current state; an elapsed open window lazily becomes `halfOpen`. */
+  get currentState(): CircuitBreakerState {
+    if (this.state === 'open' && Date.now() - this.openedAt >= this.cooldownMs) {
+      this.state = 'halfOpen';
+    }
+    return this.state;
   }
 
-  /** Seconds remaining in the open window; 0 when closed. */
+  get isOpen(): boolean {
+    return this.currentState === 'open';
+  }
+
+  get isHalfOpen(): boolean {
+    return this.currentState === 'halfOpen';
+  }
+
+  /** Seconds remaining in the open window; 0 when closed or half-open. */
   get retryAfterSeconds(): number {
-    if (this.openedAt === 0) return 0;
+    if (this.currentState !== 'open') return 0;
     return Math.max(0, Math.ceil((this.openedAt + this.cooldownMs - Date.now()) / 1000));
+  }
+
+  /** Whether a request may be attempted in the current state. */
+  canAttempt(): boolean {
+    const state = this.currentState;
+    if (state === 'closed') return true;
+    if (state === 'halfOpen' && !this.probeInFlight) {
+      this.probeInFlight = true;
+      return true;
+    }
+    return false;
   }
 
   recordSuccess(): void {
     this.consecutiveFailures = 0;
     this.openedAt = 0;
+    this.state = 'closed';
+    this.probeInFlight = false;
   }
 
   recordFailure(): void {
+    this.probeInFlight = false;
     this.consecutiveFailures += 1;
+    if (this.state === 'halfOpen') {
+      // A failed probe reopens the circuit for a fresh cooldown window.
+      this.state = 'open';
+      this.openedAt = Date.now();
+      return;
+    }
     if (this.consecutiveFailures >= this.threshold) {
+      this.state = 'open';
       this.openedAt = Date.now();
     }
   }
@@ -162,13 +222,18 @@ export class KycService {
   private redis: RedisClientType;
   private readonly provider: KycProviderClient;
   private readonly breaker: KycCircuitBreaker;
+  private readonly staleThresholdSeconds: number;
 
   constructor(
     @Optional() provider: KycProviderClient = new HttpKycProviderClient(),
     @Optional() breaker: KycCircuitBreaker = new KycCircuitBreaker(),
+    @Optional() staleThresholdSeconds?: number,
   ) {
     this.provider = provider;
     this.breaker = breaker;
+    this.staleThresholdSeconds =
+      staleThresholdSeconds ??
+      envPositiveInt('KYC_STALE_THRESHOLD_SECONDS', DEFAULT_STALE_THRESHOLD_SECONDS);
     this.redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
     this.redis.connect().catch(() => {});
   }
@@ -181,24 +246,51 @@ export class KycService {
     return `${this.key(address)}:stale`;
   }
 
+  /** Serialized cache value: the status plus when it was recorded. */
+  private serializeCached(status: KycStatus, cachedAt: string): string {
+    return JSON.stringify({ status, cachedAt });
+  }
+
+  /** Parse a cache value; returns null for missing/unrecognized values. */
+  private parseCached(raw: string | null): { status: KycStatus; cachedAt: string } | null {
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as { status?: string; cachedAt?: string };
+      if (
+        parsed &&
+        typeof parsed.status === 'string' &&
+        (Object.values(KycStatus) as string[]).includes(parsed.status)
+      ) {
+        return {
+          status: parsed.status as KycStatus,
+          cachedAt: parsed.cachedAt || new Date(0).toISOString(),
+        };
+      }
+    } catch {
+      // Fall through: legacy/plain values are treated as unrecognized.
+    }
+    return null;
+  }
+
   /**
    * Resolve the KYC status for `address`. Serves the Redis cache when fresh;
    * on a cache miss the live provider is consulted and the result cached
    * with a per-state TTL (plus an unbounded "last known" mirror for outage
    * fallback). When the provider is unreachable the circuit breaker trips
-   * after `KYC_CIRCUIT_THRESHOLD` consecutive failures; while open, and on
-   * transient failures, the last known status is served so subscriptions do
-   * not fail while the provider recovers. With no cache and no provider, a
-   * 503 is raised whose `retryAfterSeconds` reflects the provider's own
-   * recovery estimate when its health endpoint exposes one.
+   * after `KYC_CIRCUIT_THRESHOLD` consecutive failures; while open/half-open,
+   * and on transient failures, the last known status is served (flagged as
+   * `stale`) so subscriptions do not fail while the provider recovers. With no
+   * cache and no provider, a 503 is raised whose `retryAfterSeconds` reflects
+   * the provider's own recovery estimate when its health endpoint exposes one.
    */
-  async getStatus(address: string): Promise<KycStatus> {
+  async getStatus(address: string): Promise<KycStatusResult> {
     const cacheKey = this.key(address);
-    const cached = await this.redis.get(cacheKey);
-    if (cached && (Object.values(KycStatus) as string[]).includes(cached)) {
-      return cached as KycStatus;
-    }
+    const cachedRaw = await this.redis.get(cacheKey);
+    const cached = this.parseCached(cachedRaw);
     if (cached) {
+      return { status: cached.status, stale: false, cachedAt: cached.cachedAt };
+    }
+    if (cachedRaw) {
       // Unrecognized value (e.g. written by an older version): drop it.
       await this.redis.del(cacheKey);
     }
@@ -206,21 +298,24 @@ export class KycService {
     if (!this.provider.isConfigured()) {
       // Dev mode without a provider: no live call is possible, behave as
       // before and report the neutral state.
-      return KycStatus.PENDING;
+      return { status: KycStatus.PENDING, stale: false, cachedAt: new Date().toISOString() };
     }
 
-    const lastKnown = await this.redis.get(this.staleKey(address));
-    if (this.breaker.isOpen) {
+    const lastKnown = this.parseCached(await this.redis.get(this.staleKey(address)));
+    if (!this.breaker.canAttempt()) {
       this.logger.warn(`KYC provider circuit open; serving last known status for ${address}`);
-      if (lastKnown) return lastKnown as KycStatus;
+      if (lastKnown) {
+        return { status: lastKnown.status, stale: true, cachedAt: lastKnown.cachedAt };
+      }
       throw await this.providerUnavailable('KYC provider is unavailable (circuit open)');
     }
 
     try {
       const status = await this.provider.checkStatus(address);
       this.breaker.recordSuccess();
-      await this.cacheStatus(address, status);
-      return status;
+      const cachedAt = new Date().toISOString();
+      await this.cacheStatus(address, status, cachedAt);
+      return { status, stale: false, cachedAt };
     } catch (error) {
       this.breaker.recordFailure();
       this.logger.warn(
@@ -229,7 +324,7 @@ export class KycService {
       if (lastKnown) {
         // Stale-while-error fallback: serve the last known status rather
         // than failing the subscription while the provider recovers.
-        return lastKnown as KycStatus;
+        return { status: lastKnown.status, stale: true, cachedAt: lastKnown.cachedAt };
       }
       throw await this.providerUnavailable(
         'KYC provider is unavailable; please retry shortly',
@@ -252,16 +347,51 @@ export class KycService {
     await this.redis.del(this.staleKey(address));
   }
 
+  /**
+   * Whether `address` satisfies `requiredStatus`. Stale statuses served from
+   * the outage fallback are rejected once they are older than the configurable
+   * `KYC_STALE_THRESHOLD_SECONDS` (default 24h) so a revoked/expired KYC can
+   * never be relied upon for KYC-gated operations while the provider is down.
+   */
   async isEligible(address: string, requiredStatus: KycStatus): Promise<boolean> {
-    const actual = await this.getStatus(address);
-    return this.compareStatus(actual, requiredStatus);
+    const result = await this.getStatus(address);
+    if (result.stale && this.isStaleBeyondThreshold(result.cachedAt)) {
+      throw new ForbiddenException(
+        'KYC status is stale; fresh verification is required before subscribing',
+      );
+    }
+    return this.compareStatus(result.status, requiredStatus);
   }
 
-  private async cacheStatus(address: string, status: KycStatus): Promise<void> {
-    await this.redis.set(this.key(address), status, { EX: this.ttlFor(status) });
+  /**
+   * Snapshot of the circuit breaker for health reporting.
+   */
+  getCircuitBreakerHealth(): {
+    state: CircuitBreakerState;
+    retryAfterSeconds: number;
+    staleThresholdSeconds: number;
+  } {
+    return {
+      state: this.breaker.currentState,
+      retryAfterSeconds: this.breaker.retryAfterSeconds,
+      staleThresholdSeconds: this.staleThresholdSeconds,
+    };
+  }
+
+  private isStaleBeyondThreshold(cachedAt: string): boolean {
+    const cachedAtMs = Date.parse(cachedAt);
+    if (!Number.isFinite(cachedAtMs)) return true;
+    return Date.now() - cachedAtMs > this.staleThresholdSeconds * 1000;
+  }
+
+  private async cacheStatus(address: string, status: KycStatus, cachedAt?: string): Promise<void> {
+    const at = cachedAt ?? new Date().toISOString();
+    await this.redis.set(this.key(address), this.serializeCached(status, at), {
+      EX: this.ttlFor(status),
+    });
     // Unbounded mirror used as the outage fallback; refreshed on every
     // successful provider read.
-    await this.redis.set(this.staleKey(address), status);
+    await this.redis.set(this.staleKey(address), this.serializeCached(status, at));
   }
 
   private ttlFor(status: KycStatus): number {

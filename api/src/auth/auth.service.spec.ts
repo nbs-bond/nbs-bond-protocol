@@ -44,7 +44,11 @@ describe("AuthService", () => {
         {
           provide: KycService,
           useValue: {
-            getStatus: jest.fn().mockResolvedValue("VERIFIED"),
+            getStatus: jest.fn().mockResolvedValue({
+              status: "VERIFIED",
+              stale: false,
+              cachedAt: "2026-01-01T00:00:00.000Z",
+            }),
           },
         },
         {
@@ -186,6 +190,8 @@ describe("AuthService", () => {
       expect(profile).toEqual({
         walletAddress: validAddress,
         kycStatus: "VERIFIED",
+        stale: false,
+        cachedAt: "2026-01-01T00:00:00.000Z",
         createdAt: expect.any(String),
       });
     });

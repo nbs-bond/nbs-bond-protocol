@@ -80,10 +80,12 @@ export class AuthService {
   }
 
   async getProfile(userId: string): Promise<UserProfileResponse> {
-    const kycStatus = await this.kycService.getStatus(userId);
+    const kyc = await this.kycService.getStatus(userId);
     return {
       walletAddress: userId,
-      kycStatus,
+      kycStatus: kyc.status,
+      stale: kyc.stale,
+      cachedAt: kyc.cachedAt,
       createdAt: new Date().toISOString(),
     };
   }

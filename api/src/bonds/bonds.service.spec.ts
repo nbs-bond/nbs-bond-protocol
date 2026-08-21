@@ -1,5 +1,5 @@
 import { Test } from '@nestjs/testing';
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { xdr, scValToNative, nativeToScVal, Address, Keypair } from '@stellar/stellar-sdk';
 
 // BigInt is not JSON-serializable by default.  Jest workers use JSON.stringify
@@ -790,6 +790,37 @@ describe('BondsService', () => {
       ).rejects.toMatchObject({
         status: 403,
         message: 'KYC verification required before subscribing to a bond',
+      });
+      expect(kycService.isEligible).toHaveBeenCalledWith('GABC', 'verified');
+    });
+
+    it('rejects subscription when KYC status is stale', async () => {
+      const kycService = {
+        isEligible: jest.fn().mockRejectedValue(
+          new ForbiddenException(
+            'KYC status is stale; fresh verification is required before subscribing',
+          ),
+        ),
+      };
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: {} },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycService },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      await expect(
+        svc.subscribe(1, { investorAddress: 'GABC', amount: 100 }),
+      ).rejects.toMatchObject({
+        status: 403,
+        message: 'KYC status is stale; fresh verification is required before subscribing',
       });
       expect(kycService.isEligible).toHaveBeenCalledWith('GABC', 'verified');
     });
