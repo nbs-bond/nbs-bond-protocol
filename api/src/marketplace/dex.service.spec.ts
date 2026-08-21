@@ -1,5 +1,5 @@
 import { Test } from '@nestjs/testing';
-import { nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
+import { nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
 import { DexService } from './dex.service';
@@ -346,6 +346,31 @@ describe('DexService', () => {
       const raw = makeRawOrder({ status: index });
 
       expect((service as any).decodeOrder(raw).status).toBe(expected);
+    });
+  });
+
+  describe('getBestPrice', () => {
+    it('decodes an on-chain quote from exactly one simulation', async () => {
+      simulateCallMock.mockResolvedValue(
+        xdr.ScVal.scvVec([
+          nativeToScVal(BigInt(15), { type: 'i128' }),
+          nativeToScVal(BigInt(150), { type: 'i128' }),
+          nativeToScVal(BigInt(5_000), { type: 'i128' }),
+        ]),
+      );
+
+      await expect(service.getBestPrice(7, 'buy', 10)).resolves.toEqual({
+        price: 15,
+        total: 150,
+        slippageBps: 5_000,
+      });
+
+      expect(simulateCallMock).toHaveBeenCalledTimes(1);
+      const call = simulateCallMock.mock.calls[0][0];
+      expect(call.method).toBe('get_best_price');
+      expect(scValToNative(call.args[0])).toBe(BigInt(7));
+      expect(scValToNative(call.args[1])).toEqual(['Buy']);
+      expect(scValToNative(call.args[2])).toBe(BigInt(10));
     });
   });
 

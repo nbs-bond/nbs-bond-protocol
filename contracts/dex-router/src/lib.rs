@@ -47,6 +47,13 @@ pub enum OrderStatus {
     Expired,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[contracttype]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
 fn require_admin(env: &Env, caller: &Address) -> Result<(), DEXError> {
     let admin: Address = env
         .storage()
@@ -497,6 +504,116 @@ impl DEXRouter {
             .unwrap_or(0)
     }
 
+    /// Quotes a market-sized fill without requiring the caller to fetch every
+    /// order over RPC. The returned tuple is `(average_price, total,
+    /// slippage_bps)`, where one basis point is 0.01%.
+    pub fn get_best_price(
+        env: Env,
+        bond_id: u64,
+        side: Side,
+        amount: i128,
+    ) -> Result<(i128, i128, i128), DEXError> {
+        if amount <= 0 {
+            return Err(DEXError::ZeroAmount);
+        }
+
+        let bond_orders_key = DataKey::BondOrders(bond_id);
+        let order_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&bond_orders_key)
+            .unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&bond_orders_key) {
+            bump_persistent(&env, &bond_orders_key);
+        }
+
+        // Keep the quote deterministic for equal price levels by using order
+        // id (time priority) as the secondary key.
+        let mut sorted: Vec<Order> = Vec::new(&env);
+        for order_id in order_ids.iter() {
+            let key = DataKey::Order(order_id);
+            let Some(order) = env.storage().persistent().get::<DataKey, Order>(&key) else {
+                continue;
+            };
+            bump_persistent(&env, &key);
+
+            if order.bond_id != bond_id
+                || order.amount <= 0
+                || (order.status != OrderStatus::Open
+                    && order.status != OrderStatus::PartiallyFilled)
+                || is_order_expired(&env, &order)
+            {
+                continue;
+            }
+
+            let mut position = 0;
+            while position < sorted.len() {
+                let current = sorted.get(position).unwrap();
+                let precedes = match side {
+                    Side::Buy => {
+                        order.price_per_token < current.price_per_token
+                            || (order.price_per_token == current.price_per_token
+                                && order.id < current.id)
+                    }
+                    Side::Sell => {
+                        order.price_per_token > current.price_per_token
+                            || (order.price_per_token == current.price_per_token
+                                && order.id < current.id)
+                    }
+                };
+                if precedes {
+                    break;
+                }
+                position += 1;
+            }
+            sorted.insert(position, order);
+        }
+
+        let Some(first) = sorted.first() else {
+            return Ok((0, 0, 0));
+        };
+        let best_price = first.price_per_token;
+        let mut remaining = amount;
+        let mut filled = 0i128;
+        let mut total = 0i128;
+
+        for order in sorted.iter() {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(order.amount);
+            let cost = take
+                .checked_mul(order.price_per_token)
+                .ok_or(DEXError::Overflow)?;
+            total = total.checked_add(cost).ok_or(DEXError::Overflow)?;
+            filled = filled.checked_add(take).ok_or(DEXError::Overflow)?;
+            remaining -= take;
+        }
+
+        if filled == 0 {
+            return Ok((0, 0, 0));
+        }
+
+        let average_price = total / filled;
+        let ideal_total = filled
+            .checked_mul(best_price)
+            .ok_or(DEXError::Overflow)?;
+        let adverse_delta = match side {
+            Side::Buy => total.saturating_sub(ideal_total),
+            Side::Sell => ideal_total.saturating_sub(total),
+        };
+        let slippage_bps = if ideal_total > 0 {
+            adverse_delta
+                .checked_mul(10_000)
+                .ok_or(DEXError::Overflow)?
+                / ideal_total
+        } else {
+            0
+        };
+
+        Ok((average_price, total, slippage_bps))
+    }
+
     pub fn clean_expired_orders(
         env: Env,
         caller: Address,
@@ -672,6 +789,70 @@ mod test {
         assert_eq!(seller_orders.get(0).unwrap(), order_id);
 
         assert_eq!(client.order_count(), 1);
+    }
+
+    #[test]
+    fn test_get_best_price_quotes_multiple_levels_in_one_call() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+        let contract_id = env.register(
+            DEXRouter,
+            (admin, issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+        let quote_asset = Symbol::new(&env, "USDC");
+
+        client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &5i128,
+            &20i128,
+            &quote_asset,
+            &3_600u64,
+            &0,
+        );
+        client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &5i128,
+            &10i128,
+            &quote_asset,
+            &3_600u64,
+            &1,
+        );
+
+        let (average_price, total, slippage_bps) =
+            client.get_best_price(&bond_id, &Side::Buy, &10i128);
+
+        assert_eq!(average_price, 15);
+        assert_eq!(total, 150);
+        assert_eq!(slippage_bps, 5_000);
+    }
+
+    #[test]
+    fn test_get_best_price_handles_empty_and_rejects_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(
+            DEXRouter,
+            (admin, Address::generate(&env), Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.get_best_price(&99, &Side::Buy, &10),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            client.try_get_best_price(&99, &Side::Buy, &0),
+            Err(Ok(DEXError::ZeroAmount))
+        );
     }
 
     #[test]
