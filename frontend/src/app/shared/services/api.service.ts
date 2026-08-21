@@ -64,13 +64,6 @@ export class ApiService {
     );
   }
 
-  getAccruedCredits(id: number, holder: string): Observable<AccruedCreditsResponse> {
-    return this.http.get<AccruedCreditsResponse>(
-      `/api/bonds/${id}/accrued`,
-      { params: { holder }, headers: this.headers() },
-    );
-  }
-
   transferBond(id: number, toAddress: string, amount: number): Observable<TransferResponse> {
     const fromAddress = this.walletService.address();
     return this.http.post<TransferResponse>(

@@ -677,17 +677,6 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     return this.formatCountdown(b.maturityDate * 1000 - this.now());
   });
 
-  readonly claimableTotal = computed(() => {
-    const acc = this.accruedCredits();
-    if (!acc) return 0;
-    return acc.carbon + acc.biodiversity;
-  });
-
-  readonly claimDisabled = computed(() => {
-    if (this.claimSubmitting()) return true;
-    return this.accruedCredits() !== null && this.claimableTotal() <= 0;
-  });
-
   private maturityTimer?: ReturnType<typeof setInterval>;
 
   // Computed signal that tracks when to load undistributed data
@@ -787,14 +776,6 @@ export class BondDetailComponent implements OnInit, OnDestroy {
     return parts.join(" ");
   }
 
-  claimLabel(): string {
-    if (this.claimSubmitting()) return 'Claiming...';
-    if (this.accruedCredits() !== null) {
-      return `Claim ${this.claimableTotal()} credits`;
-    }
-    return 'Claim Accrued Credits';
-  }
-
   ngOnInit(): void {
     const id = Number(this.route.snapshot.paramMap.get("id"));
     if (!id) {
@@ -807,32 +788,12 @@ export class BondDetailComponent implements OnInit, OnDestroy {
       next: (bond) => {
         this.bond.set(bond);
         this.loading.set(false);
-        this.loadAccruedCredits();
       },
       error: (err) => {
         this.error.set(
           err.status === 404 ? "Bond not found" : "Failed to load bond",
         );
         this.loading.set(false);
-      },
-    });
-  }
-
-  private loadAccruedCredits(): void {
-    const b = this.bond();
-    const holder = this.walletService.address();
-    if (!b || !holder) return;
-
-    this.accruedLoading.set(true);
-    this.accruedError.set('');
-    this.apiService.getAccruedCredits(b.id, holder).subscribe({
-      next: (accrued) => {
-        this.accruedCredits.set(accrued);
-        this.accruedLoading.set(false);
-      },
-      error: () => {
-        this.accruedError.set('Failed to load accrued credits');
-        this.accruedLoading.set(false);
       },
     });
   }

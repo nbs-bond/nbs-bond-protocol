@@ -88,7 +88,9 @@ describe('DashboardComponent', () => {
         ),
       getAccruedCredits: jasmine
         .createSpy('getAccruedCredits')
-        .and.returnValue(of({ bondId: 1, holder: HOLDER, carbon: 0, biodiversity: 0 })),
+        .and.returnValue(
+          of({ bondId: 1, holder: HOLDER, total: 0, perCreditType: [] }),
+        ),
     };
     walletService = { address: signal<string | null>(null) };
 
@@ -128,8 +130,24 @@ describe('DashboardComponent', () => {
     apiService.getAccruedCredits.and.callFake((id: number) =>
       of(
         id === 1
-          ? { bondId: 1, holder: HOLDER, carbon: 120, biodiversity: 30 }
-          : { bondId: 2, holder: HOLDER, carbon: 10, biodiversity: 5 },
+          ? {
+              bondId: 1,
+              holder: HOLDER,
+              total: 150,
+              perCreditType: [
+                { creditType: 'Carbon', amount: 120 },
+                { creditType: 'Biodiversity', amount: 30 },
+              ],
+            }
+          : {
+              bondId: 2,
+              holder: HOLDER,
+              total: 15,
+              perCreditType: [
+                { creditType: 'Carbon', amount: 10 },
+                { creditType: 'Biodiversity', amount: 5 },
+              ],
+            },
       ),
     );
     fixture.detectChanges();

@@ -36,13 +36,6 @@ const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
 const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
 const ORACLE_CONSUMER = () => process.env.ORACLE_CONSUMER_ADDRESS || '';
 
-// Soroban `CreditType` unit enum variants are encoded as their u32 discriminant
-// (see contracts/shared/src/types.rs).
-const CREDIT_TYPE_DISCRIMINANT = {
-  Carbon: 0,
-  Biodiversity: 1,
-} as const;
-
 const BOND_ERROR_CODE = {
   NotInitialized: 1,
   Unauthorized: 2,

@@ -146,10 +146,20 @@ export class DashboardComponent implements OnInit {
   readonly carbonTotal = signal(0);
 
   readonly accruedCarbon = computed(() =>
-    Object.values(this.accruedCredits()).reduce((sum, acc) => sum + acc.carbon, 0),
+    Object.values(this.accruedCredits()).reduce(
+      (sum, acc) =>
+        sum +
+        (acc.perCreditType.find((e) => e.creditType === 'Carbon')?.amount ?? 0),
+      0,
+    ),
   );
   readonly accruedBiodiversity = computed(() =>
-    Object.values(this.accruedCredits()).reduce((sum, acc) => sum + acc.biodiversity, 0),
+    Object.values(this.accruedCredits()).reduce(
+      (sum, acc) =>
+        sum +
+        (acc.perCreditType.find((e) => e.creditType === 'Biodiversity')?.amount ?? 0),
+      0,
+    ),
   );
 
   ngOnInit(): void {

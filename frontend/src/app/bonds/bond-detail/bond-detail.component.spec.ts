@@ -45,9 +45,6 @@ describe('BondDetailComponent', () => {
     apiService.getUndistributedTotal.and.returnValue(
       of({ bondId: 1, undistributedTotal: 7 }),
     );
-    apiService.getAccruedCredits.and.returnValue(
-      of({ bondId: 1, holder: '', carbon: 0, biodiversity: 0 }),
-    );
     apiService.sweepUndistributed.and.returnValue(
       of({ bondId: 1, swept: 7, transactionHash: '0xabc' }),
     );
@@ -193,60 +190,6 @@ describe('BondDetailComponent', () => {
     expect(fixture.nativeElement.textContent).toContain('frozen for trading');
     expect(fixture.nativeElement.querySelector('.subscribe-btn')).toBeNull();
     expect(fixture.nativeElement.querySelector('.transfer-btn')).toBeNull();
-    discardPeriodicTasks();
-  }));
-
-  it('displays accrued carbon/biodiversity credits and the claimable amount', fakeAsync(() => {
-    walletService.address.set(
-      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-    );
-    apiService.getAccruedCredits.and.returnValue(
-      of({
-        bondId: 1,
-        holder: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-        carbon: 120,
-        biodiversity: 30,
-      }),
-    );
-    createFixture();
-
-    const section = fixture.nativeElement.querySelector(
-      '.claim-section',
-    ) as HTMLElement;
-    expect(section).not.toBeNull();
-    expect(section.textContent).toContain('Carbon');
-    expect(section.textContent).toContain('120');
-    expect(section.textContent).toContain('Biodiversity');
-    expect(section.textContent).toContain('30');
-    expect(section.textContent).toContain('Claim 150 credits');
-
-    const claimBtn = fixture.nativeElement.querySelector(
-      '.claim-btn',
-    ) as HTMLButtonElement;
-    expect(claimBtn).not.toBeNull();
-    expect(claimBtn.disabled).toBe(false);
-    discardPeriodicTasks();
-  }));
-
-  it('disables the Claim Credits button when the claimable amount is zero', fakeAsync(() => {
-    walletService.address.set(
-      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-    );
-    apiService.getAccruedCredits.and.returnValue(
-      of({
-        bondId: 1,
-        holder: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-        carbon: 0,
-        biodiversity: 0,
-      }),
-    );
-    createFixture();
-
-    const claimBtn = fixture.nativeElement.querySelector(
-      '.claim-btn',
-    ) as HTMLButtonElement;
-    expect(claimBtn).not.toBeNull();
-    expect(claimBtn.disabled).toBe(true);
     discardPeriodicTasks();
   }));
 

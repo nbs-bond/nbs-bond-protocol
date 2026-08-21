@@ -1,6 +1,6 @@
 import { Component, input, output, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { Bond } from '../../interfaces/bond.interface';
+import { Bond, AccruedCreditsResponse } from '../../interfaces/bond.interface';
 import { StatusBadgeComponent } from '../status-badge/status-badge.component';
 
 @Component({
@@ -41,11 +41,11 @@ import { StatusBadgeComponent } from '../status-badge/status-badge.component';
         @if (accruedCredits(); as acc) {
           <div class="bond-field">
             <span class="label">Accrued Carbon</span>
-            <span class="value">{{ acc.carbon | number }}</span>
+            <span class="value">{{ accruedAmount('Carbon') | number }}</span>
           </div>
           <div class="bond-field">
             <span class="label">Accrued Biodiversity</span>
-            <span class="value">{{ acc.biodiversity | number }}</span>
+            <span class="value">{{ accruedAmount('Biodiversity') | number }}</span>
           </div>
         }
       </div>
@@ -71,8 +71,15 @@ import { StatusBadgeComponent } from '../status-badge/status-badge.component';
 })
 export class BondCardComponent {
   readonly bond = input.required<Bond>();
-  readonly accruedCredits = input<{ carbon: number; biodiversity: number } | null>(null);
+  readonly accruedCredits = input<AccruedCreditsResponse | null>(null);
   readonly subscribe = output<string>();
+
+  accruedAmount(creditType: string): number {
+    const acc = this.accruedCredits();
+    return (
+      acc?.perCreditType.find((e) => e.creditType === creditType)?.amount ?? 0
+    );
+  }
 
   String(value: number): string {
     return String(value);
