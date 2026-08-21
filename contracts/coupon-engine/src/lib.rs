@@ -291,7 +291,7 @@ impl CouponEngine {
                 if report.status != ReportStatus::Verified {
                     return Err(CouponEngineError::ReportNotVerified);
                 }
-                if report.project_id != project_id {
+                if report.project_metadata_hash != project_id {
                     return Err(CouponEngineError::BondNotFound);
                 }
 
@@ -615,7 +615,11 @@ impl CouponEngine {
         };
         env.storage()
             .persistent()
-            .get(&DataKey::AccruedCreditsByType(bond_id, holder, storage_type))
+            .get(&DataKey::AccruedCreditsByType(
+                bond_id,
+                holder,
+                storage_type,
+            ))
             .unwrap_or(0)
     }
 
@@ -1159,6 +1163,12 @@ mod test {
         let issuer_id = env.register(nbbs_bond_issuer::BondIssuer, (issuer_admin.clone(),));
         let oracle_id = env.register(nbbs_oracle_consumer::OracleConsumer, (admin.clone(),));
         let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
+        env.as_contract(&oracle_id, || {
+            env.storage().instance().set(
+                &nbbs_oracle_consumer::DataKey::ProjectRegistry,
+                &registry_id,
+            );
+        });
         let ce_id = env.register(
             CouponEngine,
             (
@@ -1220,6 +1230,8 @@ mod test {
         admin_nonce: u64,
     ) -> u64 {
         let oc = nbbs_oracle_consumer::OracleConsumerClient::new(env, &t.oracle_id);
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &t.registry_id);
+        let registry_project_id = registry.get_project_by_hash(project_id).id;
         let provider = Address::generate(env);
         oc.register_provider(
             &t.admin,
@@ -1229,7 +1241,7 @@ mod test {
         );
         let report_id = oc.submit_report(
             &provider,
-            project_id,
+            &registry_project_id,
             &1000u64,
             &2000u64,
             &carbon,
@@ -1240,7 +1252,12 @@ mod test {
         );
         // Admins cannot count toward the provider threshold; verified reports
         // in tests go through the explicit auditable override path.
-        oc.admin_override_report(&t.admin, &report_id, &ReportStatus::Verified, &(admin_nonce + 1));
+        oc.admin_override_report(
+            &t.admin,
+            &report_id,
+            &ReportStatus::Verified,
+            &(admin_nonce + 1),
+        );
         report_id
     }
 
@@ -1253,6 +1270,8 @@ mod test {
         admin_nonce: u64,
     ) -> u64 {
         let oc = nbbs_oracle_consumer::OracleConsumerClient::new(env, &t.oracle_id);
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &t.registry_id);
+        let registry_project_id = registry.get_project_by_hash(project_id).id;
         let provider = Address::generate(env);
         oc.register_provider(
             &t.admin,
@@ -1262,7 +1281,7 @@ mod test {
         );
         oc.submit_report(
             &provider,
-            project_id,
+            &registry_project_id,
             &1000u64,
             &2000u64,
             &carbon,
@@ -1535,11 +1554,9 @@ mod test {
         assert_eq!(by_type_blue, 100);
 
         // Carbon lookup resolves to the same shared bucket.
-        let by_type_carbon = t.client.accrued_credits_by_type(
-            &bond_id,
-            &holder,
-            &nbbs_shared::CreditType::Carbon,
-        );
+        let by_type_carbon =
+            t.client
+                .accrued_credits_by_type(&bond_id, &holder, &nbbs_shared::CreditType::Carbon);
         assert_eq!(by_type_carbon, 100);
     }
 

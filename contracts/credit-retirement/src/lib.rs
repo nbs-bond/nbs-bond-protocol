@@ -3,12 +3,12 @@
 // Contract entrypoints carry the full provenance a certificate needs; the
 // generated client/args code inherits the arity, so the allow has to be crate-wide.
 #![allow(clippy::too_many_arguments)]
+use nbbs_coupon_engine::PeriodInfo;
+use nbbs_shared::{CouponEngineError, CreditError, CreditType};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
     Val, Vec,
 };
-use nbbs_coupon_engine::PeriodInfo;
-use nbbs_shared::{CouponEngineError, CreditError, CreditType};
 
 /// Ledgers closed in a day at the network's ~5 second close time.
 const LEDGERS_PER_DAY: u32 = 17_280;
@@ -283,11 +283,7 @@ impl CreditRetirement {
         let period = match env.try_invoke_contract::<PeriodInfo, CouponEngineError>(
             &coupon_engine,
             &Symbol::new(&env, "get_period_info"),
-            vec![
-                &env,
-                bond_id.into_val(&env),
-                period_index.into_val(&env),
-            ],
+            vec![&env, bond_id.into_val(&env), period_index.into_val(&env)],
         ) {
             Ok(Ok(period)) => period,
             _ => return Err(CreditError::PeriodNotFound),
@@ -361,7 +357,11 @@ impl CreditRetirement {
         let mut retirements: Vec<u64> =
             read(&env, &DataKey::HolderRetirements(holder.clone())).unwrap_or(vec![&env]);
         retirements.push_back(retirement_id);
-        write(&env, &DataKey::HolderRetirements(holder.clone()), &retirements);
+        write(
+            &env,
+            &DataKey::HolderRetirements(holder.clone()),
+            &retirements,
+        );
 
         let bond_holder_key = DataKey::BondHolderRetirements(bond_id, holder.clone());
         let mut bond_retirements: Vec<u64> = read(&env, &bond_holder_key).unwrap_or(vec![&env]);
@@ -391,8 +391,8 @@ impl CreditRetirement {
         env: Env,
         retirement_id: u64,
     ) -> Result<RetirementCertificate, CreditError> {
-        let record: RetirementRecord =
-            read(&env, &DataKey::Retirement(retirement_id)).ok_or(CreditError::InsufficientCredits)?;
+        let record: RetirementRecord = read(&env, &DataKey::Retirement(retirement_id))
+            .ok_or(CreditError::InsufficientCredits)?;
         Ok(certificate_from_record(&record))
     }
 
@@ -465,13 +465,13 @@ impl CreditRetirement {
 #[cfg(test)]
 mod test {
     use super::*;
+    use nbbs_bond_issuer::{BondIssuer, BondIssuerClient};
+    use nbbs_coupon_engine::{CouponEngine, CouponEngineClient};
+    use nbbs_shared::{BiodiversityMetrics, BondConfig, ReportStatus};
     use soroban_sdk::{
         testutils::{storage::Persistent as _, Address as _, Ledger as _},
         vec as svec, BytesN, Env, Symbol,
     };
-    use nbbs_bond_issuer::{BondIssuer, BondIssuerClient};
-    use nbbs_coupon_engine::{CouponEngine, CouponEngineClient};
-    use nbbs_shared::{BiodiversityMetrics, BondConfig, ReportStatus};
 
     fn make_certificate_hash(env: &Env, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
@@ -522,8 +522,24 @@ mod test {
         period_end: u64,
         admin_nonce: u64,
     ) -> u64 {
-        let oc_client =
-            nbbs_oracle_consumer::OracleConsumerClient::new(env, oracle_id);
+        let oc_client = nbbs_oracle_consumer::OracleConsumerClient::new(env, oracle_id);
+        let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &registry_id);
+        let owner = Address::generate(env);
+        let registry_project_id = registry.register_project(
+            &owner,
+            project_id,
+            &Symbol::new(env, "VCS"),
+            &Symbol::new(env, "US"),
+            &0,
+        );
+        registry.approve_project(admin, &registry_project_id, &0);
+        env.as_contract(oracle_id, || {
+            env.storage().instance().set(
+                &nbbs_oracle_consumer::DataKey::ProjectRegistry,
+                &registry_id,
+            );
+        });
         let provider = Address::generate(env);
         oc_client.register_provider(
             admin,
@@ -533,7 +549,7 @@ mod test {
         );
         let report_id = oc_client.submit_report(
             &provider,
-            project_id,
+            &registry_project_id,
             &period_start,
             &period_end,
             &carbon,
@@ -544,7 +560,12 @@ mod test {
         );
         // Admins cannot count toward the provider threshold; verified reports
         // in tests go through the explicit auditable override path.
-        oc_client.admin_override_report(admin, &report_id, &ReportStatus::Verified, &(admin_nonce + 1));
+        oc_client.admin_override_report(
+            admin,
+            &report_id,
+            &ReportStatus::Verified,
+            &(admin_nonce + 1),
+        );
         report_id
     }
 
@@ -585,12 +606,8 @@ mod test {
         let bond_id = issuer_client.issue_bond(&issuer_admin, &bond_config, &0);
         issuer_client.subscribe(&holder, &bond_id, &10_000, &0);
 
-        let oracle_id = env.register(
-            nbbs_oracle_consumer::OracleConsumer,
-            (admin.clone(),),
-        );
-        let report_id =
-            submit_verified_report(&env, &admin, &oracle_id, &project_id, 100_000);
+        let oracle_id = env.register(nbbs_oracle_consumer::OracleConsumer, (admin.clone(),));
+        let report_id = submit_verified_report(&env, &admin, &oracle_id, &project_id, 100_000);
 
         let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
         let registry = nbbs_project_registry::ProjectRegistryClient::new(&env, &registry_id);
@@ -606,7 +623,12 @@ mod test {
 
         let ce_id = env.register(
             CouponEngine,
-            (admin.clone(), issuer_id.clone(), oracle_id.clone(), registry_id.clone()),
+            (
+                admin.clone(),
+                issuer_id.clone(),
+                oracle_id.clone(),
+                registry_id.clone(),
+            ),
         );
         let ce_client = CouponEngineClient::new(&env, &ce_id);
 
@@ -847,12 +869,8 @@ mod test {
         issuer_client.subscribe(&holder1, &bond_id, &3_000, &0);
         issuer_client.subscribe(&holder2, &bond_id, &7_000, &0);
 
-        let oracle_id = env.register(
-            nbbs_oracle_consumer::OracleConsumer,
-            (admin.clone(),),
-        );
-        let report_id =
-            submit_verified_report(&env, &admin, &oracle_id, &project_id, 100_000);
+        let oracle_id = env.register(nbbs_oracle_consumer::OracleConsumer, (admin.clone(),));
+        let report_id = submit_verified_report(&env, &admin, &oracle_id, &project_id, 100_000);
 
         let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
         let registry = nbbs_project_registry::ProjectRegistryClient::new(&env, &registry_id);
@@ -868,7 +886,12 @@ mod test {
 
         let ce_id = env.register(
             CouponEngine,
-            (admin.clone(), issuer_id.clone(), oracle_id.clone(), registry_id.clone()),
+            (
+                admin.clone(),
+                issuer_id.clone(),
+                oracle_id.clone(),
+                registry_id.clone(),
+            ),
         );
         let ce_client = CouponEngineClient::new(&env, &ce_id);
 
@@ -881,7 +904,11 @@ mod test {
         ce_client.register_deduct_caller(&admin, &cr_id, &0);
         ce_client.register_bond(&admin, &bond_id, &project_id, &1);
 
-        let holders = svec![&env, (holder1.clone(), 3_000i128), (holder2.clone(), 7_000i128)];
+        let holders = svec![
+            &env,
+            (holder1.clone(), 3_000i128),
+            (holder2.clone(), 7_000i128)
+        ];
         ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2, &true);
 
         let accrued1 = ce_client.accrued_credits(&bond_id, &holder1);
@@ -1185,16 +1212,16 @@ mod test {
         // Let the entry age most of the way to expiry, then bump it back out.
         let aged_by = RETIREMENT_TTL_EXTEND_TO - RETIREMENT_TTL_THRESHOLD / 2;
         s._env.ledger().with_mut(|li| li.sequence_number += aged_by);
-        let ttl_before_bump = s
-            ._env
-            .as_contract(&s.contract_id, || s._env.storage().persistent().get_ttl(&key));
+        let ttl_before_bump = s._env.as_contract(&s.contract_id, || {
+            s._env.storage().persistent().get_ttl(&key)
+        });
         assert!(ttl_before_bump < RETIREMENT_TTL_THRESHOLD);
 
         s.client.extend_retirement_ttl(&id);
 
-        let ttl_after_bump = s
-            ._env
-            .as_contract(&s.contract_id, || s._env.storage().persistent().get_ttl(&key));
+        let ttl_after_bump = s._env.as_contract(&s.contract_id, || {
+            s._env.storage().persistent().get_ttl(&key)
+        });
         assert!(ttl_after_bump >= RETIREMENT_TTL_EXTEND_TO);
 
         // The certificate is still readable and unchanged after the bump.

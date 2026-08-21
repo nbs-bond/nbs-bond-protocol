@@ -46,6 +46,14 @@ pub enum OracleError {
     /// signature trivially sufficient, and a value above the active provider
     /// count could never be reached, permanently deadlocking verification.
     InvalidThreshold = 14,
+    /// No trusted project-registry contract has been configured.
+    ProjectRegistryNotConfigured = 15,
+    /// The supplied numeric project id does not exist in project-registry.
+    ProjectNotFound = 16,
+    /// The project exists, but its current registry status is not Approved.
+    ProjectNotApproved = 17,
+    /// The configured registry could not return a decodable linkage record.
+    ProjectRegistryCallFailed = 18,
 }
 
 #[derive(Clone, Debug, PartialEq)]

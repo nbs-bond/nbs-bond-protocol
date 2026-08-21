@@ -136,7 +136,7 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 
 - `CouponEngine.distribute_coupon` accepts an **on-chain `report_id`** instead of a caller-supplied report, eliminating fabricated distributions.
 - It reads the report from the `OracleConsumer` contract and rejects any report whose status is not `Verified` (`ReportNotVerified`).
-- The report's `project_id` must match the bond's registered project, otherwise distribution is rejected.
+- The report's registry-authenticated `project_metadata_hash` must match the bond's registered project metadata hash, otherwise distribution is rejected; the report's canonical registry identity remains its numeric `project_id`.
 - The verified report id is persisted in `PeriodInfo`, making every distribution auditable back to its evidence.
 - Integer-division remainder that cannot be allocated to holders is recorded as `undistributed` per period and aggregated in `UndistributedTotal`; the admin can recover it via `sweep_undistributed`, preventing value from being silently lost.
 

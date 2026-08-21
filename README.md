@@ -354,7 +354,8 @@ Calculates and distributes credit coupons to bondholders based on oracle-reporte
 #[derive(Clone)]
 #[contracttype]
 pub struct OracleReport {
-    pub project_id: BytesN<32>,
+    pub project_id: u64,
+    pub project_metadata_hash: BytesN<32>,
     pub period_start: u64,
     pub period_end: u64,
     pub carbon_sequestered: i128,    // In kg CO2e
@@ -431,7 +432,7 @@ pub fn withdraw_stake(env: Env, provider: Address, amount: i128, nonce: u64) -> 
 pub fn submit_report(
     env: Env,
     provider: Address,
-    project_id: BytesN<32>,
+    project_id: u64,
     period_start: u64,
     period_end: u64,
     carbon_sequestered: i128,
