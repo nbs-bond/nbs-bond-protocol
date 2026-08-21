@@ -161,7 +161,7 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | GET | /bonds/:id/undistributed | Get undistributed coupon dust total |
 | GET | /bonds/:id/periods | Coupon period history (paginated, optional `?include_report=true`) |
 | POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust (admin only) |
-| POST | /bonds/:id/transfer | Transfer bond tokens to another address |
+| POST | /bonds/:id/transfer | Peer-to-peer transfer of bond tokens (JWT; sends from the session wallet only) |
 | POST | /projects | Register project |
 | GET | /projects | List projects |
 | GET | /projects/:id | Get project details |

@@ -130,14 +130,28 @@ export class BondsController {
     return this.bondsService.sweepUndistributed(id);
   }
 
+  /**
+   * Peer-to-peer transfer of bond tokens from the authenticated holder to
+   * another address.
+   *
+   * This is a UNILATERAL token transfer, not a sale: unlike the DEX flow
+   * there is no escrow and no quote-asset leg, so nothing about it is atomic
+   * with a payment. Callers who need delivery-versus-payment must use the
+   * marketplace endpoints instead.
+   *
+   * The sending address is taken from the authenticated session (the JWT
+   * `sub` claim); `fromAddress` in the body is optional and, when present,
+   * must match it or the request is rejected with 403.
+   */
   @Post(':id/transfer')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async transfer(
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: TransferBondDto,
+    @Req() req: AuthenticatedRequest,
   ): Promise<TransferResponse> {
-    return this.bondsService.transfer(id, dto);
+    return this.bondsService.transfer(id, dto, req.user.walletAddress);
   }
 
   @Post(':id/mature')
