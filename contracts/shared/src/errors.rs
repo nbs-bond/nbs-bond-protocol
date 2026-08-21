@@ -103,6 +103,7 @@ pub enum CouponEngineError {
     Overflow = 10,
     ZeroAmount = 11,
     ProjectNotApproved = 12,
+    InvalidPeriodIndex = 13,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -226,6 +226,53 @@ mod integration {
 
             assert_eq!(contracts.cr_client.total_retirements(), 1);
         }
+        #[test]
+        fn test_period_index_gaps_rejected() {
+            let env = Env::default();
+            env.mock_all_auths_allowing_non_root_auth();
+
+            let admin = Address::generate(&env);
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let oracle = Address::generate(&env);
+            let contracts = deploy_contracts(&env, &admin);
+
+            let project_id = make_project_id(&env, 1);
+            let pid = contracts.pr_client.register_project(
+                &alice,
+                &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "VCS"),
+                &Symbol::new(&env, "US"),
+                &0,
+            );
+            contracts.pr_client.approve_project(&admin, &pid, &0);
+
+            let config = make_bond_config(&env, project_id.clone(), 10_000);
+            let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
+            contracts.bi_client.subscribe(&bob, &bond_id, &1_000, &0);
+            
+            contracts.oc_client.register_provider(&admin, &oracle, &Symbol::new(&env, "verra_vcs"), &0);
+            let report_id = contracts.oc_client.submit_report(
+                &oracle, &project_id, &1000u64, &2000u64, &100_000i128, 
+                &BiodiversityMetrics::Absent, &Symbol::new(&env, "verra_vcs"), &make_ipfs_hash(&env, 1), &0,
+            );
+            contracts.oc_client.verify_report(&admin, &report_id, &1);
+
+            contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &1);
+            
+            let holders = holders_with_balances(&env, &contracts.bi_client, bond_id, &[&bob]);
+
+            let rejected = contracts.ce_client.try_distribute_coupon(
+                &admin,
+                &bond_id,
+                &1, // Gap: expected 0
+                &holders,
+                &report_id,
+                &2,
+                &true,
+            );
+            assert_eq!(rejected, Err(Ok(CouponEngineError::InvalidPeriodIndex)));
+        }
 
         #[test]
         fn test_insufficient_supply() {
