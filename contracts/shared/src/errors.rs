@@ -135,4 +135,11 @@ pub enum GovernanceError {
     /// be decoded into the expected types, or whose values were out of range
     /// (for example an allowlist longer than `MAX_ALLOWED_CALLS`).
     InvalidCallArgs = 13,
+    /// A nonce's "ever initialized" marker exists but the nonce entry itself
+    /// is missing (issue #189). Since both are always written and
+    /// TTL-extended together, this combination can only mean the nonce was
+    /// lost to archival — never that the address simply hasn't transacted
+    /// before, which is what makes it safe to treat as an error instead of
+    /// silently resetting replay protection to 0.
+    NonceArchived = 14,
 }

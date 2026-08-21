@@ -54,6 +54,13 @@ pub enum DataKey {
     ProposalCount,
     Vote(u64, Address),
     Nonce(Address),
+    /// Marker set alongside `Nonce` (issue #189) on every write, always
+    /// TTL-extended at the same time with the same parameters — so the two
+    /// entries always share an expiration ledger. Lets `get_nonce`
+    /// distinguish a signer who has genuinely never transacted (both
+    /// entries absent, legitimately 0) from one whose nonce existed and was
+    /// lost to archival (marker present, nonce absent — an error).
+    NonceInitialized(Address),
     /// The execution allowlist: a deduplicated `Vec<AllowedCall>`. Held in
     /// **persistent** storage rather than instance storage — the allowlist is
     /// the contract's security boundary and must outlive any instance-storage
@@ -115,7 +122,58 @@ fn storage_version(env: &Env) -> u32 {
 /// fallback read is what keeps a signer's pre-migration nonce honoured
 /// instead of silently resetting to 0, which would let a stale signed
 /// request replay.
-fn get_nonce(env: &Env, addr: &Address) -> u64 {
+/// Write a nonce and its "ever initialized" marker together, always
+/// extending both to the maximum TTL window in lockstep (issue #189).
+/// Because the two entries are always written and extended at exactly the
+/// same time with exactly the same parameters, they always share the same
+/// expiration ledger.
+fn write_nonce(env: &Env, addr: &Address, nonce: u64) {
+    let key = DataKey::Nonce(addr.clone());
+    env.storage().persistent().set(&key, &nonce);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+
+    let marker_key = DataKey::NonceInitialized(addr.clone());
+    env.storage().persistent().set(&marker_key, &true);
+    env.storage().persistent().extend_ttl(
+        &marker_key,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL_EXTEND_TO,
+    );
+}
+
+fn has_nonce_marker(env: &Env, addr: &Address) -> bool {
+    let marker_key = DataKey::NonceInitialized(addr.clone());
+    if env.storage().persistent().has(&marker_key) {
+        env.storage().persistent().extend_ttl(
+            &marker_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Nonces (issue #189): a nonce found in persistent storage has its TTL
+/// extended right here on every read, on top of the extension `set_nonce`
+/// already applies on every write — so any nonce that's ever been touched
+/// stays alive as long as its owner transacts at least once within each
+/// TTL window.
+///
+/// A nonce found only in legacy instance storage (from before issue #103
+/// moved nonces to persistent storage) is self-healed into persistent
+/// storage immediately, protecting it the same way from this read onward.
+///
+/// If neither backend has an entry, `has_nonce_marker` distinguishes a
+/// signer who has simply never transacted (legitimately 0) from one whose
+/// nonce existed and was lost to archival: the marker surviving with the
+/// nonce missing can only mean the latter, since the two are always written
+/// and TTL-extended together — so that combination is an error instead of a
+/// silent reset of replay protection.
+fn get_nonce(env: &Env, addr: &Address) -> Result<u64, GovernanceError> {
     let key = DataKey::Nonce(addr.clone());
     if let Some(nonce) = env.storage().persistent().get(&key) {
         env.storage().persistent().extend_ttl(
@@ -123,24 +181,42 @@ fn get_nonce(env: &Env, addr: &Address) -> u64 {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
-        return nonce;
+        return Ok(nonce);
     }
-    env.storage().instance().get(&key).unwrap_or(0)
+
+    if let Some(nonce) = env.storage().instance().get::<_, u64>(&key) {
+        write_nonce(env, addr, nonce);
+        return Ok(nonce);
+    }
+
+    if has_nonce_marker(env, addr) {
+        return Err(GovernanceError::NonceArchived);
+    }
+
+    Ok(0)
 }
 
 fn set_nonce(env: &Env, addr: &Address, nonce: u64) {
-    let key = DataKey::Nonce(addr.clone());
-    env.storage().persistent().set(&key, &nonce);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+    write_nonce(env, addr, nonce);
 }
 
 fn check_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), GovernanceError> {
-    if nonce != get_nonce(env, addr) {
+    let current = get_nonce(env, addr)?;
+    if nonce != current {
         return Err(GovernanceError::InvalidNonce);
     }
     set_nonce(env, addr, nonce + 1);
+
+    // Extending the whole contract instance's TTL here (issue #189) means
+    // every governance call that consumes a nonce also keeps
+    // Signers/Threshold/TimelockSeconds/StorageVersion alive, and — more to
+    // this issue's point — keeps any not-yet-migrated legacy instance nonce
+    // for a different, currently-dormant address alive too, as long as some
+    // governance activity happens at least this often.
+    env.storage()
+        .instance()
+        .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+
     Ok(())
 }
 
@@ -866,7 +942,10 @@ impl Governance {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, BytesN, IntoVal};
+    use soroban_sdk::{
+        testutils::storage::Persistent as _, testutils::Address as _, testutils::Ledger as _,
+        BytesN, IntoVal,
+    };
 
     fn make_signers(env: &Env, count: u32) -> Vec<Address> {
         let mut signers: Vec<Address> = vec![&env];
@@ -2366,6 +2445,147 @@ mod test {
             &Symbol::new(&env, SELF_METHOD_SET_ALLOWED_CALLS),
             &args,
             &Symbol::new(&env, "allowlist"),
+            &0,
+        );
+        assert_eq!(proposal_id, 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Nonce liveness (issue #189)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_nonce_survives_near_ttl_expiry_and_is_refreshed_on_use() {
+        let (env, client, signers, target) = setup_proposable();
+        let contract_addr = client.address.clone();
+        let nonce_key = DataKey::Nonce(signers.get(0).unwrap());
+
+        client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        let initial_ttl = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&nonce_key)
+        });
+        assert!(initial_ttl > 0);
+
+        // Simulate a long idle period: advance to just before the nonce
+        // entry would be archived, with nobody having touched it since.
+        env.ledger().set_sequence_number(1 + initial_ttl - 5);
+        let ttl_before_use = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&nonce_key)
+        });
+        assert!(ttl_before_use <= 10);
+
+        // Signer 0 transacts again — must succeed by reading nonce 1 back
+        // (not silently reset to 0), and must refresh the TTL.
+        client.cancel(&signers.get(0).unwrap(), &1, &1);
+
+        let ttl_after_use = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&nonce_key)
+        });
+        assert!(ttl_after_use > ttl_before_use);
+    }
+
+    #[test]
+    fn test_legacy_instance_nonce_self_heals_into_persistent_storage() {
+        let (env, client, signers, target) = setup_proposable();
+
+        // Simulate a nonce recorded before issue #103 moved nonces to
+        // persistent storage.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Nonce(signers.get(0).unwrap()), &3u64);
+        });
+
+        // The legacy value must be honoured, not silently treated as 0.
+        let result = client.try_propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidNonce)));
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &3,
+        );
+        assert_eq!(proposal_id, 1);
+
+        // The value must now live in persistent storage, protected by the
+        // same extend_ttl guarantee every other nonce gets.
+        env.as_contract(&client.address, || {
+            let key = DataKey::Nonce(signers.get(0).unwrap());
+            assert!(env.storage().persistent().has(&key));
+            let stored: u64 = env.storage().persistent().get(&key).unwrap();
+            assert_eq!(stored, 4);
+        });
+    }
+
+    #[test]
+    fn test_archived_nonce_errors_instead_of_resetting_to_zero() {
+        let (env, client, signers, target) = setup_proposable();
+
+        // Signer 0 transacts once, establishing a nonce and its marker
+        // together.
+        client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        // Simulate the nonce entry itself being lost while the marker (same
+        // TTL, extended at the same time) survives — the only way this
+        // combination arises in practice is the anomaly this check exists
+        // to catch.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Nonce(signers.get(0).unwrap()));
+        });
+
+        // An attacker replaying the original nonce must be rejected with
+        // NonceArchived, not silently accepted as if the nonce were 0.
+        let result = client.try_propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(GovernanceError::NonceArchived)));
+    }
+
+    #[test]
+    fn test_first_time_signer_nonce_defaults_to_zero_not_error() {
+        // A signer who has genuinely never transacted must still get a
+        // legitimate starting nonce of 0 — the marker check must not
+        // false-positive on ordinary first use.
+        let (env, client, signers, target) = setup_proposable();
+
+        let proposal_id = client.propose(
+            &signers.get(1).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
             &0,
         );
         assert_eq!(proposal_id, 1);

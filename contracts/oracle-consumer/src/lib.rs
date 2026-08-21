@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(deprecated)]
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
 use nbbs_shared::{BiodiversityMetrics, OracleError, ReportStatus};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
 
 pub const CHALLENGE_WINDOW_SECONDS: u64 = 259200;
 pub const SLASH_PENALTY_PPM: i128 = 100_000;
@@ -106,8 +106,15 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), OracleError> {
 }
 
 /// Bump a persistent storage key's TTL if it is below the threshold.
-fn bump_persistent<K: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val> + soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
-    env.storage().persistent().extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+fn bump_persistent<
+    K: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val> + soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+>(
+    env: &Env,
+    key: &K,
+) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
 }
 
 fn get_nonce(env: &Env, addr: &Address) -> u64 {
@@ -171,7 +178,9 @@ impl OracleConsumer {
             registered_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&provider_key, &oracle_provider);
+        env.storage()
+            .persistent()
+            .set(&provider_key, &oracle_provider);
         bump_persistent(&env, &provider_key);
 
         let list_key = DataKey::ProviderList;
@@ -184,10 +193,8 @@ impl OracleConsumer {
         env.storage().persistent().set(&list_key, &providers);
         bump_persistent(&env, &list_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "provider_registered"),),
-            (provider,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "provider_registered"),), (provider,));
 
         Ok(())
     }
@@ -219,10 +226,8 @@ impl OracleConsumer {
         env.storage().persistent().set(&provider_key, &p);
         bump_persistent(&env, &provider_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "provider_removed"),),
-            (provider,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "provider_removed"),), (provider,));
 
         Ok(())
     }
@@ -312,12 +317,10 @@ impl OracleConsumer {
         bump_persistent(&env, &proj_key);
 
         let prc_key = DataKey::ProviderReportCount(provider.clone());
-        let report_count: u64 = env
-            .storage()
+        let report_count: u64 = env.storage().persistent().get(&prc_key).unwrap_or(0);
+        env.storage()
             .persistent()
-            .get(&prc_key)
-            .unwrap_or(0);
-        env.storage().persistent().set(&prc_key, &(report_count + 1));
+            .set(&prc_key, &(report_count + 1));
         bump_persistent(&env, &prc_key);
 
         env.events().publish(
@@ -418,10 +421,8 @@ impl OracleConsumer {
 
             release_report_lock(&env, &report.provider, report_id);
 
-            env.events().publish(
-                (Symbol::new(&env, "report_verified"),),
-                (report_id,),
-            );
+            env.events()
+                .publish((Symbol::new(&env, "report_verified"),), (report_id,));
         }
 
         Ok(())
@@ -536,11 +537,7 @@ impl OracleConsumer {
         env.storage().persistent().set(&challenge_key, &challenge);
         bump_persistent(&env, &challenge_key);
 
-        let mut report_mut: Report = env
-            .storage()
-            .persistent()
-            .get(&report_key)
-            .unwrap();
+        let mut report_mut: Report = env.storage().persistent().get(&report_key).unwrap();
         report_mut.status = ReportStatus::Challenged;
         env.storage().persistent().set(&report_key, &report_mut);
         bump_persistent(&env, &report_key);
@@ -552,7 +549,9 @@ impl OracleConsumer {
             .get(&pc_key)
             .unwrap_or(vec![&env]);
         provider_challenges.push_back(report_id);
-        env.storage().persistent().set(&pc_key, &provider_challenges);
+        env.storage()
+            .persistent()
+            .set(&pc_key, &provider_challenges);
         bump_persistent(&env, &pc_key);
 
         env.events().publish(
@@ -629,14 +628,22 @@ impl OracleConsumer {
 
     pub fn get_provider(env: Env, provider: Address) -> Result<OracleProvider, OracleError> {
         let key = DataKey::Provider(provider);
-        let val = env.storage().persistent().get(&key).ok_or(OracleError::ProviderNotFound)?;
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(OracleError::ProviderNotFound)?;
         bump_persistent(&env, &key);
         Ok(val)
     }
 
     pub fn get_report(env: Env, report_id: u64) -> Result<Report, OracleError> {
         let key = DataKey::Report(report_id);
-        let val = env.storage().persistent().get(&key).ok_or(OracleError::ReportNotFound)?;
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(OracleError::ReportNotFound)?;
         bump_persistent(&env, &key);
         Ok(val)
     }
@@ -661,7 +668,11 @@ impl OracleConsumer {
 
     pub fn get_challenge(env: Env, report_id: u64) -> Result<Challenge, OracleError> {
         let key = DataKey::Challenge(report_id);
-        let val = env.storage().persistent().get(&key).ok_or(OracleError::ReportNotFound)?;
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(OracleError::ReportNotFound)?;
         bump_persistent(&env, &key);
         Ok(val)
     }
@@ -700,13 +711,21 @@ impl OracleConsumer {
         }
 
         let pc_key = DataKey::ProviderChallenges(provider.clone());
-        let challenges: Vec<u64> = env.storage().persistent().get(&pc_key).unwrap_or(vec![&env]);
+        let challenges: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&pc_key)
+            .unwrap_or(vec![&env]);
         if env.storage().persistent().has(&pc_key) {
             bump_persistent(&env, &pc_key);
         }
 
         let sh_key = DataKey::SlashHistory(provider.clone());
-        let history: Vec<SlashRecord> = env.storage().persistent().get(&sh_key).unwrap_or(vec![&env]);
+        let history: Vec<SlashRecord> = env
+            .storage()
+            .persistent()
+            .get(&sh_key)
+            .unwrap_or(vec![&env]);
         if env.storage().persistent().has(&sh_key) {
             bump_persistent(&env, &sh_key);
         }
@@ -746,7 +765,11 @@ impl OracleConsumer {
 
     pub fn get_challenge_history(env: Env, provider: Address) -> Vec<Challenge> {
         let pc_key = DataKey::ProviderChallenges(provider);
-        let ids: Vec<u64> = env.storage().persistent().get(&pc_key).unwrap_or(vec![&env]);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&pc_key)
+            .unwrap_or(vec![&env]);
         if env.storage().persistent().has(&pc_key) {
             bump_persistent(&env, &pc_key);
         }
@@ -817,14 +840,15 @@ impl OracleConsumer {
             .get(&provider_key)
             .ok_or(OracleError::ProviderNotFound)?;
 
-        p.stake = p.stake.checked_add(amount).ok_or(OracleError::InsufficientStake)?;
+        p.stake = p
+            .stake
+            .checked_add(amount)
+            .ok_or(OracleError::InsufficientStake)?;
         env.storage().persistent().set(&provider_key, &p);
         bump_persistent(&env, &provider_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "stake_added"),),
-            (provider, amount),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "stake_added"),), (provider, amount));
 
         Ok(())
     }
@@ -868,10 +892,8 @@ impl OracleConsumer {
         env.storage().persistent().set(&provider_key, &p);
         bump_persistent(&env, &provider_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "stake_withdrawn"),),
-            (provider, amount),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "stake_withdrawn"),), (provider, amount));
 
         Ok(())
     }
@@ -895,12 +917,16 @@ fn lock_stake_for_report(env: &Env, provider: &Address, report_id: u64, stake: i
     let lock_amount = slashable_amount(stake);
 
     let report_lock_key = DataKey::ReportLock(report_id);
-    env.storage().persistent().set(&report_lock_key, &lock_amount);
+    env.storage()
+        .persistent()
+        .set(&report_lock_key, &lock_amount);
     bump_persistent(env, &report_lock_key);
 
     let locked_key = DataKey::LockedStake(provider.clone());
     let locked: i128 = env.storage().persistent().get(&locked_key).unwrap_or(0);
-    env.storage().persistent().set(&locked_key, &(locked + lock_amount));
+    env.storage()
+        .persistent()
+        .set(&locked_key, &(locked + lock_amount));
     bump_persistent(env, &locked_key);
 }
 
@@ -920,18 +946,18 @@ fn release_report_lock(env: &Env, provider: &Address, report_id: u64) {
 
     let locked_key = DataKey::LockedStake(provider.clone());
     let locked: i128 = env.storage().persistent().get(&locked_key).unwrap_or(0);
-    let new_locked = if lock_amount > locked { 0 } else { locked - lock_amount };
+    let new_locked = if lock_amount > locked {
+        0
+    } else {
+        locked - lock_amount
+    };
     env.storage().persistent().set(&locked_key, &new_locked);
     bump_persistent(env, &locked_key);
 }
 
 fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
     let provider_key = DataKey::Provider(provider.clone());
-    let mut p: OracleProvider = env
-        .storage()
-        .persistent()
-        .get(&provider_key)
-        .unwrap();
+    let mut p: OracleProvider = env.storage().persistent().get(&provider_key).unwrap();
 
     let penalty = slashable_amount(p.stake);
 
@@ -1124,12 +1150,7 @@ mod test {
             &0,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
         let challenged = client.get_report(&report_id);
         assert_eq!(challenged.status, ReportStatus::Challenged);
@@ -1139,12 +1160,7 @@ mod test {
         assert_eq!(challenge.challenger, challenger);
         assert!(!challenge.resolved);
 
-        client.resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Verified,
-            &1,
-        );
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
 
         let resolved = client.get_report(&report_id);
         assert_eq!(resolved.status, ReportStatus::Verified);
@@ -1184,12 +1200,8 @@ mod test {
         env.ledger()
             .set_timestamp(1_000_000 + CHALLENGE_WINDOW_SECONDS + 1);
 
-        let result = client.try_challenge_report(
-            &provider,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &1,
-        );
+        let result =
+            client.try_challenge_report(&provider, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         assert_eq!(result, Err(Ok(OracleError::SelfChallenge)));
         assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
@@ -1228,14 +1240,11 @@ mod test {
             &0,
         );
 
-        env.ledger().set_timestamp(1_000_000 + CHALLENGE_WINDOW_SECONDS + 1);
+        env.ledger()
+            .set_timestamp(1_000_000 + CHALLENGE_WINDOW_SECONDS + 1);
 
-        let result = client.try_challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        let result =
+            client.try_challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
         assert_eq!(result, Err(Ok(OracleError::ChallengeWindowExpired)));
     }
 
@@ -1269,12 +1278,7 @@ mod test {
 
         env.ledger().set_timestamp(900_000);
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
         let challenged = client.get_report(&report_id);
         assert_eq!(challenged.status, ReportStatus::Challenged);
@@ -1319,12 +1323,8 @@ mod test {
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
 
-        let result = client.try_register_provider(
-            &admin,
-            &provider,
-            &Symbol::new(&env, "verra_vcs"),
-            &1,
-        );
+        let result =
+            client.try_register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &1);
         assert_eq!(result, Err(Ok(OracleError::ProviderAlreadyExists)));
     }
 
@@ -1393,12 +1393,8 @@ mod test {
 
         client.verify_report(&verifier, &report_id, &0);
 
-        let result = client.try_challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        let result =
+            client.try_challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
         assert_eq!(result, Err(Ok(OracleError::ReportAlreadyVerified)));
     }
 
@@ -1526,19 +1522,9 @@ mod test {
             &0,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
-        client.resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Rejected,
-            &1,
-        );
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
         let report = client.get_report(&report_id);
         assert_eq!(report.status, ReportStatus::Rejected);
@@ -1571,26 +1557,11 @@ mod test {
             &0,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
-        client.resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Verified,
-            &1,
-        );
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
 
-        let result = client.try_resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Rejected,
-            &2,
-        );
+        let result = client.try_resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &2);
         assert_eq!(result, Ok(Ok(())));
     }
 
@@ -1621,12 +1592,7 @@ mod test {
             &0,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
         for invalid in [ReportStatus::Pending, ReportStatus::Challenged] {
             let result = client.try_resolve_challenge(&admin, &report_id, &invalid, &1);
@@ -1783,12 +1749,18 @@ mod test {
 
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
+        let verifier = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        // verify_report requires a registered, active provider as the
+        // caller — the admin is deliberately not exempt (see verify_report's
+        // own doc comment), so this test needs a second provider to act as
+        // the verifier rather than calling as the admin.
+        client.register_provider(&admin, &verifier, &Symbol::new(&env, "satellite"), &1);
         client.add_stake(&provider, &100_000i128, &0);
 
         let report_id = client.submit_report(
@@ -1806,7 +1778,7 @@ mod test {
         let result = client.try_withdraw_stake(&provider, &100_000i128, &2);
         assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
 
-        client.verify_report(&admin, &report_id, &1);
+        client.verify_report(&verifier, &report_id, &0);
         assert_eq!(client.get_locked_stake(&provider), 0);
 
         client.withdraw_stake(&provider, &100_000i128, &2);
@@ -1893,7 +1865,10 @@ mod test {
 
         let slashed = client.get_provider(&provider);
         assert_eq!(slashed.stake, 900);
-        assert_eq!(client.get_slash_history(&provider).get(0).unwrap().penalty, 100);
+        assert_eq!(
+            client.get_slash_history(&provider).get(0).unwrap().penalty,
+            100
+        );
     }
 
     #[test]
@@ -1924,19 +1899,9 @@ mod test {
             &1,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
-        client.resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Rejected,
-            &1,
-        );
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
         let slashed = client.get_provider(&provider);
         assert_eq!(slashed.stake, 100_000 - 10_000);
@@ -1974,19 +1939,9 @@ mod test {
             &1,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
-        client.resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Rejected,
-            &1,
-        );
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
         let slashed = client.get_provider(&provider);
         assert_eq!(slashed.stake, 0);
@@ -2021,19 +1976,9 @@ mod test {
             &1,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
-        client.resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Verified,
-            &1,
-        );
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
 
         let provider_state = client.get_provider(&provider);
         assert_eq!(provider_state.stake, 100_000);
@@ -2079,19 +2024,9 @@ mod test {
             &2,
         );
 
-        client.challenge_report(
-            &challenger,
-            &report_id,
-            &make_ipfs_hash(&env, 2),
-            &0,
-        );
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
 
-        client.resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Rejected,
-            &1,
-        );
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
         let stats = client.get_provider_stats(&provider);
         assert_eq!(stats.reports_submitted, 2);
@@ -2167,7 +2102,12 @@ mod test {
         provider_nonce: u64,
         admin_nonce: u64,
     ) -> u64 {
-        client.register_provider(admin, provider, &Symbol::new(env, "verra_vcs"), &admin_nonce);
+        client.register_provider(
+            admin,
+            provider,
+            &Symbol::new(env, "verra_vcs"),
+            &admin_nonce,
+        );
         client.submit_report(
             provider,
             project_id,
@@ -2287,15 +2227,8 @@ mod test {
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
-        let report_id = register_provider_and_submit(
-            &env,
-            &client,
-            &admin,
-            &provider_a,
-            &project_id,
-            0,
-            0,
-        );
+        let report_id =
+            register_provider_and_submit(&env, &client, &admin, &provider_a, &project_id, 0, 0);
 
         let result = client.try_verify_report(&provider_a, &report_id, &1);
         assert_eq!(result, Err(Ok(OracleError::InvalidSignature)));
@@ -2450,12 +2383,8 @@ mod test {
             &0,
         );
 
-        let result = client.try_admin_override_report(
-            &stranger,
-            &report_id,
-            &ReportStatus::Verified,
-            &0,
-        );
+        let result =
+            client.try_admin_override_report(&stranger, &report_id, &ReportStatus::Verified, &0);
         assert_eq!(result, Err(Ok(OracleError::Unauthorized)));
         assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
     }
@@ -2490,12 +2419,8 @@ mod test {
 
         // Already terminal: a second override must fail rather than flip the
         // status back and forth.
-        let result = client.try_admin_override_report(
-            &admin,
-            &report_id,
-            &ReportStatus::Rejected,
-            &2,
-        );
+        let result =
+            client.try_admin_override_report(&admin, &report_id, &ReportStatus::Rejected, &2);
         assert_eq!(result, Err(Ok(OracleError::ReportAlreadyVerified)));
         assert_eq!(client.get_report(&report_id).status, ReportStatus::Verified);
     }
@@ -2738,7 +2663,12 @@ mod test {
         }
 
         let ids = client.get_project_reports(&project_id);
-        assert_eq!(ids.len() as u64, report_count, "expected {report_count} reports, got {}", ids.len());
+        assert_eq!(
+            ids.len() as u64,
+            report_count,
+            "expected {report_count} reports, got {}",
+            ids.len()
+        );
 
         // Spot-check first and last IDs.
         assert_eq!(ids.get(0).unwrap(), 1u64);
