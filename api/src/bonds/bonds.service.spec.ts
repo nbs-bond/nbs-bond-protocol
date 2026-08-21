@@ -706,6 +706,40 @@ describe('BondsService', () => {
       ]);
     });
 
+    it('encodes each credit-type variant as a symbol ScVal', async () => {
+      const simulateCall = jest.fn(async () =>
+        nativeToScVal(BigInt(0), { type: 'i128' }),
+      );
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: { simulateCall } },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+      await svc.getAccruedCredits(1, HOLDER);
+
+      const byTypeCalls = simulateCall.mock.calls
+        .map(([options]: any[]) => options)
+        .filter((options) => options.method === 'accrued_credits_by_type');
+
+      expect(byTypeCalls).toHaveLength(4);
+      expect(byTypeCalls.map((options) => options.args[2])).toEqual([
+        nativeToScVal('Carbon', { type: 'symbol' }),
+        nativeToScVal('Biodiversity', { type: 'symbol' }),
+        nativeToScVal('Basket', { type: 'symbol' }),
+        nativeToScVal('BlueCarbon', { type: 'symbol' }),
+      ]);
+    });
+
     it('rejects an invalid holder address with 400', async () => {
       const svc = await buildService(async () =>
         nativeToScVal(BigInt(0), { type: 'i128' }),
