@@ -1783,12 +1783,14 @@ mod test {
 
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
+        let verifier = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &verifier, &Symbol::new(&env, "satellite"), &1);
         client.add_stake(&provider, &100_000i128, &0);
 
         let report_id = client.submit_report(
@@ -1806,7 +1808,7 @@ mod test {
         let result = client.try_withdraw_stake(&provider, &100_000i128, &2);
         assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
 
-        client.verify_report(&admin, &report_id, &1);
+        client.verify_report(&verifier, &report_id, &0);
         assert_eq!(client.get_locked_stake(&provider), 0);
 
         client.withdraw_stake(&provider, &100_000i128, &2);
