@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(deprecated)]
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
 use nbbs_shared::{BondConfig, BondError, BondStatus};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
 
 pub const MAX_SUPPLY: i128 = 1_000_000_000_000_000_000;
 const LEDGER_CLOSE_TIME_SECS: u64 = 5;
@@ -48,11 +48,7 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
 /// the list (with a zero balance) and are filtered at coupon distribution.
 fn append_holder(env: &Env, bond_id: u64, holder: Address) {
     let key = DataKey::HolderList(bond_id);
-    let mut list: Vec<Address> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(vec![&env]);
+    let mut list: Vec<Address> = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
     list.push_back(holder);
     env.storage().persistent().set(&key, &list);
 
@@ -79,8 +75,12 @@ fn extend_bond_ttl(env: &Env, bond_id: u64, maturity_date: u64) {
 
     let config_key = DataKey::BondConfig(bond_id);
     let state_key = DataKey::BondState(bond_id);
-    env.storage().persistent().extend_ttl(&config_key, threshold, extend_to);
-    env.storage().persistent().extend_ttl(&state_key, threshold, extend_to);
+    env.storage()
+        .persistent()
+        .extend_ttl(&config_key, threshold, extend_to);
+    env.storage()
+        .persistent()
+        .extend_ttl(&state_key, threshold, extend_to);
 }
 
 #[contract]
@@ -141,9 +141,7 @@ impl BondIssuer {
             .get(&DataKey::BondCount)
             .unwrap_or(0);
         let bond_id = count + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::BondCount, &bond_id);
+        env.storage().instance().set(&DataKey::BondCount, &bond_id);
 
         env.storage()
             .persistent()
@@ -234,17 +232,11 @@ impl BondIssuer {
         }
 
         let balance_key = DataKey::HolderBalance(bond_id, investor.clone());
-        let current_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&balance_key)
-            .unwrap_or(0);
+        let current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         let new_balance = current_balance
             .checked_add(amount)
             .ok_or(BondError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&balance_key, &new_balance);
+        env.storage().persistent().set(&balance_key, &new_balance);
 
         if current_balance == 0 {
             append_holder(&env, bond_id, investor.clone());
@@ -303,11 +295,7 @@ impl BondIssuer {
         }
 
         let from_key = DataKey::HolderBalance(bond_id, from.clone());
-        let from_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&from_key)
-            .unwrap_or(0);
+        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
         if from_balance < amount {
             return Err(BondError::InsufficientSupply);
         }
@@ -315,22 +303,12 @@ impl BondIssuer {
         let new_from_balance = from_balance
             .checked_sub(amount)
             .ok_or(BondError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&from_key, &new_from_balance);
+        env.storage().persistent().set(&from_key, &new_from_balance);
 
         let to_key = DataKey::HolderBalance(bond_id, to.clone());
-        let to_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&to_key)
-            .unwrap_or(0);
-        let new_to_balance = to_balance
-            .checked_add(amount)
-            .ok_or(BondError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&to_key, &new_to_balance);
+        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+        let new_to_balance = to_balance.checked_add(amount).ok_or(BondError::Overflow)?;
+        env.storage().persistent().set(&to_key, &new_to_balance);
 
         if to_balance == 0 {
             append_holder(&env, bond_id, to.clone());
@@ -388,11 +366,7 @@ impl BondIssuer {
         }
 
         let balance_key = DataKey::HolderBalance(bond_id, holder.clone());
-        let current_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&balance_key)
-            .unwrap_or(0);
+        let current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         if current_balance < amount {
             return Err(BondError::InsufficientSupply);
         }
@@ -400,9 +374,7 @@ impl BondIssuer {
         let new_balance = current_balance
             .checked_sub(amount)
             .ok_or(BondError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&balance_key, &new_balance);
+        env.storage().persistent().set(&balance_key, &new_balance);
 
         state.total_subscribed = state
             .total_subscribed
@@ -414,10 +386,8 @@ impl BondIssuer {
 
         extend_bond_ttl(&env, bond_id, config.maturity_date);
 
-        env.events().publish(
-            (Symbol::new(&env, "redeemed"),),
-            (bond_id, holder, amount),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "redeemed"),), (bond_id, holder, amount));
 
         Ok(())
     }
@@ -615,10 +585,8 @@ impl BondIssuer {
 
         extend_bond_ttl(&env, bond_id, config.maturity_date);
 
-        env.events().publish(
-            (Symbol::new(&env, "bond_matured"),),
-            (bond_id,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "bond_matured"),), (bond_id,));
 
         Ok(())
     }
@@ -628,8 +596,8 @@ impl BondIssuer {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::Address as _, testutils::Ledger as _, testutils::storage::Persistent as _,
-        vec, BytesN,
+        testutils::storage::Persistent as _, testutils::Address as _, testutils::Ledger as _, vec,
+        BytesN,
     };
 
     fn create_project_id(env: &Env, value: u8) -> BytesN<32> {
@@ -1208,18 +1176,15 @@ mod test {
             client.get_bond_ids_range(&0, &3),
             vec![&env, 1u64, 2u64, 3u64]
         );
-        assert_eq!(
-            client.get_bond_ids_range(&2, &2),
-            vec![&env, 3u64, 4u64]
-        );
-        assert_eq!(
-            client.get_bond_ids_range(&4, &20),
-            vec![&env, 5u64]
-        );
+        assert_eq!(client.get_bond_ids_range(&2, &2), vec![&env, 3u64, 4u64]);
+        assert_eq!(client.get_bond_ids_range(&4, &20), vec![&env, 5u64]);
         assert_eq!(client.get_bond_ids_range(&5, &20), vec![&env]);
         assert_eq!(client.get_bond_ids_range(&100, &20), vec![&env]);
         assert_eq!(client.get_bond_ids_range(&0, &0), vec![&env]);
-        assert_eq!(client.get_all_bond_ids(), vec![&env, 1u64, 2u64, 3u64, 4u64, 5u64]);
+        assert_eq!(
+            client.get_all_bond_ids(),
+            vec![&env, 1u64, 2u64, 3u64, 4u64, 5u64]
+        );
     }
 
     // --- Issue #94: Persistent storage + TTL tests ---

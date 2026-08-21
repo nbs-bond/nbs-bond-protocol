@@ -163,9 +163,12 @@ mod integration {
             );
             assert_eq!(report_id, 1);
 
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             let report = contracts.oc_client.get_report(&report_id);
             assert_eq!(report.status, ReportStatus::Verified);
@@ -309,9 +312,12 @@ mod integration {
                 .try_distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2, &true);
             assert_eq!(rejected, Err(Ok(CouponEngineError::ReportNotVerified)));
 
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             let result = contracts
                 .ce_client
@@ -381,9 +387,12 @@ mod integration {
             let report = contracts.oc_client.get_report(&report_id);
             assert_eq!(report.methodology, Symbol::new(&env, "blue_carbon"));
 
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
             assert_eq!(
                 contracts.oc_client.get_report(&report_id).status,
                 ReportStatus::Verified
@@ -467,9 +476,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             contracts
                 .ce_client
@@ -547,9 +559,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             contracts
                 .ce_client
@@ -641,9 +656,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
             contracts
                 .ce_client
                 .register_bond(&admin, &bond_id, &project_id, &1);
@@ -1265,9 +1283,12 @@ mod integration {
                 &make_ipfs_hash(&env, 1),
                 &0,
             );
-            contracts
-                .oc_client
-                .admin_override_report(&admin, &report_id, &ReportStatus::Verified, &1);
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
 
             contracts
                 .ce_client

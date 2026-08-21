@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(deprecated)]
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec};
 use nbbs_shared::DEXError;
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec};
 
 // Persistent-storage TTL constants (in ledgers).
 // MIN_TTL  ≈  1 day   at 5-second ledger cadence (~17 280 ledgers).
@@ -47,13 +47,6 @@ pub enum OrderStatus {
     Expired,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[contracttype]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
 fn require_admin(env: &Env, caller: &Address) -> Result<(), DEXError> {
     let admin: Address = env
         .storage()
@@ -67,8 +60,15 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), DEXError> {
 }
 
 /// Bump a persistent storage entry's TTL if it is below the threshold.
-fn bump_persistent<K: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val> + soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
-    env.storage().persistent().extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+fn bump_persistent<
+    K: soroban_sdk::TryIntoVal<Env, soroban_sdk::Val> + soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+>(
+    env: &Env,
+    key: &K,
+) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
 }
 
 fn get_nonce(env: &Env, addr: &Address) -> u64 {
@@ -120,11 +120,7 @@ fn verify_holder_balance(
     let balance: i128 = env.invoke_contract(
         &bond_issuer,
         &Symbol::new(env, "get_holder_balance"),
-        vec![
-            &env,
-            bond_id.into_val(env),
-            holder.clone().into_val(env),
-        ],
+        vec![&env, bond_id.into_val(env), holder.clone().into_val(env)],
     );
 
     if balance < required {
@@ -265,9 +261,7 @@ impl DEXRouter {
             return Err(DEXError::Unauthorized);
         }
 
-        if order.status != OrderStatus::Open
-            && order.status != OrderStatus::PartiallyFilled
-        {
+        if order.status != OrderStatus::Open && order.status != OrderStatus::PartiallyFilled {
             return Err(DEXError::OrderAlreadyFilled);
         }
 
@@ -275,10 +269,8 @@ impl DEXRouter {
         env.storage().persistent().set(&order_key, &order);
         bump_persistent(&env, &order_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "order_cancelled"),),
-            (order_id, caller),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "order_cancelled"),), (order_id, caller));
 
         Ok(())
     }
@@ -307,9 +299,7 @@ impl DEXRouter {
             .ok_or(DEXError::OrderNotFound)?;
         bump_persistent(&env, &order_key);
 
-        if order.status != OrderStatus::Open
-            && order.status != OrderStatus::PartiallyFilled
-        {
+        if order.status != OrderStatus::Open && order.status != OrderStatus::PartiallyFilled {
             return Err(DEXError::OrderAlreadyFilled);
         }
 
@@ -474,7 +464,11 @@ impl DEXRouter {
 
     pub fn get_order(env: Env, order_id: u64) -> Result<Order, DEXError> {
         let key = DataKey::Order(order_id);
-        let val = env.storage().persistent().get(&key).ok_or(DEXError::OrderNotFound)?;
+        let val = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(DEXError::OrderNotFound)?;
         bump_persistent(&env, &key);
         Ok(val)
     }
@@ -504,121 +498,7 @@ impl DEXRouter {
             .unwrap_or(0)
     }
 
-    /// Quotes a market-sized fill without requiring the caller to fetch every
-    /// order over RPC. The returned tuple is `(average_price, total,
-    /// slippage_bps)`, where one basis point is 0.01%.
-    pub fn get_best_price(
-        env: Env,
-        bond_id: u64,
-        side: Side,
-        amount: i128,
-    ) -> Result<(i128, i128, i128), DEXError> {
-        if amount <= 0 {
-            return Err(DEXError::ZeroAmount);
-        }
-
-        let bond_orders_key = DataKey::BondOrders(bond_id);
-        let order_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&bond_orders_key)
-            .unwrap_or(vec![&env]);
-        if env.storage().persistent().has(&bond_orders_key) {
-            bump_persistent(&env, &bond_orders_key);
-        }
-
-        // Keep the quote deterministic for equal price levels by using order
-        // id (time priority) as the secondary key.
-        let mut sorted: Vec<Order> = Vec::new(&env);
-        for order_id in order_ids.iter() {
-            let key = DataKey::Order(order_id);
-            let Some(order) = env.storage().persistent().get::<DataKey, Order>(&key) else {
-                continue;
-            };
-            bump_persistent(&env, &key);
-
-            if order.bond_id != bond_id
-                || order.amount <= 0
-                || (order.status != OrderStatus::Open
-                    && order.status != OrderStatus::PartiallyFilled)
-                || is_order_expired(&env, &order)
-            {
-                continue;
-            }
-
-            let mut position = 0;
-            while position < sorted.len() {
-                let current = sorted.get(position).unwrap();
-                let precedes = match side {
-                    Side::Buy => {
-                        order.price_per_token < current.price_per_token
-                            || (order.price_per_token == current.price_per_token
-                                && order.id < current.id)
-                    }
-                    Side::Sell => {
-                        order.price_per_token > current.price_per_token
-                            || (order.price_per_token == current.price_per_token
-                                && order.id < current.id)
-                    }
-                };
-                if precedes {
-                    break;
-                }
-                position += 1;
-            }
-            sorted.insert(position, order);
-        }
-
-        let Some(first) = sorted.first() else {
-            return Ok((0, 0, 0));
-        };
-        let best_price = first.price_per_token;
-        let mut remaining = amount;
-        let mut filled = 0i128;
-        let mut total = 0i128;
-
-        for order in sorted.iter() {
-            if remaining == 0 {
-                break;
-            }
-            let take = remaining.min(order.amount);
-            let cost = take
-                .checked_mul(order.price_per_token)
-                .ok_or(DEXError::Overflow)?;
-            total = total.checked_add(cost).ok_or(DEXError::Overflow)?;
-            filled = filled.checked_add(take).ok_or(DEXError::Overflow)?;
-            remaining -= take;
-        }
-
-        if filled == 0 {
-            return Ok((0, 0, 0));
-        }
-
-        let average_price = total / filled;
-        let ideal_total = filled
-            .checked_mul(best_price)
-            .ok_or(DEXError::Overflow)?;
-        let adverse_delta = match side {
-            Side::Buy => total.saturating_sub(ideal_total),
-            Side::Sell => ideal_total.saturating_sub(total),
-        };
-        let slippage_bps = if ideal_total > 0 {
-            adverse_delta
-                .checked_mul(10_000)
-                .ok_or(DEXError::Overflow)?
-                / ideal_total
-        } else {
-            0
-        };
-
-        Ok((average_price, total, slippage_bps))
-    }
-
-    pub fn clean_expired_orders(
-        env: Env,
-        caller: Address,
-        nonce: u64,
-    ) -> Result<u32, DEXError> {
+    pub fn clean_expired_orders(env: Env, caller: Address, nonce: u64) -> Result<u32, DEXError> {
         caller.require_auth();
 
         let expected_nonce = get_nonce(&env, &caller);
@@ -693,10 +573,8 @@ impl DEXRouter {
             }
         }
 
-        env.events().publish(
-            (Symbol::new(env, "expired_orders_cleaned"),),
-            (cleaned,),
-        );
+        env.events()
+            .publish((Symbol::new(env, "expired_orders_cleaned"),), (cleaned,));
 
         Ok(cleaned)
     }
@@ -722,12 +600,8 @@ mod test {
         holder_subscribe: i128,
     ) -> (Address, Address, u64, Address) {
         let issuer_admin = Address::generate(env);
-        let issuer_id = env.register(
-            nbbs_bond_issuer::BondIssuer,
-            (issuer_admin.clone(),),
-        );
-        let issuer_client =
-            nbbs_bond_issuer::BondIssuerClient::new(env, &issuer_id);
+        let issuer_id = env.register(nbbs_bond_issuer::BondIssuer, (issuer_admin.clone(),));
+        let issuer_client = nbbs_bond_issuer::BondIssuerClient::new(env, &issuer_id);
 
         let project_id = create_project_id(env, 1);
         let bond_config = nbbs_shared::BondConfig {
@@ -792,70 +666,6 @@ mod test {
     }
 
     #[test]
-    fn test_get_best_price_quotes_multiple_levels_in_one_call() {
-        let env = Env::default();
-        env.mock_all_auths_allowing_non_root_auth();
-        env.ledger().set_timestamp(1_000_000);
-
-        let admin = Address::generate(&env);
-        let (_issuer_admin, issuer_id, bond_id, seller) =
-            setup_bond_and_holder(&env, 10_000, 5_000);
-        let contract_id = env.register(
-            DEXRouter,
-            (admin, issuer_id, Address::generate(&env)),
-        );
-        let client = DEXRouterClient::new(&env, &contract_id);
-        let quote_asset = Symbol::new(&env, "USDC");
-
-        client.list_bond_tokens(
-            &seller,
-            &bond_id,
-            &5i128,
-            &20i128,
-            &quote_asset,
-            &3_600u64,
-            &0,
-        );
-        client.list_bond_tokens(
-            &seller,
-            &bond_id,
-            &5i128,
-            &10i128,
-            &quote_asset,
-            &3_600u64,
-            &1,
-        );
-
-        let (average_price, total, slippage_bps) =
-            client.get_best_price(&bond_id, &Side::Buy, &10i128);
-
-        assert_eq!(average_price, 15);
-        assert_eq!(total, 150);
-        assert_eq!(slippage_bps, 5_000);
-    }
-
-    #[test]
-    fn test_get_best_price_handles_empty_and_rejects_zero_amount() {
-        let env = Env::default();
-        env.mock_all_auths_allowing_non_root_auth();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(
-            DEXRouter,
-            (admin, Address::generate(&env), Address::generate(&env)),
-        );
-        let client = DEXRouterClient::new(&env, &contract_id);
-
-        assert_eq!(
-            client.get_best_price(&99, &Side::Buy, &10),
-            (0, 0, 0)
-        );
-        assert_eq!(
-            client.try_get_best_price(&99, &Side::Buy, &0),
-            Err(Ok(DEXError::ZeroAmount))
-        );
-    }
-
-    #[test]
     fn test_buy_full_order() {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
@@ -888,12 +698,14 @@ mod test {
         let order = client.get_order(&order_id);
         assert_eq!(order.status, OrderStatus::Filled);
 
-        let issuer_client =
-            nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id);
+        let issuer_client = nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id);
         assert_eq!(issuer_client.get_holder_balance(&bond_id, &seller), 4_000);
         assert_eq!(issuer_client.get_holder_balance(&bond_id, &buyer), 1_000);
 
-        assert_eq!(client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")), 0);
+        assert_eq!(
+            client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")),
+            0
+        );
         assert_eq!(
             client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")),
             100_000
@@ -934,8 +746,7 @@ mod test {
         assert_eq!(order.status, OrderStatus::PartiallyFilled);
         assert_eq!(order.amount, 600);
 
-        let issuer_client =
-            nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id);
+        let issuer_client = nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id);
         assert_eq!(issuer_client.get_holder_balance(&bond_id, &seller), 4_600);
         assert_eq!(issuer_client.get_holder_balance(&bond_id, &buyer), 400);
 
@@ -956,7 +767,10 @@ mod test {
         assert_eq!(issuer_client.get_holder_balance(&bond_id, &seller), 4_000);
         assert_eq!(issuer_client.get_holder_balance(&bond_id, &buyer), 1_000);
 
-        assert_eq!(client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")), 0);
+        assert_eq!(
+            client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")),
+            0
+        );
         assert_eq!(
             client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")),
             100_000
@@ -974,8 +788,7 @@ mod test {
         let (_issuer_admin, issuer_id, bond_id, seller) =
             setup_bond_and_holder(&env, 10_000, 1_000);
 
-        let issuer_client =
-            nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id.clone());
+        let issuer_client = nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id.clone());
 
         let contract_id = env.register(
             DEXRouter,
@@ -1009,7 +822,10 @@ mod test {
             client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")),
             100_000
         );
-        assert_eq!(client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")), 0);
+        assert_eq!(
+            client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")),
+            0
+        );
 
         // The failed purchase is fully atomic: the buyer's nonce is rolled back
         // together with the escrow bookkeeping, so the same nonce can be reused
@@ -1034,8 +850,7 @@ mod test {
         let (_issuer_admin, issuer_id, bond_id, seller) =
             setup_bond_and_holder(&env, 10_000, 2_000);
 
-        let issuer_client =
-            nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id.clone());
+        let issuer_client = nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id.clone());
 
         let contract_id = env.register(
             DEXRouter,
@@ -1085,8 +900,7 @@ mod test {
         let (_issuer_admin, issuer_id, bond_id, seller) =
             setup_bond_and_holder(&env, 10_000, 5_000);
 
-        let issuer_client =
-            nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id.clone());
+        let issuer_client = nbbs_bond_issuer::BondIssuerClient::new(&env, &issuer_id.clone());
 
         let contract_id = env.register(
             DEXRouter,
@@ -1150,7 +964,10 @@ mod test {
             client.get_quote_balance(&buyer, &Symbol::new(&env, "USDC")),
             50_000
         );
-        assert_eq!(client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")), 0);
+        assert_eq!(
+            client.get_quote_balance(&seller, &Symbol::new(&env, "USDC")),
+            0
+        );
     }
 
     #[test]
@@ -1163,7 +980,11 @@ mod test {
 
         let contract_id = env.register(
             DEXRouter,
-            (admin.clone(), Address::generate(&env), Address::generate(&env)),
+            (
+                admin.clone(),
+                Address::generate(&env),
+                Address::generate(&env),
+            ),
         );
         let client = DEXRouterClient::new(&env, &contract_id);
 
@@ -1349,7 +1170,11 @@ mod test {
 
         let contract_id = env.register(
             DEXRouter,
-            (admin.clone(), Address::generate(&env), Address::generate(&env)),
+            (
+                admin.clone(),
+                Address::generate(&env),
+                Address::generate(&env),
+            ),
         );
         let client = DEXRouterClient::new(&env, &contract_id);
 
@@ -1557,16 +1382,31 @@ mod test {
 
         // Create 3 orders
         let order1 = client.list_bond_tokens(
-            &seller, &bond_id, &1_000i128, &100i128,
-            &Symbol::new(&env, "USDC"), &100u64, &0,
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &0,
         );
         client.list_bond_tokens(
-            &seller, &bond_id, &500i128, &200i128,
-            &Symbol::new(&env, "XLM"), &10_000u64, &1,
+            &seller,
+            &bond_id,
+            &500i128,
+            &200i128,
+            &Symbol::new(&env, "XLM"),
+            &10_000u64,
+            &1,
         );
         let order3 = client.list_bond_tokens(
-            &seller, &bond_id, &300i128, &50i128,
-            &Symbol::new(&env, "USDC"), &100u64, &2,
+            &seller,
+            &bond_id,
+            &300i128,
+            &50i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &2,
         );
 
         // Cancel order 2 to create a gap
@@ -1985,7 +1825,10 @@ mod test {
 
         // Spot-check first and last.
         assert_eq!(seller_orders.get(0).unwrap(), 1u64);
-        assert_eq!(seller_orders.get((order_count - 1) as u32).unwrap(), order_count);
+        assert_eq!(
+            seller_orders.get((order_count - 1) as u32).unwrap(),
+            order_count
+        );
 
         // Every order must be individually retrievable and belong to this bond.
         let bond_orders = client.get_bond_orders(&bond_id);

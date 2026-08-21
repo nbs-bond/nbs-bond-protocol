@@ -1240,7 +1240,12 @@ mod test {
         );
         // Admins cannot count toward the provider threshold; verified reports
         // in tests go through the explicit auditable override path.
-        oc.admin_override_report(&t.admin, &report_id, &ReportStatus::Verified, &(admin_nonce + 1));
+        oc.admin_override_report(
+            &t.admin,
+            &report_id,
+            &ReportStatus::Verified,
+            &(admin_nonce + 1),
+        );
         report_id
     }
 
