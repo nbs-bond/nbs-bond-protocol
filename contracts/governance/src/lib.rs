@@ -472,6 +472,17 @@ impl Governance {
             return Err(GovernanceError::NotPending);
         }
 
+        // issue #191: a proposal whose expires_at has passed must stop
+        // accruing votes, even though its status is still nominally Pending
+        // — Soroban's revert-on-error semantics mean this call can't persist
+        // an Expired status transition (any write here would be rolled back
+        // along with the Err return), so this check is what actually closes
+        // the gap: rejecting the vote is what keeps an expired proposal from
+        // ever reaching Queued, since that's the only path there.
+        if is_expired(&env, &proposal) {
+            return Err(GovernanceError::ProposalExpired);
+        }
+
         // Guard checks presence of ANY prior choice, not a specific value —
         // this is what fixes the veto-bypass bug (#121): a stored `Veto` is
         // just as "already voted" as a stored `Approve`.
@@ -516,6 +527,12 @@ impl Governance {
 
         if proposal.status != ProposalStatus::Pending {
             return Err(GovernanceError::NotPending);
+        }
+
+        // issue #191: same expiry gate as vote_approve — a veto on an
+        // expired proposal must revert rather than accrue.
+        if is_expired(&env, &proposal) {
+            return Err(GovernanceError::ProposalExpired);
         }
 
         // Same presence check as vote_approve — this is the line that was
@@ -2003,6 +2020,108 @@ mod test {
 
         // veto_count must not have been inflated by the rejected second call.
         assert_eq!(client.get_proposal(&proposal_1).veto_count, 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Vote expiry (issue #191)
+    //
+    // Previously expiry was only checked at execute — a Pending proposal past
+    // its expires_at kept accepting votes and could still reach Queued, only
+    // to fail (uselessly) at execute. The tests below pin that voting itself
+    // now rejects an expired proposal, and that this is what stops it from
+    // ever reaching Queued.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_vote_approve_rejects_after_expiry() {
+        let (env, client, signers) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let target = make_target(&env);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        // One approval before expiry — stays Pending, below threshold.
+        client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        assert_eq!(client.get_proposal(&proposal_id).approval_count, 1);
+
+        // Advance past the proposal's own TTL, frozen at creation.
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+
+        // A further vote on the now-expired proposal must revert instead of
+        // silently accruing.
+        let result = client.try_vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+
+        // The rejected vote must not have moved the count.
+        assert_eq!(client.get_proposal(&proposal_id).approval_count, 1);
+    }
+
+    #[test]
+    fn test_vote_veto_rejects_after_expiry() {
+        let (env, client, signers) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let target = make_target(&env);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+
+        let result = client.try_vote_veto(&signers.get(1).unwrap(), &proposal_id, &0);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+        assert_eq!(client.get_proposal(&proposal_id).veto_count, 0);
+    }
+
+    #[test]
+    fn test_expired_proposal_cannot_reach_queued() {
+        // A proposal one vote short of threshold, left to expire, must never
+        // transition to Queued no matter how many more votes are attempted —
+        // Queued is only ever reached through vote_approve, and that path is
+        // now closed once the proposal has expired.
+        let (env, client, signers) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let target = make_target(&env);
+
+        let proposal_id = client.propose(
+            &signers.get(0).unwrap(),
+            &target,
+            &Symbol::new(&env, "set_something"),
+            &vec![&env],
+            &Symbol::new(&env, "desc"),
+            &0,
+        );
+        client.vote_approve(&signers.get(1).unwrap(), &proposal_id, &0);
+        client.vote_approve(&signers.get(2).unwrap(), &proposal_id, &0);
+        // One vote short of the 3-signer threshold; still Pending.
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Pending
+        );
+
+        env.ledger()
+            .set_timestamp(1_000_000 + DEFAULT_PROPOSAL_TTL_SECONDS + 1);
+
+        let result = client.try_vote_approve(&signers.get(3).unwrap(), &proposal_id, &0);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Pending
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────────
