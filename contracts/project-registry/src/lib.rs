@@ -38,6 +38,15 @@ pub struct ProjectSummary {
     pub country: Symbol,
 }
 
+/// Minimal registry-owned data needed to link an oracle report to a project.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ProjectLinkage {
+    pub id: u64,
+    pub metadata_ipfs_hash: BytesN<32>,
+    pub status: ProjectStatus,
+}
+
 fn project_id_to_bytes(env: &Env, id: u64) -> BytesN<32> {
     let mut arr = [0u8; 32];
     arr[..8].copy_from_slice(&id.to_be_bytes());
@@ -51,6 +60,22 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
         .get(&DataKey::Admin)
         .ok_or(RegistryError::NotInitialized)?;
     if caller != &admin {
+        return Err(RegistryError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn require_admin_or_oracle(env: &Env, caller: &Address) -> Result<(), RegistryError> {
+    if require_admin(env, caller).is_ok() {
+        return Ok(());
+    }
+
+    let oracle_consumer: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::OracleConsumerId)
+        .ok_or(RegistryError::OracleConsumerNotSet)?;
+    if caller != &oracle_consumer {
         return Err(RegistryError::Unauthorized);
     }
     Ok(())
@@ -204,7 +229,14 @@ impl ProjectRegistry {
         Ok(())
     }
 
+        179-retire-credits-basket-fix
     pub fn reject_project(
+       
+    /// Revoke an approved project. The admin or configured oracle consumer may
+    /// revoke it; rejected oracle reports use the latter path. Revoked projects
+    /// are permanently removed from the active registry and cannot be reinstated.
+    pub fn revoke_project(
+        main
         env: Env,
         caller: Address,
         project_id: u64,
@@ -224,7 +256,7 @@ impl ProjectRegistry {
             .persistent()
             .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
 
-        require_admin(&env, &caller)?;
+        require_admin_or_oracle(&env, &caller)?;
 
         let key = project_id_to_bytes(&env, project_id);
         let mut project: Project = env
@@ -245,9 +277,89 @@ impl ProjectRegistry {
         Ok(())
     }
 
+        179-retire-credits-basket-fix
     /// Revoke an approved project (admin-only). Revoked projects are permanently
     /// removed from the active registry and cannot be reinstated.
     pub fn revoke_project(
+       
+    /// Check if a project is active (Approved and not suspended).
+    pub fn is_project_active(env: &Env, project_id: u64) -> bool {
+        let key = project_id_to_bytes(env, project_id);
+        match env
+            .storage()
+            .instance()
+            .get::<DataKey, Project>(&DataKey::Project(key))
+        {
+            Some(project) => project.status == ProjectStatus::Approved,
+            None => false,
+        }
+    }
+
+    /// Get project status for oracle integration.
+    pub fn get_project_status(env: &Env, project_id: u64) -> Result<ProjectStatus, RegistryError> {
+        let key = project_id_to_bytes(env, project_id);
+        env.storage()
+            .instance()
+            .get::<DataKey, Project>(&DataKey::Project(key))
+            .map(|project: Project| project.status)
+            .ok_or(RegistryError::ProjectNotFound)
+    }
+
+    /// Return the registry-owned identity, metadata hash, and current status
+    /// needed by consumers that link records to a project. `project_id` is the
+    /// canonical numeric [`Project::id`]; callers must not substitute the
+    /// project's metadata hash for this identifier.
+    pub fn get_project_linkage(
+        env: &Env,
+        project_id: u64,
+    ) -> Result<ProjectLinkage, RegistryError> {
+        let key = project_id_to_bytes(env, project_id);
+        env.storage()
+            .instance()
+            .get::<DataKey, Project>(&DataKey::Project(key))
+            .map(|project| ProjectLinkage {
+                id: project.id,
+                metadata_ipfs_hash: project.metadata_ipfs_hash,
+                status: project.status,
+            })
+            .ok_or(RegistryError::ProjectNotFound)
+    }
+
+    /// Set the oracle consumer contract address (admin-only).
+    pub fn set_oracle_consumer(
+        env: Env,
+        caller: Address,
+        oracle_consumer_id: Address,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let expected_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Nonce(caller.clone()))
+            .unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleConsumerId, &oracle_consumer_id);
+
+        env.events()
+            .publish((symbol_short!("ORA_SET"),), (caller, oracle_consumer_id));
+
+        Ok(())
+    }
+
+    pub fn approve_project(
+        main
         env: Env,
         caller: Address,
         project_id: u64,
@@ -581,6 +693,33 @@ mod test {
     }
 
     #[test]
+    fn test_configured_oracle_can_revoke_approved_project() {
+        let (env, client, admin, user) = setup();
+        let oracle = Address::generate(&env);
+        let project_id = client.register_project(
+            &user,
+            &create_hash(&env, 8),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        client.approve_project(&admin, &project_id, &0);
+        client.set_oracle_consumer(&admin, &oracle, &1);
+
+        client.revoke_project(
+            &oracle,
+            &project_id,
+            &String::from_str(&env, "rejected report"),
+            &0,
+        );
+
+        assert_eq!(
+            client.get_project_status(&project_id),
+            ProjectStatus::Rejected
+        );
+    }
+
+    #[test]
     fn test_approve_non_existent_project() {
         let (_env, client, admin, _user) = setup();
         let result = client.try_approve_project(&admin, &999, &0);
@@ -647,6 +786,30 @@ mod test {
         let (_env, client, _admin, _user) = setup();
         let result = client.try_get_project(&999);
         assert_eq!(result, Err(Ok(RegistryError::ProjectNotFound)));
+    }
+
+    #[test]
+    fn test_get_project_linkage_uses_numeric_id() {
+        let (env, client, admin, user) = setup();
+        let metadata_hash = create_hash(&env, 9);
+        let project_id = client.register_project(
+            &user,
+            &metadata_hash,
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        client.approve_project(&admin, &project_id, &0);
+
+        let linkage = client.get_project_linkage(&project_id);
+        assert_eq!(linkage.id, project_id);
+        assert_eq!(linkage.metadata_ipfs_hash, metadata_hash);
+        assert_eq!(linkage.status, ProjectStatus::Approved);
+
+        assert_eq!(
+            client.try_get_project_linkage(&999),
+            Err(Ok(RegistryError::ProjectNotFound))
+        );
     }
 
     #[test]

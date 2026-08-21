@@ -289,6 +289,7 @@ impl CreditRetirement {
         };
         let accrued_by_type: i128 = env.invoke_contract(
             &coupon_engine,
+        179-retire-credits-basket-fix
             &Symbol::new(&env, "accrued_credits_by_type"),
             vec![
                 &env,
@@ -305,6 +306,8 @@ impl CreditRetirement {
         // credits were measured over — the vintage, in GHG Protocol terms.
         let period = match env.try_invoke_contract::<PeriodInfo, CouponEngineError>(
             &coupon_engine,
+
+         main
             &Symbol::new(&env, "get_period_info"),
             vec![&env, bond_id.into_val(&env), period_index.into_val(&env)],
         ) {
@@ -552,6 +555,26 @@ mod test {
         admin_nonce: u64,
     ) -> u64 {
         let oc_client = nbbs_oracle_consumer::OracleConsumerClient::new(env, oracle_id);
+        179-retire-credits-basket-fix
+       
+        let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &registry_id);
+        let owner = Address::generate(env);
+        let registry_project_id = registry.register_project(
+            &owner,
+            project_id,
+            &Symbol::new(env, "VCS"),
+            &Symbol::new(env, "US"),
+            &0,
+        );
+        registry.approve_project(admin, &registry_project_id, &0);
+        env.as_contract(oracle_id, || {
+            env.storage().instance().set(
+                &nbbs_oracle_consumer::DataKey::ProjectRegistry,
+                &registry_id,
+            );
+        });
+        main
         let provider = Address::generate(env);
         oc_client.register_provider(
             admin,
@@ -561,7 +584,7 @@ mod test {
         );
         let report_id = oc_client.submit_report(
             &provider,
-            project_id,
+            &registry_project_id,
             &period_start,
             &period_end,
             &carbon,
