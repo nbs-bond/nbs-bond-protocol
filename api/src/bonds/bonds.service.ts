@@ -1,4 +1,11 @@
-import { Injectable, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  ForbiddenException,
+  InternalServerErrorException,
+  UnauthorizedException,
+  Logger,
+} from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { NonceService } from '../common/services/nonce.service';
@@ -347,30 +354,196 @@ export class BondsService {
     };
   }
 
-  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
-    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
-    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
-
-    const { transactionHash } = await this.contractService.invokeContractMethod(
-      BOND_ISSUER(), 'transfer', investorSecret,
-      [
-        Address.fromString(dto.fromAddress).toScVal(),
-        Address.fromString(dto.toAddress).toScVal(),
-        nativeToScVal(BigInt(id), { type: 'u64' }),
-        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
-      ],
-      nonce,
+  /**
+   * Peer-to-peer transfer of bond tokens between two holders.
+   *
+   * This is a unilateral token movement, NOT a sale: there is no escrow and
+   * no quote-asset leg, so the transfer is not atomic with any payment.
+   * Delivery-versus-payment is the DEX's job (see MarketplaceController);
+   * callers of this endpoint are moving their own tokens off-DEX and settle
+   * the cash leg out of band.
+   *
+   * `sessionAddress` comes from the authenticated JWT (`sub`) and is the only
+   * trusted source of the sender's identity; `dto.fromAddress` is optional
+   * and merely cross-checked against it (403 on mismatch).
+   *
+   * REPLAY EXPOSURE (issue #13): `BondIssuer.transfer` does not take a nonce,
+   * unlike `subscribe`, `issue_bond` and the CouponEngine entrypoints, so the
+   * call is submitted without one -- passing a nonce argument the contract
+   * does not declare would simply fail with a host arity error. Until #13
+   * adds a nonce to `transfer`, a captured authorisation entry for this call
+   * can be replayed on-chain. Once #13 lands, this method should switch to
+   * `invokeContractMethod` with `nonceService.next(BOND_ISSUER(), from)`.
+   */
+  async transfer(
+    id: number,
+    dto: TransferBondDto,
+    sessionAddress: string,
+  ): Promise<TransferResponse> {
+    const fromAddress = this.resolveCallerAddress(
+      sessionAddress,
+      dto.fromAddress,
+      'fromAddress',
     );
 
+    if (dto.toAddress === fromAddress) {
+      throw new BadRequestException(
+        'toAddress must differ from the sending address',
+      );
+    }
+
+    const investorSecret = this.getSigningSecretFor(fromAddress, 'Transferring');
+
+    // Pre-flight the balance so an under-funded transfer fails with a clear
+    // 400 instead of an opaque InsufficientSupply contract error. A balance
+    // that cannot be read (RPC hiccup, unknown bond) is left to the contract
+    // rather than reported as a zero balance. The authoritative check always
+    // happens on-chain either way.
+    const balance = await this.tryReadHolderBalance(id, fromAddress);
+    if (balance !== undefined && balance < dto.amount) {
+      throw new BadRequestException(
+        `Insufficient bond token balance: holder has ${balance}, tried to transfer ${dto.amount}`,
+      );
+    }
+
+    let transactionHash: string | undefined;
+    try {
+      ({ transactionHash } = await this.contractService.sendTransaction({
+        contractAddress: BOND_ISSUER(),
+        method: 'transfer',
+        args: [
+          Address.fromString(fromAddress).toScVal(),
+          Address.fromString(dto.toAddress).toScVal(),
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+        ],
+        sourceSecretKey: investorSecret,
+      }));
+    } catch (error) {
+      throw this.mapTransferError(error, id);
+    }
+
+    // Track both sides off-chain: the recipient may be a brand new holder,
+    // and the sender stays in the set until getHolders() filters it out on a
+    // zero on-chain balance.
     await this.redis.sAdd(`bond:${id}:holders`, dto.toAddress);
+    await this.redis.sAdd(`bond:${id}:holders`, fromAddress);
 
     return {
       bondId: id,
-      fromAddress: dto.fromAddress,
+      fromAddress,
       toAddress: dto.toAddress,
       amount: dto.amount,
       transactionHash: transactionHash || '',
     };
+  }
+
+  /**
+   * Reads a holder's on-chain balance, returning `undefined` (rather than 0)
+   * when the read itself fails, so callers can tell "no tokens" apart from
+   * "could not find out".
+   */
+  private async tryReadHolderBalance(
+    id: number,
+    address: string,
+  ): Promise<number | undefined> {
+    try {
+      const balanceScVal = await this.contractService.simulateCall({
+        contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
+        args: [
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          Address.fromString(address).toScVal(),
+        ],
+      });
+      return Number(scValToNative(balanceScVal));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Resolves the address an authenticated request acts for.
+   *
+   * The session address (JWT `sub`) always wins. A body-supplied address is
+   * accepted only when it is identical; a mismatch is an authorisation
+   * failure (403), not a malformed request (400), because the request is
+   * well-formed -- the caller simply is not that address.
+   */
+  private resolveCallerAddress(
+    sessionAddress: string,
+    suppliedAddress: string | undefined,
+    field: string,
+  ): string {
+    if (!sessionAddress || !/^G[A-Z2-7]{55}$/.test(sessionAddress)) {
+      throw new UnauthorizedException(
+        'Authenticated session does not carry a valid Stellar address',
+      );
+    }
+    if (suppliedAddress && suppliedAddress !== sessionAddress) {
+      throw new ForbiddenException(
+        `${field} does not match the authenticated wallet address`,
+      );
+    }
+    return sessionAddress;
+  }
+
+  /**
+   * Returns the secret key the API signs investor transactions with, after
+   * checking it actually belongs to `address`.
+   *
+   * The API holds a single investor key (INVESTOR_SECRET_KEY), so it can only
+   * sign for that one wallet. Any other authenticated caller gets a 403 rather
+   * than a confusing on-chain auth failure. Accepting a pre-signed XDR from
+   * the wallet is the intended replacement for this server-side custody.
+   */
+  private getSigningSecretFor(address: string, action: string): string {
+    const secret = process.env.INVESTOR_SECRET_KEY || '';
+    if (!secret) {
+      throw new InternalServerErrorException(
+        'Investor signing key is not configured on this deployment',
+      );
+    }
+
+    let signerAddress: string;
+    try {
+      signerAddress = this.stellarService.getKeypairFromSecret(secret).publicKey();
+    } catch {
+      throw new InternalServerErrorException(
+        'Investor signing key is not a valid Stellar secret key',
+      );
+    }
+
+    if (signerAddress !== address) {
+      throw new ForbiddenException(
+        `${action} is temporarily limited to the configured investor wallet`,
+      );
+    }
+    return secret;
+  }
+
+  private mapTransferError(error: unknown, bondId: number): Error {
+    const code =
+      error instanceof Error
+        ? Number(error.message.match(/error code (\d+)/)?.[1])
+        : NaN;
+
+    if (code === BOND_ERROR_CODE.BondNotFound) {
+      return new BadRequestException(`Bond #${bondId} does not exist`);
+    }
+    if (code === BOND_ERROR_CODE.BondAlreadyMatured) {
+      return new BadRequestException(
+        `Bond #${bondId} has matured; its tokens can no longer be transferred`,
+      );
+    }
+    if (code === BOND_ERROR_CODE.InsufficientSupply) {
+      return new BadRequestException(
+        'Insufficient bond token balance for this transfer',
+      );
+    }
+    if (error instanceof Error) {
+      return error;
+    }
+    return new BadRequestException('Failed to transfer bond tokens');
   }
 
   async getUndistributedTotal(id: number): Promise<UndistributedTotalResponse> {

@@ -63,6 +63,28 @@ describe('BondsController guards', () => {
     expect(service.getAccruedCredits).toHaveBeenCalledWith(1, 'holder-key');
   });
 
+  it('passes the authenticated wallet address to the transfer service call', async () => {
+    const transferred = {
+      bondId: 4,
+      fromAddress: 'GSENDER',
+      toAddress: 'GRECIPIENT',
+      amount: 10,
+      transactionHash: 'tx',
+    };
+    const service = { transfer: jest.fn().mockResolvedValue(transferred) };
+    const controller = new BondsController(service as any);
+    const dto = { toAddress: 'GRECIPIENT', amount: 10 };
+    const req = { user: { walletAddress: 'GSENDER' } } as any;
+
+    await expect(controller.transfer(4, dto, req)).resolves.toBe(transferred);
+    expect(service.transfer).toHaveBeenCalledWith(4, dto, 'GSENDER');
+  });
+
+  it('routes the transfer handler under the /bonds/:id/transfer path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.transfer);
+    expect(path).toBe(':id/transfer');
+  });
+
   it('routes the periods handler under the /bonds/:id/periods path', () => {
     const path = Reflect.getMetadata('path', BondsController.prototype.getPeriods);
     expect(path).toBe(':id/periods');
