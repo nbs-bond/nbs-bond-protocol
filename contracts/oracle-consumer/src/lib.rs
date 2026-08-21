@@ -16,6 +16,7 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = 2_073_600;
 #[contracttype]
 pub enum DataKey {
     Admin,
+    Token,
     Provider(Address),
     ProviderList,
     Report(u64),
@@ -129,8 +130,9 @@ pub struct OracleConsumer;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl OracleConsumer {
-    pub fn __constructor(env: Env, admin: Address) {
+    pub fn __constructor(env: Env, admin: Address, token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Token, &token);
         env.storage()
             .instance()
             .set(&DataKey::ChallengeWindow, &CHALLENGE_WINDOW_SECONDS);
@@ -742,6 +744,13 @@ impl OracleConsumer {
             .get(&provider_key)
             .ok_or(OracleError::ProviderNotFound)?;
 
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        soroban_sdk::token::Client::new(&env, &token).transfer(
+            &provider,
+            &env.current_contract_address(),
+            &amount,
+        );
+
         p.stake = p.stake.checked_add(amount).ok_or(OracleError::InsufficientStake)?;
         env.storage().persistent().set(&provider_key, &p);
         bump_persistent(&env, &provider_key);
@@ -786,6 +795,13 @@ impl OracleConsumer {
         env.storage().persistent().set(&provider_key, &p);
         bump_persistent(&env, &provider_key);
 
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        soroban_sdk::token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &provider,
+            &amount,
+        );
+
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
             (provider, amount),
@@ -817,6 +833,12 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
     }
     env.storage().persistent().set(&provider_key, &p);
     bump_persistent(env, &provider_key);
+
+    let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+    soroban_sdk::token::Client::new(env, &token).burn(
+        &env.current_contract_address(),
+        &penalty,
+    );
 
     let sh_key = DataKey::SlashHistory(provider.clone());
     let mut history: Vec<SlashRecord> = env
@@ -869,7 +891,9 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -918,7 +942,9 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "uk_bng"), &0);
@@ -951,7 +977,9 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "uk_bng"), &0);
@@ -981,7 +1009,9 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1037,7 +1067,9 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -1083,7 +1115,9 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -1123,7 +1157,9 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -1163,7 +1199,9 @@ mod test {
         let rogue = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_submit_report(
@@ -1188,7 +1226,9 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1211,7 +1251,9 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1244,7 +1286,9 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1282,7 +1326,9 @@ mod test {
         let stranger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1316,7 +1362,9 @@ mod test {
         let provider_b = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1349,7 +1397,9 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1379,7 +1429,9 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1424,7 +1476,9 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1474,7 +1528,9 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1514,7 +1570,9 @@ mod test {
 
         let admin = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_get_report(&999);
@@ -1529,7 +1587,9 @@ mod test {
         let admin = Address::generate(&env);
         let stranger = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_get_provider(&stranger);
@@ -1543,7 +1603,9 @@ mod test {
 
         let admin = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.set_signature_threshold(&admin, &3u32, &0);
@@ -1558,20 +1620,52 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&provider, &100_000);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
         assert_eq!(client.get_provider(&provider).stake, 0);
 
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &50_000i128, &0);
         assert_eq!(client.get_provider(&provider).stake, 50_000);
+        assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&client.address), 50_000);
+        assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&provider), 50_000);
 
         let result = client.try_withdraw_stake(&provider, &60_000i128, &1);
         assert_eq!(result, Err(Ok(OracleError::InsufficientStake)));
 
         client.withdraw_stake(&provider, &20_000i128, &1);
         assert_eq!(client.get_provider(&provider).stake, 30_000);
+        assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&client.address), 30_000);
+        assert_eq!(soroban_sdk::token::Client::new(&env, &token).balance(&provider), 70_000);
+    }
+
+
+    #[test]
+    fn test_stake_insufficient_token_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        
+        // Try adding stake without minting tokens to provider
+        let result = client.try_add_stake(&provider, &50_000i128, &0);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1582,13 +1676,14 @@ mod test {
         let admin = Address::generate(&env);
         let rogue = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_add_stake(&rogue, &1_000i128, &0);
         assert_eq!(result, Err(Ok(OracleError::ProviderNotFound)));
     }
-
     #[test]
     fn test_stake_zero_amount_rejected() {
         let env = Env::default();
@@ -1597,7 +1692,9 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1616,10 +1713,13 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &100_000i128, &0);
 
         let report_id = client.submit_report(
@@ -1666,10 +1766,13 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &5i128, &0);
 
         let report_id = client.submit_report(
@@ -1713,10 +1816,13 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &100_000i128, &0);
 
         let report_id = client.submit_report(
@@ -1760,10 +1866,13 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &100_000i128, &0);
 
         let report_id = client.submit_report(
@@ -1836,7 +1945,9 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1861,7 +1972,9 @@ mod test {
         let admin = Address::generate(&env);
         let stranger = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_get_provider_stats(&stranger);
@@ -1902,7 +2015,9 @@ mod test {
         let provider_c = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.set_signature_threshold(&admin, &2u32, &0);
@@ -1952,7 +2067,9 @@ mod test {
         let provider_c = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.set_signature_threshold(&admin, &2u32, &0);
@@ -1994,7 +2111,9 @@ mod test {
         let provider_a = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let report_id = register_provider_and_submit(
@@ -2025,7 +2144,9 @@ mod test {
         let provider_b = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.set_signature_threshold(&admin, &2u32, &0);
@@ -2065,7 +2186,9 @@ mod test {
         let admin = Address::generate(&env);
         let project_id = create_project_id(&env, 42);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let reports = client.get_project_reports(&project_id);
@@ -2135,7 +2258,9 @@ mod test {
                 let challenger = Address::generate(&env);
                 let project_id = create_project_id(&env, 1);
 
-                let contract_id = env.register(OracleConsumer, (admin.clone(),));
+                let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
                 let client = OracleConsumerClient::new(&env, &contract_id);
 
                 client.register_provider(
@@ -2144,6 +2269,7 @@ mod test {
                     &Symbol::new(&env, "verra_vcs"),
                     &0,
                 );
+                soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
                 client.add_stake(&provider, &stake, &0);
 
                 let report_id = client.submit_report(
@@ -2188,7 +2314,9 @@ mod test {
 
                 let admin = Address::generate(&env);
                 let provider = Address::generate(&env);
-                let contract_id = env.register(OracleConsumer, (admin.clone(),));
+                let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
                 let client = OracleConsumerClient::new(&env, &contract_id);
 
                 client.register_provider(
@@ -2201,6 +2329,7 @@ mod test {
                 let mut stake = 0i128;
                 let mut nonce = 0u64;
                 for d in deposits {
+                    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
                     client.add_stake(&provider, &d, &nonce);
                     nonce += 1;
                     stake += d;
@@ -2236,7 +2365,9 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);

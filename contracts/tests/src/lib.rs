@@ -74,7 +74,10 @@ mod integration {
         let bi_addr = env.register(BondIssuer, (admin.clone(),));
         let bi_client = BondIssuerClient::new(env, &bi_addr);
 
-        let oc_addr = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(env);
+        let token_addr = env.register_stellar_asset_contract_v2(token_admin).address();
+
+        let oc_addr = env.register(OracleConsumer, (admin.clone(), token_addr.clone()));
         let oc_client = OracleConsumerClient::new(env, &oc_addr);
 
         let ce_addr = env.register(
