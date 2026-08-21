@@ -30,6 +30,8 @@ pub enum DataKey {
     ProviderReportCount(Address),
     ProviderChallenges(Address),
     SlashHistory(Address),
+    LockedStake(Address),
+    ReportLock(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -297,6 +299,8 @@ impl OracleConsumer {
         env.storage().persistent().set(&report_key, &report);
         bump_persistent(&env, &report_key);
 
+        lock_stake_for_report(&env, &provider, report_id, p.stake);
+
         let proj_key = DataKey::ProjectReports(project_id.clone());
         let mut project_reports: Vec<u64> = env
             .storage()
@@ -408,6 +412,8 @@ impl OracleConsumer {
             report.verified_at = env.ledger().timestamp();
             env.storage().persistent().set(&report_key, &report);
             bump_persistent(&env, &report_key);
+
+            release_report_lock(&env, &report.provider, report_id);
 
             env.events().publish(
                 (Symbol::new(&env, "report_verified"),),
@@ -549,6 +555,8 @@ impl OracleConsumer {
         env.storage().persistent().set(&report_key, &report);
         bump_persistent(&env, &report_key);
 
+        release_report_lock(&env, &report.provider, report_id);
+
         if resolution == ReportStatus::Rejected {
             slash_provider(&env, &report.provider, report_id);
         }
@@ -658,6 +666,15 @@ impl OracleConsumer {
             stake: p.stake,
             active: p.active,
         })
+    }
+
+    pub fn get_locked_stake(env: Env, provider: Address) -> i128 {
+        let key = DataKey::LockedStake(provider);
+        let val = env.storage().persistent().get(&key).unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
     }
 
     pub fn get_slash_history(env: Env, provider: Address) -> Vec<SlashRecord> {
@@ -782,6 +799,13 @@ impl OracleConsumer {
         if p.stake < amount {
             return Err(OracleError::InsufficientStake);
         }
+
+        let locked_key = DataKey::LockedStake(provider.clone());
+        let locked: i128 = env.storage().persistent().get(&locked_key).unwrap_or(0);
+        if p.stake - amount < locked {
+            return Err(OracleError::StakeLocked);
+        }
+
         p.stake -= amount;
         env.storage().persistent().set(&provider_key, &p);
         bump_persistent(&env, &provider_key);
@@ -795,6 +819,54 @@ impl OracleConsumer {
     }
 }
 
+/// The amount of stake that would be forfeited if `stake` were slashed right now.
+fn slashable_amount(stake: i128) -> i128 {
+    let mut penalty = stake * SLASH_PENALTY_PPM / 1_000_000;
+    if penalty <= 0 {
+        penalty = stake;
+    }
+    if penalty > stake {
+        penalty = stake;
+    }
+    penalty
+}
+
+/// Reserve the amount that could be slashed for a newly-submitted report so it
+/// cannot be withdrawn before the report is resolved (verified/rejected).
+fn lock_stake_for_report(env: &Env, provider: &Address, report_id: u64, stake: i128) {
+    let lock_amount = slashable_amount(stake);
+
+    let report_lock_key = DataKey::ReportLock(report_id);
+    env.storage().persistent().set(&report_lock_key, &lock_amount);
+    bump_persistent(env, &report_lock_key);
+
+    let locked_key = DataKey::LockedStake(provider.clone());
+    let locked: i128 = env.storage().persistent().get(&locked_key).unwrap_or(0);
+    env.storage().persistent().set(&locked_key, &(locked + lock_amount));
+    bump_persistent(env, &locked_key);
+}
+
+/// Release a report's reserved stake once it reaches a terminal status
+/// (Verified or Rejected).
+fn release_report_lock(env: &Env, provider: &Address, report_id: u64) {
+    let report_lock_key = DataKey::ReportLock(report_id);
+    let lock_amount: i128 = env
+        .storage()
+        .persistent()
+        .get(&report_lock_key)
+        .unwrap_or(0);
+    if lock_amount == 0 {
+        return;
+    }
+    env.storage().persistent().remove(&report_lock_key);
+
+    let locked_key = DataKey::LockedStake(provider.clone());
+    let locked: i128 = env.storage().persistent().get(&locked_key).unwrap_or(0);
+    let new_locked = if lock_amount > locked { 0 } else { locked - lock_amount };
+    env.storage().persistent().set(&locked_key, &new_locked);
+    bump_persistent(env, &locked_key);
+}
+
 fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
     let provider_key = DataKey::Provider(provider.clone());
     let mut p: OracleProvider = env
@@ -803,13 +875,7 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
         .get(&provider_key)
         .unwrap();
 
-    let mut penalty = p.stake * SLASH_PENALTY_PPM / 1_000_000;
-    if penalty <= 0 {
-        penalty = p.stake;
-    }
-    if penalty > p.stake {
-        penalty = p.stake;
-    }
+    let penalty = slashable_amount(p.stake);
 
     p.stake -= penalty;
     if p.stake == 0 {
@@ -1604,6 +1670,166 @@ mod test {
 
         let result = client.try_add_stake(&provider, &0i128, &0);
         assert_eq!(result, Err(Ok(OracleError::InsufficientStake)));
+    }
+
+    #[test]
+    fn test_withdraw_full_stake_blocked_while_report_pending() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        client.add_stake(&provider, &100_000i128, &0);
+
+        client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        assert_eq!(client.get_locked_stake(&provider), 10_000);
+
+        let result = client.try_withdraw_stake(&provider, &100_000i128, &2);
+        assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
+
+        client.withdraw_stake(&provider, &90_000i128, &2);
+        assert_eq!(client.get_provider(&provider).stake, 10_000);
+
+        let result = client.try_withdraw_stake(&provider, &1i128, &3);
+        assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
+    }
+
+    #[test]
+    fn test_withdraw_lock_releases_after_report_verified() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.add_stake(&provider, &100_000i128, &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        let result = client.try_withdraw_stake(&provider, &100_000i128, &2);
+        assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
+
+        client.verify_report(&admin, &report_id, &1);
+        assert_eq!(client.get_locked_stake(&provider), 0);
+
+        client.withdraw_stake(&provider, &100_000i128, &2);
+        assert_eq!(client.get_provider(&provider).stake, 0);
+    }
+
+    #[test]
+    fn test_withdraw_lock_releases_after_challenge_resolved() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.add_stake(&provider, &100_000i128, &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+
+        let result = client.try_withdraw_stake(&provider, &100_000i128, &2);
+        assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
+
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
+        assert_eq!(client.get_locked_stake(&provider), 0);
+
+        client.withdraw_stake(&provider, &100_000i128, &2);
+        assert_eq!(client.get_provider(&provider).stake, 0);
+    }
+
+    /// Reproduces the escape sequence from issue #182: a provider used to be
+    /// able to submit a report, withdraw their entire stake before it was
+    /// resolved, and have `slash_provider` compute a zero penalty on
+    /// rejection. The stake lock must keep the sequence from working.
+    #[test]
+    fn test_issue_182_escape_sequence_now_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.add_stake(&provider, &1_000i128, &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        let result = client.try_withdraw_stake(&provider, &1_000i128, &2);
+        assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
+
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
+
+        let slashed = client.get_provider(&provider);
+        assert_eq!(slashed.stake, 900);
+        assert_eq!(client.get_slash_history(&provider).get(0).unwrap().penalty, 100);
     }
 
     #[test]
