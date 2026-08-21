@@ -1,5 +1,11 @@
 import { Test } from '@nestjs/testing';
-import { BadRequestException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  InternalServerErrorException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { xdr, scValToNative, nativeToScVal, Address, Keypair } from '@stellar/stellar-sdk';
 
 // BigInt is not JSON-serializable by default.  Jest workers use JSON.stringify
@@ -943,5 +949,185 @@ describe('BondsService', () => {
         verifiedAt: 1700000060,
       });
     });
+  });
+});
+
+describe('BondsService.claimCredits', () => {
+  const INVESTOR_SECRET = Keypair.random();
+  const INVESTOR = INVESTOR_SECRET.publicKey();
+  const OTHER_HOLDER = Keypair.random().publicKey();
+
+  const buildClaimService = async (opts: {
+    accrued: number;
+    claimed?: number;
+    invokeError?: Error;
+  }) => {
+    const simulateCall = jest.fn(({ method }: { method: string }) => {
+      if (method === 'accrued_credits') {
+        return Promise.resolve(
+          nativeToScVal(BigInt(opts.accrued), { type: 'i128' }),
+        );
+      }
+      return Promise.resolve(nativeToScVal(BigInt(0), { type: 'i128' }));
+    });
+
+    const invokeContractMethod = opts.invokeError
+      ? jest.fn().mockRejectedValue(opts.invokeError)
+      : jest.fn().mockResolvedValue({
+          result: nativeToScVal(BigInt(opts.claimed ?? opts.accrued), {
+            type: 'i128',
+          }),
+          transactionHash: 'tx-hash',
+          successful: true,
+        });
+
+    const next = jest.fn().mockResolvedValue(4);
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        BondsService,
+        { provide: ContractService, useValue: { simulateCall, invokeContractMethod } },
+        {
+          provide: StellarService,
+          useValue: {
+            getKeypairFromSecret: jest
+              .fn()
+              .mockImplementation((secret: string) => Keypair.fromSecret(secret)),
+          },
+        },
+        { provide: NonceService, useValue: { next } },
+        { provide: KycService, useValue: kycServiceMock },
+      ],
+    }).compile();
+
+    return {
+      svc: moduleRef.get(BondsService) as BondsService,
+      simulateCall,
+      invokeContractMethod,
+      next,
+    };
+  };
+
+  beforeEach(() => {
+    process.env.INVESTOR_SECRET_KEY = INVESTOR_SECRET.secret();
+  });
+
+  afterAll(() => {
+    delete process.env.INVESTOR_SECRET_KEY;
+  });
+
+  it('claims for the authenticated session address and reports the on-chain amount', async () => {
+    const { svc, invokeContractMethod } = await buildClaimService({
+      accrued: 250,
+      claimed: 250,
+    });
+
+    await expect(svc.claimCredits(3, {}, INVESTOR)).resolves.toEqual({
+      bondId: 3,
+      investorAddress: INVESTOR,
+      credits: 250,
+      transactionHash: 'tx-hash',
+    });
+
+    const [contract, method, secret, args, nonce] =
+      invokeContractMethod.mock.calls[0];
+    expect(method).toBe('claim_credits');
+    expect(contract).toBe(process.env.COUPON_ENGINE_ADDRESS || '');
+    expect(secret).toBe(INVESTOR_SECRET.secret());
+    expect(scValToNative(args[0])).toBe(INVESTOR);
+    expect(Number(scValToNative(args[1]))).toBe(3);
+    expect(nonce).toBe(4);
+  });
+
+  it('returns the amount the contract actually zeroed, not the pre-read balance', async () => {
+    const { svc } = await buildClaimService({ accrued: 250, claimed: 180 });
+
+    const response = await svc.claimCredits(3, {}, INVESTOR);
+
+    expect(response.credits).toBe(180);
+  });
+
+  it('accepts a body address identical to the session address', async () => {
+    const { svc } = await buildClaimService({ accrued: 10 });
+
+    await expect(
+      svc.claimCredits(1, { investorAddress: INVESTOR }, INVESTOR),
+    ).resolves.toMatchObject({ investorAddress: INVESTOR });
+  });
+
+  it('rejects a body address that is not the authenticated wallet with 403', async () => {
+    const { svc, invokeContractMethod } = await buildClaimService({ accrued: 10 });
+
+    await expect(
+      svc.claimCredits(1, { investorAddress: OTHER_HOLDER }, INVESTOR),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(invokeContractMethod).not.toHaveBeenCalled();
+  });
+
+  it('rejects a session that carries no valid Stellar address with 401', async () => {
+    const { svc } = await buildClaimService({ accrued: 10 });
+
+    await expect(svc.claimCredits(1, {}, 'not-an-address')).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+  });
+
+  it('rejects a caller the API holds no signing key for with 403', async () => {
+    const { svc, invokeContractMethod } = await buildClaimService({ accrued: 10 });
+
+    await expect(svc.claimCredits(1, {}, OTHER_HOLDER)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+    expect(invokeContractMethod).not.toHaveBeenCalled();
+  });
+
+  it('fails with 500 when no investor signing key is configured', async () => {
+    delete process.env.INVESTOR_SECRET_KEY;
+    const { svc } = await buildClaimService({ accrued: 10 });
+
+    await expect(svc.claimCredits(1, {}, INVESTOR)).rejects.toBeInstanceOf(
+      InternalServerErrorException,
+    );
+  });
+
+  it('short-circuits without submitting a transaction when nothing is accrued', async () => {
+    const { svc, invokeContractMethod, next } = await buildClaimService({
+      accrued: 0,
+    });
+
+    await expect(svc.claimCredits(5, {}, INVESTOR)).resolves.toEqual({
+      bondId: 5,
+      investorAddress: INVESTOR,
+      credits: 0,
+      transactionHash: '',
+    });
+    expect(invokeContractMethod).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('maps an on-chain accounting mismatch to 409 Conflict', async () => {
+    const { svc } = await buildClaimService({
+      accrued: 100,
+      invokeError: new BadRequestException(
+        'Transaction simulation failed: host error (contract error code 13)',
+      ),
+    });
+
+    await expect(svc.claimCredits(2, {}, INVESTOR)).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+  });
+
+  it('maps an unknown bond to 400', async () => {
+    const { svc } = await buildClaimService({
+      accrued: 100,
+      invokeError: new BadRequestException(
+        'Transaction simulation failed: host error (contract error code 4)',
+      ),
+    });
+
+    await expect(svc.claimCredits(99, {}, INVESTOR)).rejects.toThrow(
+      'Bond #99 does not exist',
+    );
   });
 });

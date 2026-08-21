@@ -63,6 +63,26 @@ describe('BondsController guards', () => {
     expect(service.getAccruedCredits).toHaveBeenCalledWith(1, 'holder-key');
   });
 
+  it('passes the authenticated wallet address to the claim service call', async () => {
+    const claimed = {
+      bondId: 4,
+      investorAddress: 'GINVESTOR',
+      credits: 10,
+      transactionHash: 'tx',
+    };
+    const service = { claimCredits: jest.fn().mockResolvedValue(claimed) };
+    const controller = new BondsController(service as any);
+    const req = { user: { walletAddress: 'GINVESTOR' } } as any;
+
+    await expect(controller.claimCredits(4, {}, req)).resolves.toBe(claimed);
+    expect(service.claimCredits).toHaveBeenCalledWith(4, {}, 'GINVESTOR');
+  });
+
+  it('routes the claim handler under the /bonds/:id/claim path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.claimCredits);
+    expect(path).toBe(':id/claim');
+  });
+
   it('routes the periods handler under the /bonds/:id/periods path', () => {
     const path = Reflect.getMetadata('path', BondsController.prototype.getPeriods);
     expect(path).toBe(':id/periods');
