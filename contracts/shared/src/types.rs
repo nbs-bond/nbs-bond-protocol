@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[contracttype]
@@ -89,4 +89,12 @@ pub enum ReportStatus {
 pub enum VoteChoice {
     Approve,
     Veto,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum GovernanceAction {
+    AddSigner(Address),
+    RemoveSigner(Address),
+    UpdateThreshold(u32),
 }
