@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, HttpException, HttpStatus, Logger, OnModuleDestroy } from '@nestjs/common';
 import {
   rpc,
   TransactionBuilder,
@@ -32,9 +32,23 @@ export interface ContractCallResult {
 }
 
 @Injectable()
-export class ContractService {
+export class ContractService implements OnModuleDestroy {
   private sorobanRpc: rpc.Server;
   private readonly logger = new Logger(ContractService.name);
+
+  /**
+   * When true, sendTransaction() will reject new submissions immediately.
+   * Set by onModuleDestroy() before waiting for in-flight transactions.
+   */
+  private shuttingDown = false;
+
+  /**
+   * Every active pollTransactionConfirmation() call is tracked here.
+   * onModuleDestroy() waits for all of them to settle before returning,
+   * giving in-flight blockchain transactions a chance to reach a terminal
+   * state (SUCCESS or FAILED) before the process exits.
+   */
+  private readonly inFlightTransactions = new Set<Promise<xdr.ScVal>>();
 
   constructor(
     private readonly stellarService: StellarService,
@@ -100,6 +114,15 @@ export class ContractService {
         );
       }
 
+      // Reject new submissions once shutdown has been requested so we do not
+      // start transactions we cannot wait for.
+      if (this.shuttingDown) {
+        throw new HttpException(
+          'Service is shutting down — transaction submission refused',
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
+
       const keypair = Keypair.fromSecret(sourceSecretKey);
       const contract = new Contract(contractAddress);
 
@@ -135,12 +158,23 @@ export class ContractService {
 
       const hash = response.hash;
 
+      // Track the confirmation promise so onModuleDestroy() can wait for it.
+      const confirmationPromise = this.pollTransactionConfirmation(hash, contractAddress, keypair, method);
+      this.inFlightTransactions.add(confirmationPromise);
+      // Remove the promise from the tracking set once it settles.  Handle
+      // both outcomes explicitly so the derived promise never becomes an
+      // unhandled rejection when the transaction fails or times out.
+      confirmationPromise.then(
+        () => this.inFlightTransactions.delete(confirmationPromise),
+        () => this.inFlightTransactions.delete(confirmationPromise),
+      );
+
       // Poll getTransaction until the transaction is included in a ledger
       // or the timeout expires.  Without this confirmation step the nonce
       // mirror in Redis can diverge from on-chain state: sendTransaction
       // returns while the tx is still PENDING, the caller increments the
       // nonce, and the next submission fails with InvalidNonce.
-      const retval = await this.pollTransactionConfirmation(hash, contractAddress, keypair, method);
+      const retval = await confirmationPromise;
 
       return {
         result: retval,
@@ -382,5 +416,33 @@ export class ContractService {
 
   getSorobanRpc(): rpc.Server {
     return this.sorobanRpc;
+  }
+
+  /**
+   * Gracefully shut down the ContractService.
+   *
+   * Steps:
+   * 1. Set the shutdown flag so sendTransaction() refuses new submissions.
+   * 2. Wait for all in-flight pollTransactionConfirmation() calls to settle
+   *    (SUCCESS, FAILED, or timeout). This prevents leaving blockchain
+   *    transactions in an indeterminate state and keeps the Redis nonce mirror
+   *    consistent (rollbacks for failed/timed-out transactions are still
+   *    performed by the polling loop itself before it resolves/rejects).
+   *
+   * Called automatically by NestJS when app.enableShutdownHooks() is active
+   * and the process receives SIGTERM/SIGINT.
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.shuttingDown = true;
+
+    if (this.inFlightTransactions.size > 0) {
+      this.logger.log(
+        `ContractService: waiting for ${this.inFlightTransactions.size} in-flight transaction(s) to settle`,
+      );
+      await Promise.allSettled([...this.inFlightTransactions]);
+      this.logger.log('ContractService: all in-flight transactions settled');
+    } else {
+      this.logger.log('ContractService: no in-flight transactions on shutdown');
+    }
   }
 }

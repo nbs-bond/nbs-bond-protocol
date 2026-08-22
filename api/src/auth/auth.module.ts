@@ -1,18 +1,18 @@
-import { Module } from '@nestjs/common';
-import { JwtModule } from '@nestjs/jwt';
-import { PassportModule } from '@nestjs/passport';
-import { AuthController } from './auth.controller';
-import { AuthService } from './auth.service';
-import { JwtStrategy } from './jwt.strategy';
-import { KycService } from './kyc.service';
-import { getJwtSecret } from './jwt.config';
+import { Module } from "@nestjs/common";
+import { JwtModule } from "@nestjs/jwt";
+import { PassportModule } from "@nestjs/passport";
+import { AuthController } from "./auth.controller";
+import { AuthService } from "./auth.service";
+import { JwtStrategy } from "./jwt.strategy";
+import { KycService } from "./kyc.service";
+import { getJwtSecret } from "./jwt.config";
 
 @Module({
   imports: [
-    PassportModule.register({ defaultStrategy: 'jwt' }),
+    PassportModule.register({ defaultStrategy: "jwt" }),
     JwtModule.register({
       secret: getJwtSecret(),
-      signOptions: { expiresIn: process.env.JWT_EXPIRY || '7d' },
+      signOptions: { expiresIn: process.env.JWT_EXPIRY || "1h" },
     }),
   ],
   controllers: [AuthController],

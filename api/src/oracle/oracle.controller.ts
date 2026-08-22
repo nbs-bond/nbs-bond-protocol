@@ -9,6 +9,7 @@ import { ChallengeDto } from './dto/challenge.dto';
 import { RegisterProviderDto } from './dto/register-provider.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
+import { ProviderGuard } from '../common/guards/provider.guard';
 import {
   ReportResponse,
   ChallengeResponse,
@@ -26,13 +27,13 @@ export class OracleController {
   ) {}
 
   @Post('reports')
+  @UseGuards(JwtAuthGuard, ProviderGuard)
   @HttpCode(HttpStatus.CREATED)
   async submitReport(
     @Body() dto: SubmitReportDto,
-    @Req() req: any,
+    @Req() req: AuthenticatedRequest,
   ): Promise<ReportResponse> {
-    const providerAddress = req.headers['x-provider-address'] as string || process.env.DEFAULT_PROVIDER_ADDRESS || '';
-    return this.oracleService.submitReport(dto, providerAddress);
+    return this.oracleService.submitReport(dto, req.user.walletAddress);
   }
 
   @Get('reports/:projectId')

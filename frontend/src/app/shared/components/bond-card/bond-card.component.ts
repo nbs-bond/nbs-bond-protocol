@@ -1,6 +1,6 @@
 import { Component, input, output, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { Bond } from '../../interfaces/bond.interface';
+import { Bond, AccruedCreditsResponse } from '../../interfaces/bond.interface';
 import { StatusBadgeComponent } from '../status-badge/status-badge.component';
 
 @Component({
@@ -38,6 +38,16 @@ import { StatusBadgeComponent } from '../status-badge/status-badge.component';
           <span class="label">Coupons</span>
           <span class="value">{{ bond().couponSchedule.length }} payments</span>
         </div>
+        @if (accruedCredits(); as acc) {
+          <div class="bond-field">
+            <span class="label">Accrued Carbon</span>
+            <span class="value">{{ accruedAmount('Carbon') | number }}</span>
+          </div>
+          <div class="bond-field">
+            <span class="label">Accrued Biodiversity</span>
+            <span class="value">{{ accruedAmount('Biodiversity') | number }}</span>
+          </div>
+        }
       </div>
       <button *ngIf="bond().status === 'Active'" class="subscribe-btn" (click)="subscribe.emit(String(bond().id))">
         Subscribe
@@ -61,7 +71,15 @@ import { StatusBadgeComponent } from '../status-badge/status-badge.component';
 })
 export class BondCardComponent {
   readonly bond = input.required<Bond>();
+  readonly accruedCredits = input<AccruedCreditsResponse | null>(null);
   readonly subscribe = output<string>();
+
+  accruedAmount(creditType: string): number {
+    const acc = this.accruedCredits();
+    return (
+      acc?.perCreditType.find((e) => e.creditType === creditType)?.amount ?? 0
+    );
+  }
 
   String(value: number): string {
     return String(value);

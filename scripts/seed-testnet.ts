@@ -124,15 +124,21 @@ async function main() {
 
   const projectHash = bytes32('nbs-seed:amazon-reforestation-corridor');
   let projectId = projectHash;
+  let registryProjectId: bigint;
 
   if (await exists(BOND_ISSUER_ID, 'get_bond', [u64(BOND_ID)])) {
     const bond = await read(BOND_ISSUER_ID, 'get_bond', [u64(BOND_ID)]) as { project_id: Buffer };
     projectId = xdr.ScVal.scvBytes(Buffer.from(bond.project_id));
+    const project = await read(PROJECT_REGISTRY_ID, 'get_project_by_hash', [projectId]) as { id: bigint };
+    registryProjectId = BigInt(project.id);
     console.log(`\n  Bond ${BOND_ID} already exists; skipping project and bond registration`);
   } else {
     console.log('\n📋 Registering project...');
-    await invoke(admin, PROJECT_REGISTRY_ID, 'register_project', [
-      address(admin.publicKey()), projectHash, symbol(METHODOLOGY), symbol('BR'), u64(0),
+    registryProjectId = BigInt(await invoke(admin, PROJECT_REGISTRY_ID, 'register_project', [
+      address(admin.publicKey()), projectHash, symbol(METHODOLOGY), symbol('BR'), u64(1),
+    ]) as bigint);
+    await invoke(admin, PROJECT_REGISTRY_ID, 'approve_project', [
+      address(admin.publicKey()), u64(registryProjectId), u64(2),
     ]);
 
     const now = Math.floor(Date.now() / 1000);
@@ -158,7 +164,7 @@ async function main() {
 
   console.log('\n🔭 Registering independent oracle providers...');
   const providers = [provider, verifier];
-  let adminNonce = 0;
+  let adminNonce = 1;
   for (const keypair of providers) {
     if (await exists(ORACLE_CONSUMER_ID, 'get_provider', [address(keypair.publicKey())])) {
       console.log(`  Provider ${keypair.publicKey()} already exists; skipping`);
@@ -171,7 +177,11 @@ async function main() {
     adminNonce += 1;
   }
 
-  const existingReportIds = await read(ORACLE_CONSUMER_ID, 'get_project_reports', [projectId]) as bigint[];
+  const existingReportIds = await read(
+    ORACLE_CONSUMER_ID,
+    'get_project_reports',
+    [u64(registryProjectId)],
+  ) as bigint[];
   let reportId: bigint | undefined;
   for (const candidateId of existingReportIds) {
     const candidate = await read(ORACLE_CONSUMER_ID, 'get_report', [u64(candidateId)]) as {
@@ -189,7 +199,7 @@ async function main() {
     console.log('\n📡 Submitting non-zero carbon report...');
     const now = Math.floor(Date.now() / 1000);
     reportId = BigInt(await invoke(provider, ORACLE_CONSUMER_ID, 'submit_report', [
-      address(provider.publicKey()), projectId, u64(now - 30 * 86_400), u64(now),
+      address(provider.publicKey()), u64(registryProjectId), u64(now - 30 * 86_400), u64(now),
       i128(250_000), enumValue('Absent'), symbol(METHODOLOGY),
       bytes32('nbs-seed:oracle-evidence'), u64(0),
     ]) as bigint);

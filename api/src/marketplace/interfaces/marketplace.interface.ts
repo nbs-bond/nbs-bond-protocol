@@ -54,3 +54,9 @@ export interface SlippageResponse {
   estimatedTotal: number;
   slippagePercent: number;
 }
+
+export interface OnChainPriceQuote {
+  price: number;
+  total: number;
+  slippageBps: number;
+}

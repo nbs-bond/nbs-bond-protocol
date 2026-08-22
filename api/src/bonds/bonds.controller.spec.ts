@@ -5,6 +5,21 @@ import { AdminGuard } from '../common/guards/admin.guard';
 describe('BondsController guards', () => {
   const GUARDS_METADATA = '__guards__';
 
+  it.each([
+    ['create', [JwtAuthGuard, AdminGuard]],
+    ['subscribe', [JwtAuthGuard]],
+    ['distributeCoupon', [JwtAuthGuard, AdminGuard]],
+    ['claimCredits', [JwtAuthGuard]],
+    ['transfer', [JwtAuthGuard]],
+    ['mature', [JwtAuthGuard, AdminGuard]],
+  ] as const)('guards %s with the required guards', (handler, expected) => {
+    const guards: unknown[] = Reflect.getMetadata(
+      GUARDS_METADATA,
+      BondsController.prototype[handler],
+    );
+    expect(guards).toEqual(expected);
+  });
+
   it('guards POST /:id/sweep-undistributed with JWT + Admin guards', () => {
     const guards: unknown[] = Reflect.getMetadata(
       GUARDS_METADATA,
@@ -46,6 +61,26 @@ describe('BondsController guards', () => {
 
     await expect(controller.getAccruedCredits(1, 'holder-key')).resolves.toBe(accrued);
     expect(service.getAccruedCredits).toHaveBeenCalledWith(1, 'holder-key');
+  });
+
+  it('passes the authenticated wallet address to the claim service call', async () => {
+    const claimed = {
+      bondId: 4,
+      investorAddress: 'GINVESTOR',
+      credits: 10,
+      transactionHash: 'tx',
+    };
+    const service = { claimCredits: jest.fn().mockResolvedValue(claimed) };
+    const controller = new BondsController(service as any);
+    const req = { user: { walletAddress: 'GINVESTOR' } } as any;
+
+    await expect(controller.claimCredits(4, {}, req)).resolves.toBe(claimed);
+    expect(service.claimCredits).toHaveBeenCalledWith(4, {}, 'GINVESTOR');
+  });
+
+  it('routes the claim handler under the /bonds/:id/claim path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.claimCredits);
+    expect(path).toBe(':id/claim');
   });
 
   it('routes the periods handler under the /bonds/:id/periods path', () => {
