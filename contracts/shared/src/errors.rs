@@ -130,6 +130,10 @@ pub enum CouponEngineError {
     /// tried to zero it out (issue #110). Returned instead of silently
     /// destroying the mismatched amount.
     AccountingMismatch = 13,
+    /// The `UndistributedTotal` storage key is missing despite the
+    /// initialization flag being set.  Indicates storage corruption or
+    /// an unexpected contract state.
+    UndistributedTotalNotFound = 14,
 }
 
 #[derive(Clone, Debug, PartialEq)]
