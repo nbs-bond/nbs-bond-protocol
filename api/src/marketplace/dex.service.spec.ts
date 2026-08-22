@@ -1,4 +1,5 @@
 import { Test } from '@nestjs/testing';
+import { HttpException, HttpStatus } from '@nestjs/common';
 import { nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
@@ -552,6 +553,113 @@ describe('DexService', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // buyBondTokens — escrow pre-check boundary (dto.amount * order.pricePerToken
+  // vs. escrowed balance). The general "enough balance" / "not enough balance"
+  // cases were already covered elsewhere, but not the exact boundary where
+  // proceeds == balance, which is the case most likely to flip on an off-by-one
+  // if the `<` in `escrowed.balance < proceeds` were ever changed to `<=`.
+  // ---------------------------------------------------------------------------
+
+  describe('buyBondTokens — escrow boundary', () => {
+    const order = { ...STUB_ORDER, pricePerToken: 25 };
+    const dto = { orderId: 1, maxPrice: 25, amount: 8 }; // proceeds = 25 * 8 = 200
+
+    it('proceeds exactly equal to escrowed balance is allowed (boundary, not rejected)', async () => {
+      jest.spyOn(service, 'getOrder').mockResolvedValue(order);
+      jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
+        address: SELLER,
+        asset: 'USDC',
+        balance: 200, // == proceeds exactly
+      });
+      invokeContractMethodMock.mockResolvedValue({
+        result: nativeToScVal(true),
+        transactionHash: 'txhash',
+        successful: true,
+      });
+
+      await expect(service.buyBondTokens(dto, SELLER)).resolves.toBeDefined();
+      expect(invokeContractMethodMock).toHaveBeenCalled();
+    });
+
+    it('proceeds one unit over escrowed balance is rejected before touching the contract', async () => {
+      jest.spyOn(service, 'getOrder').mockResolvedValue(order);
+      jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
+        address: SELLER,
+        asset: 'USDC',
+        balance: 199, // == proceeds - 1
+      });
+
+      await expect(service.buyBondTokens(dto, SELLER)).rejects.toBeInstanceOf(
+        Error,
+      );
+      expect(invokeContractMethodMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // mapDexError — buyBondTokens' catch handler translates on-chain DEXError
+  // codes into HTTP responses. Only the SellerBalanceDepleted (409) branch had
+  // coverage; the InsufficientFunds branch, the default/unmapped-code fallback,
+  // and the HttpException passthrough were untested.
+  // ---------------------------------------------------------------------------
+
+  describe('buyBondTokens — mapDexError translation', () => {
+    function setupForError(rejection: unknown): void {
+      jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
+      jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
+        address: SELLER,
+        asset: 'USDC',
+        balance: 1_000, // proceeds for 100 @ 10 = 1_000, so the pre-check passes
+      });
+      invokeContractMethodMock.mockRejectedValue(rejection);
+    }
+
+    it('maps DEXError code 10 (InsufficientFunds) to 402 Payment Required', async () => {
+      setupForError(
+        new Error('Transaction simulation failed: Error(Contract, #10) (contract error code 10)'),
+      );
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+
+      await expect(service.buyBondTokens(dto, SELLER)).rejects.toMatchObject({
+        status: HttpStatus.PAYMENT_REQUIRED,
+      });
+    });
+
+    it('falls back to BadRequestException for an unmapped DEXError code', async () => {
+      setupForError(
+        new Error('Transaction simulation failed: Error(Contract, #3) (contract error code 3)'),
+      );
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+
+      await expect(service.buyBondTokens(dto, SELLER)).rejects.toMatchObject({
+        status: HttpStatus.BAD_REQUEST,
+      });
+    });
+
+    it('falls back to BadRequestException for an error with no recognizable code', async () => {
+      setupForError(new Error('network timeout contacting horizon'));
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+
+      await expect(service.buyBondTokens(dto, SELLER)).rejects.toMatchObject({
+        status: HttpStatus.BAD_REQUEST,
+        message: 'network timeout contacting horizon',
+      });
+    });
+
+    it('passes an existing HttpException through unchanged instead of re-wrapping it', async () => {
+      const original = new HttpException('upstream rate limited', HttpStatus.TOO_MANY_REQUESTS);
+      setupForError(original);
+
+      const dto = { orderId: 1, maxPrice: 100, amount: 100 };
+
+      await expect(service.buyBondTokens(dto, SELLER)).rejects.toBe(original);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Nonce scoping — nonce must be allocated for the admin signer, not the user
   // ---------------------------------------------------------------------------
 
@@ -775,6 +883,69 @@ describe('DexService', () => {
 
       // args[2] = amount (i128)
       expect(scValToNative(args[2])).toBe(BigInt(1500));
+    });
+
+    // Contract signature (contracts/dex-router/src/lib.rs list_bond_tokens):
+    // (seller, bond_id: u64, amount: i128, price_per_token: i128, quote_asset: Symbol,
+    // expires_after_seconds: u64, nonce). Not covered by the pre-existing regression
+    // block, which only locked execute_purchase/deposit_quote/withdraw_quote. Every
+    // numeric fixture below is distinct so an accidental swap between adjacent
+    // same-typed args (amount <-> pricePerToken, or either <-> expiresAfterSeconds)
+    // changes the asserted outcome rather than silently passing.
+    it('list_bond_tokens sends [seller, bond_id, amount, price_per_token, quote_asset, expires_after_seconds]', async () => {
+      invokeContractMethodMock.mockResolvedValue({
+        result: nativeToScVal(BigInt(1), { type: 'u64' }),
+        transactionHash: 'txhash',
+        successful: true,
+      });
+      jest.spyOn(service, 'getOrder').mockResolvedValue({ ...STUB_ORDER, id: 1 });
+
+      const dto: ListBondDto = {
+        bondId: 42,
+        amount: 777,
+        pricePerToken: 33,
+        quoteAsset: 'XLM',
+        expiresAfterSeconds: 9001,
+      };
+      await service.listBondTokens(dto, SELLER);
+
+      const args = getLastArgs();
+      expect(args).toHaveLength(6);
+
+      // args[0] = seller (Address)
+      expect(scValToNative(args[0]) as string).toBe(SELLER);
+
+      // args[1] = bond_id (u64)
+      expect(scValToNative(args[1])).toBe(BigInt(42));
+
+      // args[2] = amount (i128) — must come BEFORE price_per_token
+      expect(scValToNative(args[2])).toBe(BigInt(777));
+
+      // args[3] = price_per_token (i128) — must come AFTER amount
+      expect(scValToNative(args[3])).toBe(BigInt(33));
+
+      // args[4] = quote_asset (symbol)
+      expect(scValToNative(args[4])).toBe('XLM');
+
+      // args[5] = expires_after_seconds (u64)
+      expect(scValToNative(args[5])).toBe(BigInt(9001));
+    });
+
+    // Contract signature (contracts/dex-router/src/lib.rs cancel_listing):
+    // (caller, order_id: u64, nonce). Also not covered by the pre-existing block.
+    it('cancel_listing sends [caller, order_id]', async () => {
+      invokeContractMethodMock.mockResolvedValue({ transactionHash: 'txhash' });
+
+      await service.cancelOrder(17, SELLER);
+
+      const args = getLastArgs();
+      expect(args).toHaveLength(2);
+
+      // args[0] = caller (Address)
+      expect(scValToNative(args[0]) as string).toBe(SELLER);
+
+      // args[1] = order_id (u64)
+      expect(scValToNative(args[1])).toBe(BigInt(17));
     });
   });
 
