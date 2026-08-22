@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { IpfsService } from './ipfs.service';
@@ -12,7 +12,8 @@ import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse } from './in
 const PROJECT_REGISTRY = () => process.env.PROJECT_REGISTRY_ADDRESS || '';
 
 @Injectable()
-export class ProjectsService {
+export class ProjectsService implements OnModuleDestroy {
+  private readonly logger = new Logger(ProjectsService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -183,5 +184,22 @@ export class ProjectsService {
 
   private getAdminSecret(): string {
     return process.env.ADMIN_SECRET_KEY || '';
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('ProjectsService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `ProjectsService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

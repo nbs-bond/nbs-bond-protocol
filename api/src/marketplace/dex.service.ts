@@ -3,6 +3,8 @@ import {
   BadRequestException,
   HttpException,
   HttpStatus,
+  Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
@@ -41,7 +43,8 @@ const DEX_ERROR_CODE = {
 } as const;
 
 @Injectable()
-export class DexService {
+export class DexService implements OnModuleDestroy {
+  private readonly logger = new Logger(DexService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -366,5 +369,22 @@ export class DexService {
     }
 
     return new BadRequestException(message);
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('DexService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `DexService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

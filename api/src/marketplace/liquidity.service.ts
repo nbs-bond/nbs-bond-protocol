@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { DexService } from './dex.service';
 import {
   PriceFeedResponse,
@@ -9,7 +9,8 @@ import {
 import { createClient, RedisClientType } from '@redis/client';
 
 @Injectable()
-export class LiquidityService {
+export class LiquidityService implements OnModuleDestroy {
+  private readonly logger = new Logger(LiquidityService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -88,5 +89,22 @@ export class LiquidityService {
       estimatedTotal: quote.total,
       slippagePercent: quote.slippageBps / 100,
     };
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('LiquidityService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `LiquidityService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

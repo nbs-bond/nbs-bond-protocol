@@ -5,6 +5,8 @@ import {
   ForbiddenException,
   HttpException,
   HttpStatus,
+  Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { toBytes32 } from '../stellar/bytes32';
@@ -40,7 +42,8 @@ const ORACLE_ERROR_CODE = {
 };
 
 @Injectable()
-export class OracleService {
+export class OracleService implements OnModuleDestroy {
+  private readonly logger = new Logger(OracleService.name);
   private redis: RedisClientType;
   private readonly localChallengeAttempts = new Map<string, { count: number; expiresAt: number }>();
   private static readonly CHALLENGE_LIMIT = 3;
@@ -462,6 +465,23 @@ export class OracleService {
       throw new HttpException(
         'Challenge limit exceeded: maximum 3 challenges per wallet per 24 hours',
         HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('OracleService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `OracleService: error closing Redis connection: ${error?.message ?? error}`,
       );
     }
   }

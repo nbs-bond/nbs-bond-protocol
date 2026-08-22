@@ -8,13 +8,19 @@
  * Each suite exercises the onModuleDestroy() hook of each service and verifies
  * the correct cleanup behaviour:
  *
- *   - AuthService:      redis.quit() is called when the module is destroyed.
- *   - NonceService:     any held distributed locks are released and
- *                       redis.quit() is called.
- *   - OracleScheduler:  the shuttingDown flag prevents new poll cycles,
- *                       in-flight cycles are awaited, and redis.quit() is called.
- *   - ContractService:  new transaction submissions are refused after shutdown,
- *                       and in-flight confirmation polls are awaited.
+ *   - AuthService:                redis.quit() is called when the module is destroyed.
+ *   - NonceService:               any held distributed locks are released and
+ *                                 redis.quit() is called.
+ *   - OracleScheduler:            the shuttingDown flag prevents new poll cycles,
+ *                                 in-flight cycles are awaited, and redis.quit() is called.
+ *   - ContractService:            new transaction submissions are refused after shutdown,
+ *                                 and in-flight confirmation polls are awaited.
+ *   - BondsService, KycService, ProjectsService, LiquidityService, DexService,
+ *     OracleMonitoringService, OracleService:
+ *                                 redis.quit() is called.
+ *   - StellarService:             the Horizon SSE payment stream is closed.
+ *   - Subprocess SIGTERM:         a real SIGTERM sent to a minimal NestJS app
+ *                                 triggers onModuleDestroy and the process exits.
  *
  * Why direct construction rather than Test.createTestingModule for heavy services
  * ---------------------------------------------------------------------------------
@@ -29,21 +35,62 @@
  * For the lifecycle-hook suite we DO use Test.createTestingModule because
  * that suite is specifically testing NestJS's hook invocation pipeline.
  *
- * Why in-process rather than subprocess
- * ----------------------------------------
- * A subprocess SIGTERM test would require a live Redis instance and a live
- * Stellar RPC node.  Testing onModuleDestroy() directly is equivalent because
- * app.close() calls the same NestJS callDestroyHook() pipeline as SIGTERM when
- * enableShutdownHooks() is active.
+ * Subprocess SIGTERM test
+ * -----------------------
+ * The final suite spawns a minimal NestJS app (sigterm-fixture.ts) as a
+ * subprocess, signals it with SIGTERM, and asserts the onModuleDestroy hook
+ * ran.  This is a true end-to-end test of the enableShutdownHooks() → SIGTERM
+ * → callDestroyHook pipeline.  The fixture has no Redis or Stellar dependencies
+ * so it is fast and deterministic.
  */
 
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, HttpStatus } from '@nestjs/common';
+import { spawn } from 'child_process';
+import * as path from 'path';
+
+// Mock @redis/client so the services constructed directly below never open a
+// real TCP connection to localhost:6379.  Each service constructor calls
+// createClient().connect() and, without a running Redis, the client would keep
+// reconnecting in the background and leave open handles that prevent Jest from
+// exiting.  The suites below replace the constructed client with their own
+// controllable mock (makeRedisMock) before exercising onModuleDestroy().
+jest.mock('@redis/client', () => {
+  const mock = {
+    get isOpen() {
+      return true;
+    },
+    connect: jest.fn().mockResolvedValue(undefined),
+    quit: jest.fn().mockResolvedValue(undefined),
+    set: jest.fn().mockResolvedValue('OK'),
+    get: jest.fn().mockResolvedValue(null),
+    del: jest.fn().mockResolvedValue(1),
+    exists: jest.fn().mockResolvedValue(0),
+    eval: jest.fn().mockResolvedValue(0),
+    lPush: jest.fn().mockResolvedValue(1),
+    lTrim: jest.fn().mockResolvedValue('OK'),
+    expire: jest.fn().mockResolvedValue(1),
+    sAdd: jest.fn().mockResolvedValue(1),
+    sMembers: jest.fn().mockResolvedValue([]),
+    incr: jest.fn().mockResolvedValue(1),
+  };
+  return {
+    createClient: jest.fn(() => mock),
+  };
+});
 
 // Services under test
 import { AuthService } from '../src/auth/auth.service';
+import { KycService } from '../src/auth/kyc.service';
+import { BondsService } from '../src/bonds/bonds.service';
 import { NonceService } from '../src/common/services/nonce.service';
+import { ProjectsService } from '../src/projects/projects.service';
+import { LiquidityService } from '../src/marketplace/liquidity.service';
+import { DexService } from '../src/marketplace/dex.service';
 import { OracleScheduler } from '../src/oracle/oracle.scheduler';
+import { OracleMonitoringService } from '../src/oracle/oracle.monitoring.service';
+import { OracleService } from '../src/oracle/oracle.service';
+import { StellarService } from '../src/stellar/stellar.service';
 import { ContractService, ContractCallOptions } from '../src/stellar/contract.service';
 
 // ---------------------------------------------------------------------------
@@ -410,3 +457,260 @@ describe('NestJS lifecycle hooks — onModuleDestroy called on app.close() (e2e)
     await app.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Suite 6: All remaining Redis services — redis.quit() on shutdown
+// ---------------------------------------------------------------------------
+
+/**
+ * Inject a mock Redis client into `service` under the private `redis` field
+ * and return the mock so callers can assert on it.
+ */
+function injectRedisMock(service: unknown): ReturnType<typeof makeRedisMock> {
+  const redisMock = makeRedisMock();
+  (service as unknown as { redis: unknown }).redis = redisMock;
+  return redisMock;
+}
+
+describe('KycService — graceful shutdown (e2e)', () => {
+  it('calls redis.quit() on shutdown', async () => {
+    const service = new KycService();
+    const redisMock = injectRedisMock(service);
+    await service.onModuleDestroy();
+    expect(redisMock.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still resolves when redis.quit() rejects', async () => {
+    const service = new KycService();
+    const redisMock = injectRedisMock(service);
+    redisMock.quit.mockRejectedValueOnce(new Error('disconnected'));
+    await expect(service.onModuleDestroy()).resolves.not.toThrow();
+  });
+});
+
+describe('BondsService — graceful shutdown (e2e)', () => {
+  it('calls redis.quit() on shutdown', async () => {
+    const service = new BondsService({} as never, {} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    await service.onModuleDestroy();
+    expect(redisMock.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still resolves when redis.quit() rejects', async () => {
+    const service = new BondsService({} as never, {} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    redisMock.quit.mockRejectedValueOnce(new Error('disconnected'));
+    await expect(service.onModuleDestroy()).resolves.not.toThrow();
+  });
+});
+
+describe('ProjectsService — graceful shutdown (e2e)', () => {
+  it('calls redis.quit() on shutdown', async () => {
+    const service = new ProjectsService({} as never, {} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    await service.onModuleDestroy();
+    expect(redisMock.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still resolves when redis.quit() rejects', async () => {
+    const service = new ProjectsService({} as never, {} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    redisMock.quit.mockRejectedValueOnce(new Error('disconnected'));
+    await expect(service.onModuleDestroy()).resolves.not.toThrow();
+  });
+});
+
+describe('LiquidityService — graceful shutdown (e2e)', () => {
+  it('calls redis.quit() on shutdown', async () => {
+    const service = new LiquidityService({} as never);
+    const redisMock = injectRedisMock(service);
+    await service.onModuleDestroy();
+    expect(redisMock.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still resolves when redis.quit() rejects', async () => {
+    const service = new LiquidityService({} as never);
+    const redisMock = injectRedisMock(service);
+    redisMock.quit.mockRejectedValueOnce(new Error('disconnected'));
+    await expect(service.onModuleDestroy()).resolves.not.toThrow();
+  });
+});
+
+describe('DexService — graceful shutdown (e2e)', () => {
+  it('calls redis.quit() on shutdown', async () => {
+    const service = new DexService({} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    await service.onModuleDestroy();
+    expect(redisMock.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still resolves when redis.quit() rejects', async () => {
+    const service = new DexService({} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    redisMock.quit.mockRejectedValueOnce(new Error('disconnected'));
+    await expect(service.onModuleDestroy()).resolves.not.toThrow();
+  });
+});
+
+describe('OracleMonitoringService — graceful shutdown (e2e)', () => {
+  it('calls redis.quit() on shutdown', async () => {
+    const service = new OracleMonitoringService({} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    await service.onModuleDestroy();
+    expect(redisMock.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still resolves when redis.quit() rejects', async () => {
+    const service = new OracleMonitoringService({} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    redisMock.quit.mockRejectedValueOnce(new Error('disconnected'));
+    await expect(service.onModuleDestroy()).resolves.not.toThrow();
+  });
+});
+
+describe('OracleService — graceful shutdown (e2e)', () => {
+  it('calls redis.quit() on shutdown', async () => {
+    const service = new OracleService({} as never, {} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    await service.onModuleDestroy();
+    expect(redisMock.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still resolves when redis.quit() rejects', async () => {
+    const service = new OracleService({} as never, {} as never, {} as never, {} as never);
+    const redisMock = injectRedisMock(service);
+    redisMock.quit.mockRejectedValueOnce(new Error('disconnected'));
+    await expect(service.onModuleDestroy()).resolves.not.toThrow();
+  });
+});
+
+describe('StellarService — graceful shutdown (e2e)', () => {
+  it('closes the Horizon payment stream on shutdown', () => {
+    const service = new StellarService();
+
+    // Set up a fake stream state so closePaymentStream() has something to clean up.
+    const closeFn = jest.fn();
+    (service as unknown as { streamState: unknown }).streamState = {
+      publicKey: 'GABC',
+      onPayment: jest.fn(),
+      closeFn,
+      reconnectTimer: null,
+      backoffMs: 1000,
+    };
+
+    service.onModuleDestroy();
+
+    // streamState must be null (cleared by closePaymentStream).
+    expect((service as unknown as { streamState: unknown }).streamState).toBeNull();
+    // closeFn must have been called.
+    expect(closeFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles shutdown gracefully when no stream is active', () => {
+    const service = new StellarService();
+    // onModuleDestroy must not throw when streamState is null.
+    expect(() => service.onModuleDestroy()).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite 7: Subprocess SIGTERM — real signal → onModuleDestroy pipeline
+// ---------------------------------------------------------------------------
+
+/**
+ * Wait for a predicate to become true, polling every 100 ms.
+ * Rejects after `timeoutMs` if the predicate never returns true.
+ */
+function waitFor(
+  predicate: () => boolean,
+  timeoutMs: number,
+  label: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      if (predicate()) {
+        clearInterval(timer);
+        resolve();
+      } else if (Date.now() - start >= timeoutMs) {
+        clearInterval(timer);
+        reject(new Error(`${label}: timed out after ${timeoutMs}ms`));
+      }
+    }, 100);
+  });
+}
+
+describe('SIGTERM — real subprocess shutdown (e2e)', () => {
+  const fixturePath = path.join(__dirname, 'sigterm-fixture.ts');
+  const apiRoot = path.resolve(__dirname, '..');
+
+  it(
+    'runs onModuleDestroy and exits when the process receives SIGTERM',
+    async () => {
+      const child = spawn(
+        process.execPath,
+        ['-r', 'ts-node/register', fixturePath],
+        {
+          cwd: apiRoot,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += String(chunk);
+      });
+
+      const exitPromise = new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+      }>((resolve) => {
+        child.on('close', (code, signal) => resolve({ code, signal }));
+      });
+
+      // Wait for the probe to start listening.
+      await waitFor(
+        () => stdout.includes('"event":"ready"'),
+        30_000,
+        'subprocess did not start',
+      );
+      expect(stderr).not.toContain('BOOTSTRAP_ERROR');
+
+      // Send SIGTERM — this must trigger the enableShutdownHooks() pipeline.
+      child.kill('SIGTERM');
+
+      // Wait for the process to exit.
+      const exitInfo = await waitForExit(exitPromise, 15_000);
+
+      expect(stdout).toContain('"event":"destroyed"');
+      // NestJS v10 runs the destroy hooks, removes its signal listener, then
+      // re-sends the signal to itself, so the child is terminated BY SIGTERM
+      // (exit code null, signal 'SIGTERM') rather than exiting with code 0.
+      expect(exitInfo.signal).toBe('SIGTERM');
+    },
+    60_000,
+  );
+});
+
+/**
+ * Wait for a child-process exit promise, with a timeout.
+ */
+async function waitForExit(
+  exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+  timeoutMs: number,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+  });
+  const result = await Promise.race([exitPromise, timeout]);
+  if (timer) clearTimeout(timer);
+  if (result === 'timeout') {
+    throw new Error(`subprocess did not exit within ${timeoutMs}ms`);
+  }
+  return result;
+}

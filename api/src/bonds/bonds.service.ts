@@ -6,6 +6,7 @@ import {
   InternalServerErrorException,
   UnauthorizedException,
   Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
@@ -66,7 +67,7 @@ const COUPON_ERROR_CODE = {
 };
 
 @Injectable()
-export class BondsService {
+export class BondsService implements OnModuleDestroy {
   private readonly logger = new Logger(BondsService.name);
   private redis: RedisClientType;
 
@@ -815,5 +816,22 @@ export class BondsService {
 
   private getAdminSecret(): string {
     return process.env.ADMIN_SECRET_KEY || '';
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('BondsService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `BondsService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }
