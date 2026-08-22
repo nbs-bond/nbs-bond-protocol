@@ -39,6 +39,9 @@ const ORACLE_ERROR_CODE = {
   InvalidNonce: 3,
   ProviderNotFound: 4,
   ProviderAlreadyExists: 5,
+  // Added to replace the previous overloaded use of `ProviderAlreadyExists`
+  // (= 5) for a duplicate `challenge_report` call on the same report (#114).
+  ChallengeAlreadyExists: 20,
 };
 
 @Injectable()
@@ -159,15 +162,19 @@ export class OracleService implements OnModuleDestroy {
     await this.enforceChallengeRateLimit(challengerAddress);
     const nonce = await this.nonceService.next(ORACLE_CONSUMER(), challengerAddress);
 
-    await this.contractService.invokeContractMethod(
-      ORACLE_CONSUMER(), 'challenge_report', investorSecret,
-      [
-        Address.fromString(challengerAddress).toScVal(),
-        nativeToScVal(BigInt(reportId), { type: 'u64' }),
-        toBytes32(dto.counterEvidenceHash),
-      ],
-      nonce,
-    );
+    try {
+      await this.contractService.invokeContractMethod(
+        ORACLE_CONSUMER(), 'challenge_report', investorSecret,
+        [
+          Address.fromString(challengerAddress).toScVal(),
+          nativeToScVal(BigInt(reportId), { type: 'u64' }),
+          toBytes32(dto.counterEvidenceHash),
+        ],
+        nonce,
+      );
+    } catch (error) {
+      throw this.mapChallengeError(error, reportId);
+    }
 
     return {
       reportId,
@@ -435,6 +442,24 @@ export class OracleService implements OnModuleDestroy {
       return new BadRequestException(error.message);
     }
     return new BadRequestException('Failed to register oracle provider');
+  }
+
+  private mapChallengeError(error: unknown, reportId: number): Error {
+    if (error instanceof ConflictException) {
+      return error;
+    }
+    if (error instanceof HttpException) {
+      if (this.contractErrorCode(error.message) === ORACLE_ERROR_CODE.ChallengeAlreadyExists) {
+        return new ConflictException(
+          `Report #${reportId} already has a challenge on file`,
+        );
+      }
+      return error;
+    }
+    if (error instanceof Error) {
+      return new BadRequestException(error.message);
+    }
+    return new BadRequestException('Failed to challenge report');
   }
 
   private contractErrorCode(message: string): number | undefined {

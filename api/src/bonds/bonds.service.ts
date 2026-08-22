@@ -56,6 +56,12 @@ const BOND_ERROR_CODE = {
   ProjectNotApproved: 8,
   Overflow: 9,
   ReportNotVerified: 10,
+  // Added to replace the previous overloaded use of `Overflow` (= 9) for
+  // "not yet mature" / "maturity date in the past", and of
+  // `InsufficientSupply` (= 6) for a holder's own balance, on-chain (#114).
+  NotYetMature: 14,
+  MaturityDateInPast: 15,
+  InsufficientBalance: 16,
 };
 
 const COUPON_ERROR_CODE = {
@@ -88,11 +94,16 @@ export class BondsService implements OnModuleDestroy {
 
     const configScVal = this.encodeBondConfig(dto);
 
-    const { result } = await this.contractService.invokeContractMethod(
-      BOND_ISSUER(), 'issue_bond', adminSecret,
-      [Address.fromString(adminAddress).toScVal(), configScVal],
-      nonce,
-    );
+    let result: xdr.ScVal;
+    try {
+      ({ result } = await this.contractService.invokeContractMethod(
+        BOND_ISSUER(), 'issue_bond', adminSecret,
+        [Address.fromString(adminAddress).toScVal(), configScVal],
+        nonce,
+      ));
+    } catch (error) {
+      throw this.mapBondError(error);
+    }
 
     const bondId = Number(scValToNative(result));
     const bond = await this.buildBondResponse(bondId);
@@ -512,16 +523,21 @@ export class BondsService implements OnModuleDestroy {
     const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
 
-    const { transactionHash } = await this.contractService.invokeContractMethod(
-      BOND_ISSUER(), 'transfer', investorSecret,
-      [
-        Address.fromString(dto.fromAddress).toScVal(),
-        Address.fromString(dto.toAddress).toScVal(),
-        nativeToScVal(BigInt(id), { type: 'u64' }),
-        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
-      ],
-      nonce,
-    );
+    let transactionHash: string | undefined;
+    try {
+      ({ transactionHash } = await this.contractService.invokeContractMethod(
+        BOND_ISSUER(), 'transfer', investorSecret,
+        [
+          Address.fromString(dto.fromAddress).toScVal(),
+          Address.fromString(dto.toAddress).toScVal(),
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+        ],
+        nonce,
+      ));
+    } catch (error) {
+      throw this.mapBondError(error, id);
+    }
 
     await this.redis.sAdd(`bond:${id}:holders`, dto.toAddress);
 
@@ -798,16 +814,30 @@ export class BondsService implements OnModuleDestroy {
     };
   }
 
-  private mapBondError(error: unknown, bondId: number): Error {
+  private mapBondError(error: unknown, bondId?: number): Error {
     if (error instanceof BadRequestException) {
       const message = error.message;
       const match = message.match(/error code (\d+)/);
       const code = match ? Number(match[1]) : undefined;
 
-      if (code === BOND_ERROR_CODE.Overflow) {
+      if (code === BOND_ERROR_CODE.NotYetMature) {
         return new BadRequestException(
           `Bond #${bondId} cannot be matured before its maturity date. ` +
           'Maturation is only allowed once the maturity date has been reached.',
+        );
+      }
+
+      if (code === BOND_ERROR_CODE.MaturityDateInPast) {
+        return new BadRequestException(
+          'Bond maturity date must be in the future.',
+        );
+      }
+
+      if (code === BOND_ERROR_CODE.InsufficientBalance) {
+        return new BadRequestException(
+          bondId !== undefined
+            ? `Insufficient balance on bond #${bondId} to complete this transfer.`
+            : 'Insufficient balance to complete this transfer.',
         );
       }
 
@@ -816,7 +846,7 @@ export class BondsService implements OnModuleDestroy {
     if (error instanceof Error) {
       return new BadRequestException(error.message);
     }
-    return new BadRequestException('Failed to mature bond');
+    return new BadRequestException('Bond operation failed');
   }
 
   private getAdminSecret(): string {
