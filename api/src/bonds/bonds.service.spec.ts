@@ -777,6 +777,7 @@ describe('BondsService', () => {
       xdr.ScVal.scvVec([
         nativeToScVal(BigInt(7), { type: 'u64' }),
         Address.fromString(REPORT_HOLDER).toScVal(),
+        nativeToScVal(BigInt(42), { type: 'u64' }),
         xdr.ScVal.scvBytes(Buffer.alloc(32)),
         nativeToScVal(BigInt(1000), { type: 'u64' }),
         nativeToScVal(BigInt(2000), { type: 'u64' }),
@@ -989,11 +990,12 @@ describe('BondsService', () => {
       const report = (svc as any).decodeReport([
         BigInt(9),
         REPORT_HOLDER,
+        BigInt(42),
         Buffer.alloc(32),
         BigInt(1000),
         BigInt(2000),
         BigInt(500),
-        [0],
+        ['Absent'],
         'VM0003',
         Buffer.alloc(32),
         1,

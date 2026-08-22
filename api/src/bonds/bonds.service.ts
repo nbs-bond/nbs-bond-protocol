@@ -679,22 +679,27 @@ export class BondsService implements OnModuleDestroy {
 
   /**
    * Decodes an OracleConsumer `Report` struct. Field order matches the
-   * contract declaration; note the `biodiversity` field is skipped by
-   * position (index 6) when building the summary.
+   * contract declaration: `id, provider, project_id, project_metadata_hash,
+   * period_start, period_end, carbon_sequestered, biodiversity, methodology,
+   * ipfs_evidence_hash, status, submitted_at, verified_at`. `project_id`
+   * (index 2) is the registry's numeric id and is not surfaced here;
+   * `projectId` below is the metadata hash (index 3), kept for
+   * compatibility with existing API consumers. `biodiversity` (index 7) is
+   * skipped by position when building the summary.
    */
   private decodeReport(data: any[]): PeriodReportResponse {
     return {
       id: Number(data[0]),
       providerAddress: data[1] as string,
-      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
-      periodStart: Number(data[3]),
-      periodEnd: Number(data[4]),
-      carbonSequestered: Number(data[5]),
-      methodology: data[7] as string,
-      ipfsHash: Buffer.from(data[8] as Uint8Array).toString('hex'),
-      status: this.reportStatusFromIndex(Number(data[9])),
-      submittedAt: Number(data[10]),
-      verifiedAt: Number(data[11]),
+      projectId: Buffer.from(data[3] as Uint8Array).toString('hex'),
+      periodStart: Number(data[4]),
+      periodEnd: Number(data[5]),
+      carbonSequestered: Number(data[6]),
+      methodology: data[8] as string,
+      ipfsHash: Buffer.from(data[9] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[10])),
+      submittedAt: Number(data[11]),
+      verifiedAt: Number(data[12]),
     };
   }
 
