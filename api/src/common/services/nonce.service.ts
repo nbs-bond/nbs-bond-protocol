@@ -411,13 +411,9 @@ export class NonceService implements OnModuleDestroy {
 
     // Close the Redis connection gracefully.
     try {
-      if (this.redis.isReady) {
+      if (this.redis.isOpen) {
         await this.redis.quit();
         this.logger.log('NonceService: Redis connection closed gracefully');
-      } else if (this.redis.isOpen) {
-        // The connection never reached the ready state (e.g. Redis was
-        // unavailable on startup); quit() would hang waiting for a reply.
-        this.redis.disconnect();
       }
     } catch (error) {
       this.logger.warn(

@@ -133,6 +133,27 @@ export class OracleService implements OnModuleDestroy {
     return reports;
   }
 
+  /**
+   * Whether a non-rejected report already exists for this provider and exact
+   * period. Used by the scheduler to skip duplicate on-chain submissions so a
+   * re-run within the same period never creates a second report.
+   */
+  async hasReportForPeriod(
+    projectId: string,
+    providerAddress: string,
+    periodStart: number,
+    periodEnd: number,
+  ): Promise<boolean> {
+    const reports = await this.getProjectReports(projectId);
+    return reports.some(
+      (report) =>
+        report.providerAddress === providerAddress &&
+        report.periodStart === periodStart &&
+        report.periodEnd === periodEnd &&
+        report.status !== ReportStatus.Rejected,
+    );
+  }
+
   async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: string): Promise<ChallengeResponse> {
     if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(dto.counterEvidenceHash)) {
       throw new BadRequestException(
