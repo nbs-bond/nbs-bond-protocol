@@ -146,6 +146,8 @@ export class DexService implements OnModuleDestroy {
     const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
     try {
+      // Contract signature (contracts/dex-router/src/lib.rs execute_purchase):
+      // (buyer, order_id, max_price: i128, amount: i128, nonce) — max_price comes BEFORE amount.
       await this.contractService.invokeContractMethod(
         DEX_ROUTER(), 'execute_purchase', adminSecret,
         [
@@ -264,6 +266,8 @@ export class DexService implements OnModuleDestroy {
     const adminPublicKey = this.getAdminPublicKey();
     const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
+    // Contract signature (contracts/dex-router/src/lib.rs deposit_quote):
+    // (caller, quote_asset: Symbol, amount: i128, nonce).
     const { transactionHash } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'deposit_quote', adminSecret,
       [
@@ -287,6 +291,8 @@ export class DexService implements OnModuleDestroy {
     const adminPublicKey = this.getAdminPublicKey();
     const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
+    // Contract signature (contracts/dex-router/src/lib.rs withdraw_quote):
+    // (caller, quote_asset: Symbol, amount: i128, nonce).
     const { transactionHash } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'withdraw_quote', adminSecret,
       [
