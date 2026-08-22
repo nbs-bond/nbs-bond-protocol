@@ -1,4 +1,8 @@
-import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import {
+  ExecutionContext,
+  ForbiddenException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ProviderGuard } from './provider.guard';
 
 describe('ProviderGuard', () => {
@@ -25,12 +29,12 @@ describe('ProviderGuard', () => {
     );
   });
 
-  it('throws UnauthorizedException if user walletAddress is not in provider whitelist', async () => {
+  it('throws ForbiddenException if user walletAddress is not in provider whitelist', async () => {
     process.env.ORACLE_PROVIDER_WHITELIST = 'GPROVIDER1,GPROVIDER2';
     const context = createMockContext({ user: { walletAddress: 'GOTHER' } });
 
     await expect(guard.canActivate(context)).rejects.toThrow(
-      new UnauthorizedException('Provider access required'),
+      new ForbiddenException('Provider access required'),
     );
   });
 

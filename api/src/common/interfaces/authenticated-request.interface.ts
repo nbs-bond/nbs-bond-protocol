@@ -1,15 +1,14 @@
-import { Request } from 'express';
+import { Request } from "express";
 
 export enum KycStatus {
-  NONE = 'none',
-  PENDING = 'pending',
-  VERIFIED = 'verified',
-  ACCREDITED = 'accredited',
+  NONE = "none",
+  PENDING = "pending",
+  VERIFIED = "verified",
+  ACCREDITED = "accredited",
 }
 
 export interface AuthenticatedUser {
   walletAddress: string;
-  kycStatus: KycStatus;
 }
 
 export interface AuthenticatedRequest extends Request {

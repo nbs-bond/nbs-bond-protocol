@@ -1,11 +1,12 @@
-import { Component, inject, OnInit, ChangeDetectionStrategy, signal } from '@angular/core';
+import { Component, inject, OnInit, ChangeDetectionStrategy, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterModule, Router } from '@angular/router';
 import { ApiService } from '../shared/services/api.service';
+import { WalletService } from '../auth/wallet.service';
 import { BondCardComponent } from '../shared/components/bond-card/bond-card.component';
 import { ProjectCardComponent } from '../shared/components/project-card/project-card.component';
 import { LoadingSpinnerComponent } from '../shared/components/loading-spinner/loading-spinner.component';
-import { Bond, Project } from '../shared/interfaces/bond.interface';
+import { Bond, Project, AccruedCreditsResponse } from '../shared/interfaces/bond.interface';
 
 @Component({
   selector: 'app-dashboard',
@@ -17,6 +18,10 @@ import { Bond, Project } from '../shared/interfaces/bond.interface';
 
       @if (error()) {
         <div class="error-banner">{{ error() }}</div>
+      }
+
+      @if (accruedError()) {
+        <div class="error-banner">{{ accruedError() }}</div>
       }
 
       <div class="stats-grid">
@@ -35,6 +40,14 @@ import { Bond, Project } from '../shared/interfaces/bond.interface';
         <div class="stat-card">
           <span class="stat-label">Carbon Sequestration</span>
           <span class="stat-value">{{ carbonTotal() | number }} tCO₂e</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Accrued Carbon Credits</span>
+          <span class="stat-value">{{ accruedCarbon() | number }}</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Accrued Biodiversity Credits</span>
+          <span class="stat-value">{{ accruedBiodiversity() | number }}</span>
         </div>
       </div>
 
@@ -59,7 +72,11 @@ import { Bond, Project } from '../shared/interfaces/bond.interface';
           @if (bonds().length > 0) {
             <div class="card-grid">
               @for (bond of bonds(); track bond.id) {
-                <app-bond-card [bond]="bond" (subscribe)="onSubscribe($event)" />
+                <app-bond-card
+                  [bond]="bond"
+                  [accruedCredits]="accruedCredits()[bond.id]"
+                  (subscribe)="onSubscribe($event)"
+                />
               }
             </div>
           } @else {
@@ -113,17 +130,37 @@ import { Bond, Project } from '../shared/interfaces/bond.interface';
 })
 export class DashboardComponent implements OnInit {
   private readonly apiService = inject(ApiService);
+  private readonly walletService = inject(WalletService);
   private readonly router = inject(Router);
 
   readonly bonds = signal<Bond[]>([]);
   readonly projects = signal<Project[]>([]);
   readonly loading = signal(true);
   readonly error = signal('');
+  readonly accruedCredits = signal<Record<number, AccruedCreditsResponse>>({});
+  readonly accruedError = signal('');
 
   readonly totalBonds = signal(0);
   readonly activeBonds = signal(0);
   readonly totalProjects = signal(0);
   readonly carbonTotal = signal(0);
+
+  readonly accruedCarbon = computed(() =>
+    Object.values(this.accruedCredits()).reduce(
+      (sum, acc) =>
+        sum +
+        (acc.perCreditType.find((e) => e.creditType === 'Carbon')?.amount ?? 0),
+      0,
+    ),
+  );
+  readonly accruedBiodiversity = computed(() =>
+    Object.values(this.accruedCredits()).reduce(
+      (sum, acc) =>
+        sum +
+        (acc.perCreditType.find((e) => e.creditType === 'Biodiversity')?.amount ?? 0),
+      0,
+    ),
+  );
 
   ngOnInit(): void {
     this.loadData();
@@ -138,6 +175,7 @@ export class DashboardComponent implements OnInit {
         this.bonds.set(res.data);
         this.totalBonds.set(res.meta.total);
         this.activeBonds.set(res.data.filter((b: Bond) => b.status === 'Active').length);
+        this.loadAccruedCredits(res.data);
       },
       error: () => this.error.set('Failed to load dashboard data'),
     });
@@ -154,6 +192,20 @@ export class DashboardComponent implements OnInit {
         this.loading.set(false);
       },
     });
+  }
+
+  private loadAccruedCredits(bonds: Bond[]): void {
+    const holder = this.walletService.address();
+    if (!holder) return;
+
+    for (const bond of bonds) {
+      this.apiService.getAccruedCredits(bond.id, holder).subscribe({
+        next: (accrued) => {
+          this.accruedCredits.update((map) => ({ ...map, [bond.id]: accrued }));
+        },
+        error: () => this.accruedError.set('Failed to load accrued credits'),
+      });
+    }
   }
 
   onSubscribe(bondId: string): void {

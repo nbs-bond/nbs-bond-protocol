@@ -1,4 +1,8 @@
-import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import {
+  ExecutionContext,
+  ForbiddenException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { AdminGuard } from './admin.guard';
 
 describe('AdminGuard', () => {
@@ -25,12 +29,12 @@ describe('AdminGuard', () => {
     );
   });
 
-  it('throws UnauthorizedException if user walletAddress does not match admin key', async () => {
+  it('throws ForbiddenException if user walletAddress does not match admin key', async () => {
     process.env.STELLAR_PUBLIC_KEY = 'GADMIN_KEY';
     const context = createMockContext({ user: { walletAddress: 'GUSER_KEY' } });
 
     await expect(guard.canActivate(context)).rejects.toThrow(
-      new UnauthorizedException('Admin access required'),
+      new ForbiddenException('Admin access required'),
     );
   });
 

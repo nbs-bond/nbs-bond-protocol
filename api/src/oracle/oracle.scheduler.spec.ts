@@ -7,6 +7,7 @@ import { OracleProviderAdapter, MeasurementData } from './providers/provider.int
 import { VerraProvider } from './providers/verra.provider';
 import { SatelliteProvider } from './providers/satellite.provider';
 import { BlueCarbonProvider } from './providers/blue-carbon.provider';
+import { SchedulerRegistry } from '@nestjs/schedule';
 
 jest.mock('@redis/client', () => {
   const mockClient = {

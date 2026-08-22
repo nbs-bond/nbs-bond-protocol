@@ -1,6 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ProjectsController } from './projects.controller';
 import { ProjectsService } from './projects.service';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { AdminGuard } from '../common/guards/admin.guard';
 
 describe('ProjectsController', () => {
   let controller: ProjectsController;
@@ -89,4 +91,28 @@ describe('ProjectsController', () => {
     expect(service.uploadDocuments).toHaveBeenCalledWith(1, files);
     expect(result).toBe(expected);
   });
+});
+
+describe('ProjectsController guards', () => {
+  const GUARDS_METADATA = '__guards__';
+
+  it.each(['approve', 'reject'] as const)(
+    'guards %s with JWT + Admin guards',
+    (handler) => {
+      const guards: unknown[] = Reflect.getMetadata(
+        GUARDS_METADATA,
+        ProjectsController.prototype[handler],
+      );
+      expect(guards).toEqual([JwtAuthGuard, AdminGuard]);
+    },
+  );
+
+  it.each(['register', 'findAll', 'findOne'] as const)(
+    'keeps %s public',
+    (handler) => {
+      expect(
+        Reflect.getMetadata(GUARDS_METADATA, ProjectsController.prototype[handler]),
+      ).toBeUndefined();
+    },
+  );
 });

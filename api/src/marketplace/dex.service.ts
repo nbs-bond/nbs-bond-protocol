@@ -3,6 +3,8 @@ import {
   BadRequestException,
   HttpException,
   HttpStatus,
+  Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
@@ -17,9 +19,10 @@ import {
   QuoteAsset,
   QuoteBalanceResponse,
   QuoteTransactionResponse,
+  OnChainPriceQuote,
 } from './interfaces/marketplace.interface';
 import { createClient, RedisClientType } from '@redis/client';
-import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
 import { PaginatedResponse } from '../common/dto/pagination.dto';
 
 const DEX_ROUTER = () => process.env.DEX_ROUTER_ADDRESS || '';
@@ -40,7 +43,8 @@ const DEX_ERROR_CODE = {
 } as const;
 
 @Injectable()
-export class DexService {
+export class DexService implements OnModuleDestroy {
+  private readonly logger = new Logger(DexService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -121,7 +125,7 @@ export class DexService {
     );
 
     const orderId = Number(scValToNative(result));
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
     return this.getOrder(orderId);
   }
 
@@ -162,7 +166,7 @@ export class DexService {
       throw this.mapDexError(error);
     }
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(dto.orderId);
     return this.getOrder(dto.orderId);
   }
 
@@ -180,7 +184,7 @@ export class DexService {
       nonce,
     );
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
   }
 
   async getOrder(orderId: number): Promise<OrderResponse> {
@@ -197,6 +201,43 @@ export class DexService {
 
     await this.redis.setEx(cacheKey, 60, JSON.stringify(order));
     return order;
+  }
+
+  // `del('orders:*')` does not glob-match; SCAN for the real keys and UNLINK them.
+  private async invalidateOrderCaches(orderId: number): Promise<void> {
+    const keys = [`order:${orderId}`];
+
+    for await (const key of this.redis.scanIterator({ MATCH: 'orders:*', COUNT: 100 })) {
+      keys.push(key as unknown as string);
+    }
+
+    await this.redis.unlink(keys);
+  }
+
+  async getBestPrice(
+    bondId: number,
+    side: 'buy' | 'sell',
+    amount: number,
+  ): Promise<OnChainPriceQuote> {
+    const sideScVal = xdr.ScVal.scvVec([
+      nativeToScVal(side === 'buy' ? 'Buy' : 'Sell', { type: 'symbol' }),
+    ]);
+    const quoteScVal = await this.contractService.simulateCall({
+      contractAddress: DEX_ROUTER(),
+      method: 'get_best_price',
+      args: [
+        nativeToScVal(BigInt(bondId), { type: 'u64' }),
+        sideScVal,
+        nativeToScVal(BigInt(amount), { type: 'i128' }),
+      ],
+    });
+    const [price, total, slippageBps] = scValToNative(quoteScVal) as bigint[];
+
+    return {
+      price: Number(price),
+      total: Number(total),
+      slippageBps: Number(slippageBps),
+    };
   }
 
   async getQuoteBalance(
@@ -328,5 +369,22 @@ export class DexService {
     }
 
     return new BadRequestException(message);
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('DexService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `DexService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

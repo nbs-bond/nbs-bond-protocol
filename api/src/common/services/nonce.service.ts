@@ -121,13 +121,20 @@ export class NonceService implements OnModuleDestroy {
       // A "not found" / "entry not found" error here means the address has
       // never transacted with this contract, so the contract's own
       // unwrap_or(0) would also return 0. Treat that as nonce=0.
-      // Any other RPC error is also logged and defaults to 0 — the only
-      // risk is a spurious InvalidNonce if the account is not new. The
-      // caller's retry / error-handling path covers that case.
-      this.logger.warn(
-        `sync(): could not read on-chain nonce for ${address} on ${contractAddress}; ` +
-          `defaulting to 0. Error: ${error?.message ?? error}`,
-      );
+      if (this.isNotFoundError(error)) {
+        this.logger.debug(
+          `sync(): no on-chain nonce entry for ${address} on ${contractAddress}; defaulting to 0`,
+        );
+      } else {
+        // Any other RPC failure is a real outage: rethrow so the caller can
+        // surface a clear error instead of silently handing back a wrong nonce
+        // (e.g. when next() falls back to sync() after a Redis failure).
+        this.logger.error(
+          `sync(): could not read on-chain nonce for ${address} on ${contractAddress}; ` +
+            `Error: ${error?.message ?? error}`,
+        );
+        throw error;
+      }
     }
 
     // Atomically write the value with TTL in a single SET ... EX command.
@@ -195,12 +202,25 @@ export class NonceService implements OnModuleDestroy {
       })) as number;
       return incremented - 1;
     } catch (error) {
-      this.logger.warn(
-        `Failed to allocate nonce for ${address}; falling back to timestamp`,
-        error,
+      // Redis INCR failed. Fall back to the authoritative on-chain nonce via
+      // sync(). Never fabricate a timestamp nonce: a Unix timestamp is far
+      // ahead of the contract's expected nonce (guaranteed InvalidNonce) and
+      // collides for concurrent requests in the same second.
+      this.logger.error(
+        `next(): Redis nonce allocation failed for ${address} on ${contractAddress}; ` +
+          `falling back to on-chain sync. Error: ${error?.message ?? error}`,
       );
-      return Math.floor(Date.now() / 1000);
+      return await this.sync(contractAddress, address);
     }
+  }
+
+  /**
+   * Whether an on-chain read error indicates the nonce entry simply does not
+   * exist yet (brand-new address) rather than an RPC/network failure.
+   */
+  private isNotFoundError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    return /not found/i.test(message);
   }
 
   /**

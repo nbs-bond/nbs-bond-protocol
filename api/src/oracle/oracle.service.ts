@@ -5,6 +5,8 @@ import {
   ForbiddenException,
   HttpException,
   HttpStatus,
+  Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { toBytes32 } from '../stellar/bytes32';
@@ -40,7 +42,8 @@ const ORACLE_ERROR_CODE = {
 };
 
 @Injectable()
-export class OracleService {
+export class OracleService implements OnModuleDestroy {
+  private readonly logger = new Logger(OracleService.name);
   private redis: RedisClientType;
   private readonly localChallengeAttempts = new Map<string, { count: number; expiresAt: number }>();
   private static readonly CHALLENGE_LIMIT = 3;
@@ -375,20 +378,30 @@ export class OracleService {
     return undefined;
   }
 
+  /**
+   * Decodes an OracleConsumer `Report` struct. Field order matches the
+   * contract declaration: `id, provider, project_id, project_metadata_hash,
+   * period_start, period_end, carbon_sequestered, biodiversity, methodology,
+   * ipfs_evidence_hash, status, submitted_at, verified_at`. `project_id`
+   * (index 2) is the registry's numeric id and is not surfaced here;
+   * `projectId` below is the metadata hash (index 3), kept for
+   * compatibility with existing API consumers. `biodiversity` (index 7) is
+   * skipped by position when building the response.
+   */
   private decodeReport(data: any[]): ReportResponse {
     return {
       id: Number(data[0]),
       providerAddress: data[1] as string,
-      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
-      periodStart: Number(data[3]),
-      periodEnd: Number(data[4]),
-      carbonSequestered: Number(data[5]),
-      methodology: data[6] as string,
-      ipfsHash: Buffer.from(data[7] as Uint8Array).toString('hex'),
-      status: this.reportStatusFromIndex(Number(data[8])),
-      createdAt: new Date(Number(data[9]) * 1000).toISOString(),
-      verifiedAt: Number(data[10]) > 0
-        ? new Date(Number(data[10]) * 1000).toISOString()
+      projectId: Buffer.from(data[3] as Uint8Array).toString('hex'),
+      periodStart: Number(data[4]),
+      periodEnd: Number(data[5]),
+      carbonSequestered: Number(data[6]),
+      methodology: data[8] as string,
+      ipfsHash: Buffer.from(data[9] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[10])),
+      createdAt: new Date(Number(data[11]) * 1000).toISOString(),
+      verifiedAt: Number(data[12]) > 0
+        ? new Date(Number(data[12]) * 1000).toISOString()
         : undefined,
     };
   }
@@ -483,6 +496,23 @@ export class OracleService {
       throw new HttpException(
         'Challenge limit exceeded: maximum 3 challenges per wallet per 24 hours',
         HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('OracleService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `OracleService: error closing Redis connection: ${error?.message ?? error}`,
       );
     }
   }

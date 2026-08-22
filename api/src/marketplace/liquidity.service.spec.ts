@@ -27,6 +27,7 @@ describe('LiquidityService', () => {
           provide: DexService,
           useValue: {
             listOrders: jest.fn(),
+            getBestPrice: jest.fn(),
           },
         },
       ],
@@ -102,20 +103,18 @@ describe('LiquidityService', () => {
   });
 
   describe('calculateSlippage', () => {
-    it('calculates average price and slippage percentage across multiple order levels', async () => {
-      dexService.listOrders.mockResolvedValue({
-        data: [
-          { pricePerToken: 10, amount: 5 } as any,
-          { pricePerToken: 20, amount: 5 } as any,
-        ],
-        meta: { page: 1, limit: 100, total: 2, totalPages: 1 },
+    it('uses one on-chain quote instead of fetching every order', async () => {
+      dexService.getBestPrice.mockResolvedValue({
+        price: 15,
+        total: 150,
+        slippageBps: 5_000,
       });
 
       const result = await service.calculateSlippage(1, 10);
 
-      // Total cost: (5 * 10) + (5 * 20) = 150. Average price: 150 / 10 = 15.
-      // Ideal cost: 10 * 10 = 100.
-      // Slippage: ((150 - 100) / 100) * 100 = 50%.
+      expect(dexService.getBestPrice).toHaveBeenCalledTimes(1);
+      expect(dexService.getBestPrice).toHaveBeenCalledWith(1, 'buy', 10);
+      expect(dexService.listOrders).not.toHaveBeenCalled();
       expect(result).toEqual({
         bondId: 1,
         amount: 10,
@@ -126,9 +125,10 @@ describe('LiquidityService', () => {
     });
 
     it('handles empty open order book gracefully', async () => {
-      dexService.listOrders.mockResolvedValue({
-        data: [],
-        meta: { page: 1, limit: 100, total: 0, totalPages: 1 },
+      dexService.getBestPrice.mockResolvedValue({
+        price: 0,
+        total: 0,
+        slippageBps: 0,
       });
 
       const result = await service.calculateSlippage(1, 10);

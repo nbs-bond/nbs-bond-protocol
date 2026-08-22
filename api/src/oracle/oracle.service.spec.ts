@@ -147,14 +147,16 @@ describe('OracleService', () => {
   });
 
   describe('decodeReport', () => {
-    it('maps the contract Report struct to a ReportResponse', () => {
+    it('maps the contract Report struct to a ReportResponse, skipping the biodiversity field', () => {
       const raw = [
         BigInt(4),
         'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        BigInt(42),
         Buffer.from('a1b2'.padEnd(64, '0'), 'hex'),
         BigInt(1700000000),
         BigInt(1700086400),
         BigInt(1200),
+        ['Absent'],
         'VM0003',
         Buffer.from('c3d4'.padEnd(64, '0'), 'hex'),
         1,
@@ -185,10 +187,12 @@ describe('OracleService', () => {
       const raw = [
         BigInt(1),
         'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        BigInt(1),
         Buffer.alloc(32),
         BigInt(0),
         BigInt(0),
         BigInt(0),
+        ['Absent'],
         'VM0003',
         Buffer.alloc(32),
         index,
