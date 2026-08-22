@@ -15,6 +15,18 @@
  *    tx_failed. We cannot verify funding at import time, but the skip
  *    message directs contributors to Friendbot so they know what to do.
  *
+ * Note on investor signing (#116)
+ * --------------------------------
+ * There used to be an INVESTOR_SECRET_KEY probe/gate here, matching a single
+ * shared server-held investor key the API signed all subscribe/claim/transfer
+ * transactions with. That key has been removed entirely: investor operations
+ * now use a two-step prepare → sign-externally → submit flow, so e2e suites
+ * that exercise them generate their OWN throwaway Keypair per test (funded
+ * via Friendbot) instead of depending on a pre-configured env var. Those
+ * suites are gated on `describeWithAdminKey` alone, since the only remaining
+ * environment prerequisite is an admin key able to issue/set up a bond for
+ * the throwaway investor to act against.
+ *
  * Stellar secret-key format
  * -------------------------
  * StrKey S-encoded Ed25519 seed:
@@ -71,22 +83,18 @@ export function isValidStellarSecretKey(value: string | undefined): boolean {
 export const hasAdminKey = isValidStellarSecretKey(process.env.ADMIN_SECRET_KEY);
 
 /**
- * True when INVESTOR_SECRET_KEY is a valid Stellar secret seed.
- * Required by investor subscription / transfer signing tests.
- */
-export const hasInvestorKey = isValidStellarSecretKey(process.env.INVESTOR_SECRET_KEY);
-
-/**
  * True when USER_SECRET_KEY is a valid Stellar secret seed.
  * Required by user-level signing tests.
  */
 export const hasUserKey = isValidStellarSecretKey(process.env.USER_SECRET_KEY);
 
 /**
- * True when ALL three signer keys are present and valid.
- * Use this for suites that exercise the full bond lifecycle.
+ * True when both remaining pre-configured signer keys (admin, user) are
+ * present and valid. Investor operations no longer use a pre-configured key
+ * at all (see the #116 note above) — suites needing a signed investor
+ * transaction generate their own throwaway Keypair instead.
  */
-export const hasAllSigningKeys = hasAdminKey && hasInvestorKey && hasUserKey;
+export const hasAllSigningKeys = hasAdminKey && hasUserKey;
 
 // ---------------------------------------------------------------------------
 // Skip-reason helpers (for logging)
@@ -142,27 +150,13 @@ export function describeWithAdminKey(
 }
 
 /**
- * Wraps a `describe` block so that the suite runs only when
- * INVESTOR_SECRET_KEY is a valid Stellar secret seed.
- */
-export function describeWithInvestorKey(
-  name: string,
-  fn: () => void,
-): void {
-  if (hasInvestorKey) {
-    describe(name, fn);
-  } else {
-    warnSkip([missingKeyReason('INVESTOR_SECRET_KEY')]);
-    describe.skip(name, fn);
-  }
-}
-
-/**
- * Wraps a `describe` block so that the suite runs only when all three
- * signer keys (ADMIN_SECRET_KEY, INVESTOR_SECRET_KEY, USER_SECRET_KEY)
- * are valid Stellar secret seeds.
+ * Wraps a `describe` block so that the suite runs only when both remaining
+ * pre-configured signer keys (ADMIN_SECRET_KEY, USER_SECRET_KEY) are valid
+ * Stellar secret seeds.
  *
- * Use this for full bond-lifecycle flows that require every role.
+ * Use this for full bond-lifecycle flows that require every non-investor
+ * role. Investor identity is no longer pre-configured — see the #116 note
+ * above.
  */
 export function describeWithAllSigningKeys(
   name: string,
@@ -173,7 +167,6 @@ export function describeWithAllSigningKeys(
   } else {
     const missing: string[] = [];
     if (!hasAdminKey) missing.push('ADMIN_SECRET_KEY');
-    if (!hasInvestorKey) missing.push('INVESTOR_SECRET_KEY');
     if (!hasUserKey) missing.push('USER_SECRET_KEY');
     warnSkip(missing.map(missingKeyReason));
     describe.skip(name, fn);

@@ -28,6 +28,18 @@ export interface ChallengeResponse {
   createdAt: string;
 }
 
+/**
+ * Returned by the `/prepare` step of the pre-signed-transaction challenge
+ * flow (see OracleService.prepareChallenge()). `xdr` is an UNSIGNED base64
+ * transaction envelope the challenger's wallet must sign and post back to
+ * POST /oracle/challenge/:reportId; `nonce` is the contract-level nonce
+ * reserved for that submission.
+ */
+export interface ChallengePrepareResponse {
+  xdr: string;
+  nonce: number;
+}
+
 export type ProviderHealthState = 'healthy' | 'stale' | 'unknown';
 
 export interface ProviderHealthStatus {

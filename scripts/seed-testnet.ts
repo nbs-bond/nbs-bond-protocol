@@ -26,6 +26,32 @@ function required(name: string): string {
   return value;
 }
 
+/**
+ * This script signs its own seed transactions directly against
+ * Horizon/Soroban RPC (see invoke() above) — it never went through the API,
+ * so it never actually depended on the API's INVESTOR_SECRET_KEY. It only
+ * borrowed that env var's name by convention for its third signer role
+ * ("verifier", a second independent oracle provider used to verify a
+ * report). Now that INVESTOR_SECRET_KEY has been removed entirely (#116:
+ * investor operations use a pre-signed-transaction flow instead of a
+ * server-held key), this script reads SEED_VERIFIER_SECRET_KEY instead —
+ * and, if that is not set, generates its own throwaway Keypair and prints
+ * it, so `npm run seed:testnet` keeps working out of the box.
+ */
+function loadOrGenerateSigner(envVar: string, label: string): Keypair {
+  const value = process.env[envVar];
+  if (value && !value.includes('...')) {
+    return Keypair.fromSecret(value);
+  }
+  const generated = Keypair.random();
+  console.log(
+    `  ${label}: ${envVar} not set — generated a throwaway keypair ` +
+    `${generated.publicKey()} (secret ${generated.secret()}). ` +
+    `Set ${envVar} in api/.env to reuse the same signer across runs.`,
+  );
+  return generated;
+}
+
 const PROJECT_REGISTRY_ID = required('PROJECT_REGISTRY_ADDRESS');
 const BOND_ISSUER_ID = required('BOND_ISSUER_ADDRESS');
 const COUPON_ENGINE_ID = required('COUPON_ENGINE_ADDRESS');
@@ -114,9 +140,9 @@ async function fund(keypair: Keypair): Promise<void> {
 async function main() {
   const admin = Keypair.fromSecret(required('ADMIN_SECRET_KEY'));
   const provider = Keypair.fromSecret(required('USER_SECRET_KEY'));
-  const verifier = Keypair.fromSecret(required('INVESTOR_SECRET_KEY'));
+  const verifier = loadOrGenerateSigner('SEED_VERIFIER_SECRET_KEY', 'Verifier/investor signer');
   if (new Set([admin.publicKey(), provider.publicKey(), verifier.publicKey()]).size !== 3) {
-    throw new Error('ADMIN_SECRET_KEY, USER_SECRET_KEY, and INVESTOR_SECRET_KEY must be distinct');
+    throw new Error('ADMIN_SECRET_KEY, USER_SECRET_KEY, and SEED_VERIFIER_SECRET_KEY must be distinct');
   }
 
   console.log('🌱 Seeding testnet with sample data...\n');

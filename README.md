@@ -782,10 +782,11 @@ STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
 SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
 STELLAR_PUBLIC_KEY=G...                        # Admin public key (used by deploy scripts)
 
-# ── Signer Keys (used by the API to build transactions) ──────────
+# ── Signer Keys (used by the API to build admin/dev transactions) ─
+# Investor operations (subscribe/claim/transfer) no longer use a
+# server-held secret key — see "Pre-signed investor transactions" below.
 ADMIN_SECRET_KEY=S...                          # Issuer/admin secret key
 USER_SECRET_KEY=S...                           # Regular user (developer) secret key
-INVESTOR_SECRET_KEY=S...                       # Investor secret key
 
 # ── Contract Addresses (populated after deployment) ──────────────
 BOND_ISSUER_ADDRESS=C...
@@ -829,6 +830,28 @@ Pinata credentials are configured. Without credentials, non-production
 environments use `IPFS_LOCAL_API_URL` and log that remote pinning was skipped.
 Production always requires Pinata credentials; set `REQUIRE_IPFS_PINNING=true`
 to enforce the same behavior in another environment.
+
+#### Pre-signed investor transactions
+
+Investor operations — `POST /bonds/:id/subscribe`, `POST /bonds/:id/claim`,
+`POST /bonds/:id/transfer`, and `POST /oracle/challenge/:reportId` — are
+two-step calls, not server-signed calls:
+
+1. **Prepare**: `POST` the corresponding `.../prepare` endpoint (e.g.
+   `POST /bonds/:id/subscribe/prepare`). The API builds an unsigned
+   transaction (reserving a contract-level nonce scoped to the caller's own
+   wallet address) and returns it as base64 XDR.
+2. **Sign**: the investor's own wallet (a Freighter-style browser extension,
+   out of scope for this repo — see the frontend integration issue) signs
+   the XDR locally. The API never sees or holds an investor's private key.
+3. **Submit**: `POST` the original endpoint with `{ "signedTxXdr": "<base64
+   envelope>" }`. The API validates that the envelope's source account,
+   contract address, and method match what was prepared, then submits it
+   as-is.
+
+This replaced a single shared `INVESTOR_SECRET_KEY` the API used to sign
+every investor transaction, which meant concurrent investors collided on the
+same on-chain sequence number/nonce — see `docs/architecture.md` for details.
 
 ---
 
@@ -1034,7 +1057,12 @@ npm run test:cov
 | Suite | Keys required | Behaviour when keys absent |
 |---|---|---|
 | **API validation** | None | Always runs — uses an in-process probe controller, no network |
-| **Signing suites** (bond issuance, investor subscription) | `ADMIN_SECRET_KEY`, `INVESTOR_SECRET_KEY` | Skipped automatically with a log message |
+| **Signing suites** (bond issuance, investor pre-signed subscribe/claim/transfer) | `ADMIN_SECRET_KEY` | Skipped automatically with a log message |
+
+Investor operations no longer depend on a pre-configured signer key: the
+investor-flow suite generates its own throwaway `Keypair`, funds it via
+Friendbot, and signs the XDR returned by the relevant `/prepare` endpoint
+locally — see "Pre-signed investor transactions" below.
 
 The skip logic lives in `api/test/testenv.ts` and uses `describe.skip` at
 collection time (not `test.skip` inside `beforeAll`), which is the correct
@@ -1046,7 +1074,6 @@ Jest primitive for conditionally skipping a suite.
 
    ```env
    ADMIN_SECRET_KEY=S<55 base32 chars>   # valid StrKey-encoded Ed25519 seed
-   INVESTOR_SECRET_KEY=S<55 base32 chars>
    USER_SECRET_KEY=S<55 base32 chars>
    ```
 
