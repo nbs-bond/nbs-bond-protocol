@@ -1229,7 +1229,7 @@ mod integration {
 
             env.ledger().set_timestamp(config.maturity_date - 1);
             let early = contracts.bi_client.try_mature_bond(&admin, &bond_id, &1);
-            assert_eq!(early, Err(Ok(BondError::Overflow)));
+            assert_eq!(early, Err(Ok(BondError::NotYetMature)));
 
             env.ledger().set_timestamp(config.maturity_date);
             contracts.bi_client.mature_bond(&admin, &bond_id, &1);
