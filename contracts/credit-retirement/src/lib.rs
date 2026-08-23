@@ -350,9 +350,7 @@ impl CreditRetirement {
         write(&env, &DataKey::Retirement(retirement_id), &record);
 
         let retired: i128 = read(&env, &DataKey::RetiredCredits(holder.clone())).unwrap_or(0);
-        let new_total = retired
-            .checked_add(amount)
-            .ok_or(CreditError::InsufficientCredits)?;
+        let new_total = retired.checked_add(amount).ok_or(CreditError::Overflow)?;
         write(&env, &DataKey::RetiredCredits(holder.clone()), &new_total);
 
         let mut retirements: Vec<u64> =
@@ -385,7 +383,7 @@ impl CreditRetirement {
         env: Env,
         retirement_id: u64,
     ) -> Result<RetirementRecord, CreditError> {
-        read(&env, &DataKey::Retirement(retirement_id)).ok_or(CreditError::InsufficientCredits)
+        read(&env, &DataKey::Retirement(retirement_id)).ok_or(CreditError::RetirementNotFound)
     }
 
     pub fn get_retirement_certificate(
@@ -393,7 +391,7 @@ impl CreditRetirement {
         retirement_id: u64,
     ) -> Result<RetirementCertificate, CreditError> {
         let record: RetirementRecord = read(&env, &DataKey::Retirement(retirement_id))
-            .ok_or(CreditError::InsufficientCredits)?;
+            .ok_or(CreditError::RetirementNotFound)?;
         Ok(certificate_from_record(&record))
     }
 
@@ -425,7 +423,7 @@ impl CreditRetirement {
     /// for reporting must be able to keep it alive.
     pub fn extend_retirement_ttl(env: Env, retirement_id: u64) -> Result<(), CreditError> {
         let record: RetirementRecord = read(&env, &DataKey::Retirement(retirement_id))
-            .ok_or(CreditError::InsufficientCredits)?;
+            .ok_or(CreditError::RetirementNotFound)?;
 
         // Re-home legacy instance-storage records on first touch so the TTL bump
         // has a persistent entry to act on.
@@ -463,13 +461,11 @@ impl CreditRetirement {
     }
 }
 
-
-
-    /// Get the total retired credits by type for a holder.
-    pub fn get_retired_by_type(env: Env, holder: Address, credit_type: CreditType) -> i128 {
-        let key = DataKey::RetiredByType(holder, credit_type);
-        read(&env, &key).unwrap_or(0)
-    }
+/// Get the total retired credits by type for a holder.
+pub fn get_retired_by_type(env: Env, holder: Address, credit_type: CreditType) -> i128 {
+    let key = DataKey::RetiredByType(holder, credit_type);
+    read(&env, &key).unwrap_or(0)
+}
 #[cfg(test)]
 mod test {
     use super::*;
@@ -537,6 +533,7 @@ mod test {
         let registry_project_id = registry.register_project(
             &owner,
             project_id,
+            &Symbol::new(env, "Project"),
             &Symbol::new(env, "VCS"),
             &Symbol::new(env, "US"),
             &0,
@@ -623,6 +620,7 @@ mod test {
         let pid = registry.register_project(
             &user,
             &project_id,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -845,10 +843,44 @@ mod test {
     }
 
     #[test]
+    fn test_retire_credits_overflow_rejected() {
+        let s = setup();
+
+        // Force the holder's already-retired total to the brink of i128::MAX so
+        // the checked_add guard in retire_credits trips instead of wrapping.
+        s._env.as_contract(&s.contract_id, || {
+            s._env.storage().persistent().set(
+                &DataKey::RetiredCredits(s.holder.clone()),
+                &(i128::MAX - s.accrued + 1),
+            );
+        });
+
+        let hash = make_certificate_hash(&s._env, 1);
+        let result = s.client.try_retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &s.accrued,
+            &CreditType::Carbon,
+            &hash,
+            &0,
+        );
+        assert_eq!(result, Err(Ok(CreditError::Overflow)));
+    }
+
+    #[test]
     fn test_query_nonexistent_retirement() {
         let s = setup();
         let result = s.client.try_get_retirement_record(&999);
-        assert_eq!(result, Err(Ok(CreditError::InsufficientCredits)));
+        assert_eq!(result, Err(Ok(CreditError::RetirementNotFound)));
+    }
+
+    #[test]
+    fn test_query_nonexistent_retirement_certificate() {
+        let s = setup();
+        let result = s.client.try_get_retirement_certificate(&999);
+        assert_eq!(result, Err(Ok(CreditError::RetirementNotFound)));
     }
 
     #[test]
@@ -886,6 +918,7 @@ mod test {
         let pid = registry.register_project(
             &user,
             &project_id,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -1242,7 +1275,7 @@ mod test {
     fn test_extend_ttl_for_unknown_retirement_rejected() {
         let s = setup();
         let result = s.client.try_extend_retirement_ttl(&404u64);
-        assert_eq!(result, Err(Ok(CreditError::InsufficientCredits)));
+        assert_eq!(result, Err(Ok(CreditError::RetirementNotFound)));
     }
 
     #[test]

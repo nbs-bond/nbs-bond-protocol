@@ -390,11 +390,11 @@ describe('BondsService', () => {
       return moduleRef.get(BondsService);
     };
 
-    it('maps a before-maturity Overflow to a 400 with a clear message', async () => {
+    it('maps a before-maturity NotYetMature (code 14) to a 400 with a clear message', async () => {
       const contractService = {
         invokeContractMethod: jest.fn().mockRejectedValue(
           new BadRequestException(
-            'Contract error on TEST.mature_bond (contract error code 9)',
+            'Contract error on TEST.mature_bond (contract error code 14)',
           ),
         ),
       };
@@ -424,6 +424,124 @@ describe('BondsService', () => {
         status: 400,
         message:
           'Contract error on TEST.mature_bond (contract error code 4)',
+      });
+    });
+
+    it('rethrows a genuine arithmetic Overflow (code 9) unchanged', async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockRejectedValue(
+          new BadRequestException(
+            'Contract error on TEST.mature_bond (contract error code 9)',
+          ),
+        ),
+      };
+
+      const svc = await buildModule(contractService);
+
+      await expect(svc.mature(7)).rejects.toMatchObject({
+        status: 400,
+        message: 'Contract error on TEST.mature_bond (contract error code 9)',
+      });
+    });
+  });
+
+  describe('create', () => {
+    const adminStub = () => ({
+      getKeypairFromSecret: jest.fn().mockReturnValue({
+        publicKey: () =>
+          'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      }),
+    });
+
+    const buildModule = async (contractService: any) => {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: adminStub() },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+      return moduleRef.get(BondsService);
+    };
+
+    const dto: any = {
+      projectId: '0'.repeat(64),
+      faceValue: 1000,
+      couponSchedule: [1000000, 2000000],
+      creditType: 'Carbon',
+      maturityDate: 500,
+      totalSupply: 10000,
+    };
+
+    it('maps a past-maturity-date MaturityDateInPast (code 15) to a clear 400', async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockRejectedValue(
+          new BadRequestException(
+            'Contract error on TEST.issue_bond (contract error code 15)',
+          ),
+        ),
+      };
+
+      const svc = await buildModule(contractService);
+
+      await expect(svc.create(dto)).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining(
+          'maturity date must be in the future',
+        ),
+      });
+    });
+  });
+
+  describe('transfer', () => {
+    const investorStub = () => ({
+      getKeypairFromSecret: jest.fn().mockReturnValue({
+        publicKey: () =>
+          'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      }),
+    });
+
+    const buildModule = async (contractService: any) => {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: investorStub() },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+      return moduleRef.get(BondsService);
+    };
+
+    const dto: any = {
+      fromAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      toAddress: 'GBO6AXD5GLGDR45HENK4RZMFXOTZIJYL3NWGNGWXYI3RTFNIYK32YGJQ',
+      amount: 600,
+    };
+
+    it('maps an InsufficientBalance (code 16) to a clear 400', async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockRejectedValue(
+          new BadRequestException(
+            'Contract error on TEST.transfer (contract error code 16)',
+          ),
+        ),
+      };
+
+      const svc = await buildModule(contractService);
+
+      await expect(svc.transfer(7, dto)).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('Insufficient balance on bond #7'),
       });
     });
   });
@@ -776,6 +894,7 @@ describe('BondsService', () => {
       xdr.ScVal.scvVec([
         nativeToScVal(BigInt(7), { type: 'u64' }),
         Address.fromString(REPORT_HOLDER).toScVal(),
+        nativeToScVal(BigInt(42), { type: 'u64' }),
         xdr.ScVal.scvBytes(Buffer.alloc(32)),
         nativeToScVal(BigInt(1000), { type: 'u64' }),
         nativeToScVal(BigInt(2000), { type: 'u64' }),
@@ -988,11 +1107,12 @@ describe('BondsService', () => {
       const report = (svc as any).decodeReport([
         BigInt(9),
         REPORT_HOLDER,
+        BigInt(42),
         Buffer.alloc(32),
         BigInt(1000),
         BigInt(2000),
         BigInt(500),
-        [0],
+        ['Absent'],
         'VM0003',
         Buffer.alloc(32),
         1,

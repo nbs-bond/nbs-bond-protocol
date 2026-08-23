@@ -1441,6 +1441,7 @@ mod test {
         let pid = registry.register_project(
             &user,
             &metadata,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,

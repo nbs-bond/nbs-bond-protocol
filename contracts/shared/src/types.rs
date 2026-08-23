@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[contracttype]
@@ -65,6 +65,18 @@ pub enum ProjectStatus {
     Approved,
     Rejected,
     Inactive,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct Project {
+    pub id: u64,
+    pub owner: Address,
+    pub metadata_ipfs_hash: BytesN<32>,
+    pub name: Symbol,
+    pub status: ProjectStatus,
+    pub methodology: Symbol,
+    pub country: Symbol,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

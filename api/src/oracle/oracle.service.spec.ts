@@ -168,17 +168,49 @@ describe('OracleService', () => {
         .rejects.toMatchObject({ status: HttpStatus.TOO_MANY_REQUESTS });
       expect(contractService.prepareTransaction).toHaveBeenCalledTimes(3);
     });
+
+    it('maps a ChallengeAlreadyExists contract error (code 20) to a ConflictException', async () => {
+      contractService.invokeContractMethod.mockReset().mockRejectedValue(
+        new BadRequestException(
+          'Contract simulation failed: Error(Contract, #20) (contract error code 20)',
+        ),
+      );
+
+      await expect(
+        service.challengeReport(7, dto, investorAddress),
+      ).rejects.toBeInstanceOf(ConflictException);
+      await expect(
+        service.challengeReport(8, dto, investorAddress),
+      ).rejects.toThrow('already has a challenge on file');
+    });
+
+    it('propagates other contract failures from challenge_report unchanged', async () => {
+      contractService.invokeContractMethod.mockReset().mockRejectedValue(
+        new BadRequestException(
+          'Contract simulation failed: Error(Contract, #6) (contract error code 6)',
+        ),
+      );
+
+      await expect(
+        service.challengeReport(9, dto, investorAddress),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('contract error code 6'),
+      });
+    });
   });
 
   describe('decodeReport', () => {
-    it('maps the contract Report struct to a ReportResponse', () => {
+    it('maps the contract Report struct to a ReportResponse, skipping the biodiversity field', () => {
       const raw = [
         BigInt(4),
         'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        BigInt(42),
         Buffer.from('a1b2'.padEnd(64, '0'), 'hex'),
         BigInt(1700000000),
         BigInt(1700086400),
         BigInt(1200),
+        ['Absent'],
         'VM0003',
         Buffer.from('c3d4'.padEnd(64, '0'), 'hex'),
         1,
@@ -209,10 +241,12 @@ describe('OracleService', () => {
       const raw = [
         BigInt(1),
         'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        BigInt(1),
         Buffer.alloc(32),
         BigInt(0),
         BigInt(0),
         BigInt(0),
+        ['Absent'],
         'VM0003',
         Buffer.alloc(32),
         index,

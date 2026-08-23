@@ -628,7 +628,7 @@ impl OracleConsumer {
 
         let challenge_key = DataKey::Challenge(report_id);
         if env.storage().persistent().has(&challenge_key) {
-            return Err(OracleError::ProviderAlreadyExists);
+            return Err(OracleError::ChallengeAlreadyExists);
         }
 
         let challenge = Challenge {
@@ -1199,6 +1199,7 @@ mod test {
         let project_id = registry.register_project(
             &owner,
             &make_ipfs_hash(env, 200),
+            &Symbol::new(env, "Project"),
             &Symbol::new(env, "VCS"),
             &Symbol::new(env, "US"),
             &0,
@@ -1286,6 +1287,7 @@ mod test {
         let pending_id = registry.register_project(
             &owner,
             &make_ipfs_hash(&env, 1),
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -1293,6 +1295,7 @@ mod test {
         let rejected_id = registry.register_project(
             &owner,
             &make_ipfs_hash(&env, 2),
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &1,
@@ -1301,6 +1304,7 @@ mod test {
         let inactive_id = registry.register_project(
             &owner,
             &make_ipfs_hash(&env, 3),
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &2,
@@ -1340,6 +1344,7 @@ mod test {
         let project_id = registry.register_project(
             &owner,
             &metadata_hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -1651,6 +1656,7 @@ mod test {
         let pa = registry.register_project(
             &owner,
             &make_ipfs_hash(&env, 10),
+            &Symbol::new(&env, "ProjectA"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -1659,6 +1665,7 @@ mod test {
         let pb = registry.register_project(
             &owner,
             &make_ipfs_hash(&env, 11),
+            &Symbol::new(&env, "ProjectB"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &1,
@@ -1744,6 +1751,60 @@ mod test {
         let stored_challenge = client.get_challenge(&report_id);
         assert!(stored_challenge.resolved);
         assert_eq!(stored_challenge.resolution, ReportStatus::Verified as u32);
+    }
+
+    #[test]
+    fn test_challenge_already_exists_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        // A Challenge record can only ever appear in storage alongside a
+        // report status flip to `Challenged` (see `challenge_report`), so this
+        // combination — a stored Challenge with the report still `Pending` —
+        // cannot arise through the public API. It is constructed directly here
+        // to exercise the defensive duplicate-challenge guard on its own
+        // terms: `challenge_report` must still refuse to overwrite an existing
+        // `Challenge` entry with `ChallengeAlreadyExists`, not the unrelated
+        // `ProviderAlreadyExists`.
+        env.as_contract(&contract_id, || {
+            let stale_challenge = Challenge {
+                report_id,
+                challenger: challenger.clone(),
+                counter_evidence_hash: make_ipfs_hash(&env, 9),
+                submitted_at: 0,
+                resolved: false,
+                resolution: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Challenge(report_id), &stale_challenge);
+        });
+
+        let result =
+            client.try_challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        assert_eq!(result, Err(Ok(OracleError::ChallengeAlreadyExists)));
     }
 
     #[test]

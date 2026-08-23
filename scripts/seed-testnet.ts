@@ -161,7 +161,8 @@ async function main() {
   } else {
     console.log('\n📋 Registering project...');
     registryProjectId = BigInt(await invoke(admin, PROJECT_REGISTRY_ID, 'register_project', [
-      address(admin.publicKey()), projectHash, symbol(METHODOLOGY), symbol('BR'), u64(1),
+      address(admin.publicKey()), projectHash, symbol('Amazon_Corridor'), symbol(METHODOLOGY),
+      symbol('BR'), u64(1),
     ]) as bigint);
     await invoke(admin, PROJECT_REGISTRY_ID, 'approve_project', [
       address(admin.publicKey()), u64(registryProjectId), u64(2),

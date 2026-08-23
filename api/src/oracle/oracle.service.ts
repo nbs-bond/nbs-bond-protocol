@@ -39,6 +39,9 @@ const ORACLE_ERROR_CODE = {
   InvalidNonce: 3,
   ProviderNotFound: 4,
   ProviderAlreadyExists: 5,
+  // Added to replace the previous overloaded use of `ProviderAlreadyExists`
+  // (= 5) for a duplicate `challenge_report` call on the same report (#114).
+  ChallengeAlreadyExists: 20,
 };
 
 @Injectable()
@@ -159,37 +162,19 @@ export class OracleService implements OnModuleDestroy {
     await this.enforceChallengeRateLimit(challengerAddress);
     const nonce = await this.nonceService.next(ORACLE_CONSUMER(), challengerAddress);
 
-    return this.contractService.prepareTransaction(
-      ORACLE_CONSUMER(), 'challenge_report', challengerAddress,
-      [
-        Address.fromString(challengerAddress).toScVal(),
-        nativeToScVal(BigInt(reportId), { type: 'u64' }),
-        toBytes32(dto.counterEvidenceHash),
-      ],
-      nonce,
-    );
-  }
-
-  /**
-   * Second step: submits the transaction envelope the challenger's wallet
-   * signed from prepareChallenge().
-   */
-  async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: string): Promise<ChallengeResponse> {
-    if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(dto.counterEvidenceHash)) {
-      throw new BadRequestException(
-        'counterEvidenceHash must be a valid 46-character CIDv0 beginning with Qm',
-      );
-    }
-
     try {
-      Address.fromString(challengerAddress);
-    } catch {
-      throw new BadRequestException('A valid challenger wallet address is required');
+      await this.contractService.invokeContractMethod(
+        ORACLE_CONSUMER(), 'challenge_report', investorSecret,
+        [
+          Address.fromString(challengerAddress).toScVal(),
+          nativeToScVal(BigInt(reportId), { type: 'u64' }),
+          toBytes32(dto.counterEvidenceHash),
+        ],
+        nonce,
+      );
+    } catch (error) {
+      throw this.mapChallengeError(error, reportId);
     }
-
-    await this.contractService.submitSignedTransaction(
-      dto.signedTxXdr, ORACLE_CONSUMER(), 'challenge_report', challengerAddress,
-    );
 
     return {
       reportId,
@@ -379,20 +364,30 @@ export class OracleService implements OnModuleDestroy {
     return undefined;
   }
 
+  /**
+   * Decodes an OracleConsumer `Report` struct. Field order matches the
+   * contract declaration: `id, provider, project_id, project_metadata_hash,
+   * period_start, period_end, carbon_sequestered, biodiversity, methodology,
+   * ipfs_evidence_hash, status, submitted_at, verified_at`. `project_id`
+   * (index 2) is the registry's numeric id and is not surfaced here;
+   * `projectId` below is the metadata hash (index 3), kept for
+   * compatibility with existing API consumers. `biodiversity` (index 7) is
+   * skipped by position when building the response.
+   */
   private decodeReport(data: any[]): ReportResponse {
     return {
       id: Number(data[0]),
       providerAddress: data[1] as string,
-      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
-      periodStart: Number(data[3]),
-      periodEnd: Number(data[4]),
-      carbonSequestered: Number(data[5]),
-      methodology: data[6] as string,
-      ipfsHash: Buffer.from(data[7] as Uint8Array).toString('hex'),
-      status: this.reportStatusFromIndex(Number(data[8])),
-      createdAt: new Date(Number(data[9]) * 1000).toISOString(),
-      verifiedAt: Number(data[10]) > 0
-        ? new Date(Number(data[10]) * 1000).toISOString()
+      projectId: Buffer.from(data[3] as Uint8Array).toString('hex'),
+      periodStart: Number(data[4]),
+      periodEnd: Number(data[5]),
+      carbonSequestered: Number(data[6]),
+      methodology: data[8] as string,
+      ipfsHash: Buffer.from(data[9] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[10])),
+      createdAt: new Date(Number(data[11]) * 1000).toISOString(),
+      verifiedAt: Number(data[12]) > 0
+        ? new Date(Number(data[12]) * 1000).toISOString()
         : undefined,
     };
   }
@@ -447,6 +442,24 @@ export class OracleService implements OnModuleDestroy {
       return new BadRequestException(error.message);
     }
     return new BadRequestException('Failed to register oracle provider');
+  }
+
+  private mapChallengeError(error: unknown, reportId: number): Error {
+    if (error instanceof ConflictException) {
+      return error;
+    }
+    if (error instanceof HttpException) {
+      if (this.contractErrorCode(error.message) === ORACLE_ERROR_CODE.ChallengeAlreadyExists) {
+        return new ConflictException(
+          `Report #${reportId} already has a challenge on file`,
+        );
+      }
+      return error;
+    }
+    if (error instanceof Error) {
+      return new BadRequestException(error.message);
+    }
+    return new BadRequestException('Failed to challenge report');
   }
 
   private contractErrorCode(message: string): number | undefined {

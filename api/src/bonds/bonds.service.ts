@@ -57,6 +57,12 @@ const BOND_ERROR_CODE = {
   ProjectNotApproved: 8,
   Overflow: 9,
   ReportNotVerified: 10,
+  // Added to replace the previous overloaded use of `Overflow` (= 9) for
+  // "not yet mature" / "maturity date in the past", and of
+  // `InsufficientSupply` (= 6) for a holder's own balance, on-chain (#114).
+  NotYetMature: 14,
+  MaturityDateInPast: 15,
+  InsufficientBalance: 16,
 };
 
 const COUPON_ERROR_CODE = {
@@ -89,11 +95,16 @@ export class BondsService implements OnModuleDestroy {
 
     const configScVal = this.encodeBondConfig(dto);
 
-    const { result } = await this.contractService.invokeContractMethod(
-      BOND_ISSUER(), 'issue_bond', adminSecret,
-      [Address.fromString(adminAddress).toScVal(), configScVal],
-      nonce,
-    );
+    let result: xdr.ScVal;
+    try {
+      ({ result } = await this.contractService.invokeContractMethod(
+        BOND_ISSUER(), 'issue_bond', adminSecret,
+        [Address.fromString(adminAddress).toScVal(), configScVal],
+        nonce,
+      ));
+    } catch (error) {
+      throw this.mapBondError(error);
+    }
 
     const bondId = Number(scValToNative(result));
     const bond = await this.buildBondResponse(bondId);
@@ -545,26 +556,22 @@ export class BondsService implements OnModuleDestroy {
     dto: PrepareTransferDto,
   ): Promise<PrepareTransactionResponse> {
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
-    return this.contractService.prepareTransaction(
-      BOND_ISSUER(), 'transfer', dto.fromAddress,
-      [
-        Address.fromString(dto.fromAddress).toScVal(),
-        Address.fromString(dto.toAddress).toScVal(),
-        nativeToScVal(BigInt(id), { type: 'u64' }),
-        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
-      ],
-      nonce,
-    );
-  }
 
-  /**
-   * Second step: submits the transaction envelope `fromAddress`'s wallet
-   * signed from prepareTransfer().
-   */
-  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
-    const { transactionHash } = await this.contractService.submitSignedTransaction(
-      dto.signedTxXdr, BOND_ISSUER(), 'transfer', dto.fromAddress,
-    );
+    let transactionHash: string | undefined;
+    try {
+      ({ transactionHash } = await this.contractService.invokeContractMethod(
+        BOND_ISSUER(), 'transfer', investorSecret,
+        [
+          Address.fromString(dto.fromAddress).toScVal(),
+          Address.fromString(dto.toAddress).toScVal(),
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+        ],
+        nonce,
+      ));
+    } catch (error) {
+      throw this.mapBondError(error, id);
+    }
 
     await this.redis.sAdd(`bond:${id}:holders`, dto.toAddress);
 
@@ -722,22 +729,27 @@ export class BondsService implements OnModuleDestroy {
 
   /**
    * Decodes an OracleConsumer `Report` struct. Field order matches the
-   * contract declaration; note the `biodiversity` field is skipped by
-   * position (index 6) when building the summary.
+   * contract declaration: `id, provider, project_id, project_metadata_hash,
+   * period_start, period_end, carbon_sequestered, biodiversity, methodology,
+   * ipfs_evidence_hash, status, submitted_at, verified_at`. `project_id`
+   * (index 2) is the registry's numeric id and is not surfaced here;
+   * `projectId` below is the metadata hash (index 3), kept for
+   * compatibility with existing API consumers. `biodiversity` (index 7) is
+   * skipped by position when building the summary.
    */
   private decodeReport(data: any[]): PeriodReportResponse {
     return {
       id: Number(data[0]),
       providerAddress: data[1] as string,
-      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
-      periodStart: Number(data[3]),
-      periodEnd: Number(data[4]),
-      carbonSequestered: Number(data[5]),
-      methodology: data[7] as string,
-      ipfsHash: Buffer.from(data[8] as Uint8Array).toString('hex'),
-      status: this.reportStatusFromIndex(Number(data[9])),
-      submittedAt: Number(data[10]),
-      verifiedAt: Number(data[11]),
+      projectId: Buffer.from(data[3] as Uint8Array).toString('hex'),
+      periodStart: Number(data[4]),
+      periodEnd: Number(data[5]),
+      carbonSequestered: Number(data[6]),
+      methodology: data[8] as string,
+      ipfsHash: Buffer.from(data[9] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[10])),
+      submittedAt: Number(data[11]),
+      verifiedAt: Number(data[12]),
     };
   }
 
@@ -836,16 +848,30 @@ export class BondsService implements OnModuleDestroy {
     };
   }
 
-  private mapBondError(error: unknown, bondId: number): Error {
+  private mapBondError(error: unknown, bondId?: number): Error {
     if (error instanceof BadRequestException) {
       const message = error.message;
       const match = message.match(/error code (\d+)/);
       const code = match ? Number(match[1]) : undefined;
 
-      if (code === BOND_ERROR_CODE.Overflow) {
+      if (code === BOND_ERROR_CODE.NotYetMature) {
         return new BadRequestException(
           `Bond #${bondId} cannot be matured before its maturity date. ` +
           'Maturation is only allowed once the maturity date has been reached.',
+        );
+      }
+
+      if (code === BOND_ERROR_CODE.MaturityDateInPast) {
+        return new BadRequestException(
+          'Bond maturity date must be in the future.',
+        );
+      }
+
+      if (code === BOND_ERROR_CODE.InsufficientBalance) {
+        return new BadRequestException(
+          bondId !== undefined
+            ? `Insufficient balance on bond #${bondId} to complete this transfer.`
+            : 'Insufficient balance to complete this transfer.',
         );
       }
 
@@ -854,7 +880,7 @@ export class BondsService implements OnModuleDestroy {
     if (error instanceof Error) {
       return new BadRequestException(error.message);
     }
-    return new BadRequestException('Failed to mature bond');
+    return new BadRequestException('Bond operation failed');
   }
 
   private getAdminSecret(): string {

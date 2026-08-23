@@ -24,6 +24,20 @@ pub enum BondError {
     /// variant is returned only when the *entire* batch consists of already-
     /// paid addresses, so callers can detect a fully-redundant call.
     AlreadyProcessed = 13,
+    /// `mature_bond` was called before `config.maturity_date` has elapsed.
+    /// Replaces the previous overloaded use of `Overflow` (= 9) for this
+    /// guard so callers can distinguish "not mature yet" from a real
+    /// arithmetic overflow.
+    NotYetMature = 14,
+    /// `issue_bond` was called with a `maturity_date` that is already in the
+    /// past (at or before the current ledger timestamp). Replaces the
+    /// previous overloaded use of `Overflow` (= 9) for this guard.
+    MaturityDateInPast = 15,
+    /// A holder's own token balance was too small to cover a `transfer` or
+    /// `redeem` request. Replaces the previous overloaded use of
+    /// `InsufficientSupply` (= 6) for this check, which is reserved for the
+    /// bond's total-supply cap in `subscribe`.
+    InsufficientBalance = 16,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +72,11 @@ pub enum OracleError {
     /// overlaps an already-submitted report for the same project, which
     /// would double-count carbon sequestered if both were verified.
     OverlappingReportPeriod = 19,
+    /// `challenge_report` was called for a report that already has a
+    /// `Challenge` recorded. Replaces the previous overloaded use of
+    /// `ProviderAlreadyExists` (= 5), which is reserved for
+    /// `register_provider`'s duplicate-provider check.
+    ChallengeAlreadyExists = 20,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +127,16 @@ pub enum CreditError {
     PeriodNotFound = 10,
     PeriodNotDistributed = 11,
     InsufficientCreditsByType = 12,
+    /// A retirement id lookup (`get_retirement_record`,
+    /// `get_retirement_certificate`, `extend_retirement_ttl`) missed.
+    /// Replaces the previous overloaded use of `InsufficientCredits` (= 3)
+    /// for these "not found" lookups, which is reserved for genuine
+    /// insufficient-balance checks in `retire_credits`.
+    RetirementNotFound = 13,
+    /// A `checked_add` guard on retired-credit totals overflowed. Replaces
+    /// the previous overloaded use of `InsufficientCredits` (= 3) for this
+    /// arithmetic guard.
+    Overflow = 14,
 }
 
 #[derive(Clone, Debug, PartialEq)]

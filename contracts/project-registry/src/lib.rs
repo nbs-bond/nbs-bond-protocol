@@ -1,10 +1,18 @@
 #![no_std]
 #![allow(deprecated)]
+pub use nbbs_shared::Project;
 use nbbs_shared::{ProjectStatus, RegistryError};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Symbol,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, String,
+    Symbol, TryFromVal, Val, Vec,
 };
+
+/// Ledgers closed in a day at the network's ~5 second close time.
+const LEDGERS_PER_DAY: u32 = 17_280;
+/// Refresh entries once they are within 30 days of expiry.
+const PERSISTENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 30;
+/// Keep project data and the contract instance alive for another 120 days.
+const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 120;
 
 #[derive(Clone)]
 #[contracttype]
@@ -13,20 +21,10 @@ pub enum DataKey {
     Project(BytesN<32>),
     ProjectCount,
     ProjectId(u64),
+    ProjectByHash(BytesN<32>),
     Nonce(Address),
     OwnerProjects(Address),
     OracleConsumerId,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct Project {
-    pub id: u64,
-    pub owner: Address,
-    pub metadata_ipfs_hash: BytesN<32>,
-    pub status: ProjectStatus,
-    pub methodology: Symbol,
-    pub country: Symbol,
 }
 
 #[derive(Clone)]
@@ -51,6 +49,39 @@ fn project_id_to_bytes(env: &Env, id: u64) -> BytesN<32> {
     let mut arr = [0u8; 32];
     arr[..8].copy_from_slice(&id.to_be_bytes());
     BytesN::from_array(env, &arr)
+}
+
+fn bump_instance(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+fn bump_persistent(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+fn read_persistent<V>(env: &Env, key: &DataKey) -> Option<V>
+where
+    V: TryFromVal<Env, Val>,
+{
+    match env.storage().persistent().get(key) {
+        Some(value) => {
+            bump_persistent(env, key);
+            Some(value)
+        }
+        None => None,
+    }
+}
+
+fn write_persistent<V>(env: &Env, key: &DataKey, value: &V)
+where
+    V: IntoVal<Env, Val>,
+{
+    env.storage().persistent().set(key, value);
+    bump_persistent(env, key);
 }
 
 fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
@@ -85,26 +116,15 @@ fn ensure_metadata_hash_available(
     env: &Env,
     metadata_ipfs_hash: &BytesN<32>,
 ) -> Result<(), RegistryError> {
-    let count: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::ProjectCount)
-        .unwrap_or(0);
-
-    for i in 1..=count {
-        let key = project_id_to_bytes(env, i);
-        if let Some(project) = env
-            .storage()
-            .instance()
-            .get::<_, Project>(&DataKey::Project(key))
-        {
+    let hash_key = DataKey::ProjectByHash(metadata_ipfs_hash.clone());
+    if let Some(project_id) = read_persistent::<u64>(env, &hash_key) {
+        let project_key = DataKey::Project(project_id_to_bytes(env, project_id));
+        if let Some(project) = read_persistent::<Project>(env, &project_key) {
             let active_project = matches!(
                 project.status,
                 ProjectStatus::Pending | ProjectStatus::Approved
             );
-            if active_project
-                && project.metadata_ipfs_hash.to_array() == metadata_ipfs_hash.to_array()
-            {
+            if active_project {
                 return Err(RegistryError::ProjectAlreadyExists);
             }
         }
@@ -120,23 +140,23 @@ pub struct ProjectRegistry;
 impl ProjectRegistry {
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        bump_instance(&env);
     }
 
     pub fn register_project(
         env: Env,
         caller: Address,
         metadata_ipfs_hash: BytesN<32>,
+        name: Symbol,
         methodology: Symbol,
         country: Symbol,
         nonce: u64,
     ) -> Result<u64, RegistryError> {
+        bump_instance(&env);
         caller.require_auth();
 
-        let expected_nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Nonce(caller.clone()))
-            .unwrap_or(0);
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
@@ -147,43 +167,31 @@ impl ProjectRegistry {
         }
         ensure_metadata_hash_available(&env, &metadata_ipfs_hash)?;
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProjectCount)
-            .unwrap_or(0);
+        let count: u64 = read_persistent(&env, &DataKey::ProjectCount).unwrap_or(0);
         let new_id = count + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::ProjectCount, &new_id);
+        write_persistent(&env, &DataKey::ProjectCount, &new_id);
 
         let project = Project {
             id: new_id,
             owner: caller.clone(),
-            metadata_ipfs_hash,
+            metadata_ipfs_hash: metadata_ipfs_hash.clone(),
+            name,
             status: ProjectStatus::Pending,
             methodology,
             country,
         };
 
         let key = project_id_to_bytes(&env, new_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::Project(key), &project);
+        write_persistent(&env, &DataKey::Project(key), &project);
+        write_persistent(&env, &DataKey::ProjectByHash(metadata_ipfs_hash), &new_id);
 
-        let mut owner_projects: Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::OwnerProjects(caller.clone()))
-            .unwrap_or(vec![&env]);
+        let owner_projects_key = DataKey::OwnerProjects(caller.clone());
+        let mut owner_projects: Vec<u64> =
+            read_persistent(&env, &owner_projects_key).unwrap_or(vec![&env]);
         owner_projects.push_back(new_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::OwnerProjects(caller), &owner_projects);
+        write_persistent(&env, &owner_projects_key, &owner_projects);
 
         Ok(new_id)
     }
@@ -197,27 +205,20 @@ impl ProjectRegistry {
         reason: String,
         nonce: u64,
     ) -> Result<(), RegistryError> {
+        bump_instance(&env);
         caller.require_auth();
 
-        let expected_nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Nonce(caller.clone()))
-            .unwrap_or(0);
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
         require_admin(&env, &caller)?;
 
         let key = project_id_to_bytes(&env, project_id);
-        let mut project: Project = env
-            .storage()
-            .instance()
-            .get(&DataKey::Project(key.clone()))
+        let mut project: Project = read_persistent(&env, &DataKey::Project(key.clone()))
             .ok_or(RegistryError::ProjectNotFound)?;
 
         if project.status != ProjectStatus::Approved {
@@ -225,9 +226,7 @@ impl ProjectRegistry {
         }
 
         project.status = ProjectStatus::Inactive;
-        env.storage()
-            .instance()
-            .set(&DataKey::Project(key), &project);
+        write_persistent(&env, &DataKey::Project(key), &project);
 
         // Emit suspension event
         env.events()
@@ -246,27 +245,20 @@ impl ProjectRegistry {
         reason: String,
         nonce: u64,
     ) -> Result<(), RegistryError> {
+        bump_instance(&env);
         caller.require_auth();
 
-        let expected_nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Nonce(caller.clone()))
-            .unwrap_or(0);
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
         require_admin_or_oracle(&env, &caller)?;
 
         let key = project_id_to_bytes(&env, project_id);
-        let mut project: Project = env
-            .storage()
-            .instance()
-            .get(&DataKey::Project(key.clone()))
+        let mut project: Project = read_persistent(&env, &DataKey::Project(key.clone()))
             .ok_or(RegistryError::ProjectNotFound)?;
 
         if project.status != ProjectStatus::Approved {
@@ -274,9 +266,7 @@ impl ProjectRegistry {
         }
 
         project.status = ProjectStatus::Rejected;
-        env.storage()
-            .instance()
-            .set(&DataKey::Project(key), &project);
+        write_persistent(&env, &DataKey::Project(key), &project);
 
         // Emit revocation event
         env.events()
@@ -287,12 +277,9 @@ impl ProjectRegistry {
 
     /// Check if a project is active (Approved and not suspended).
     pub fn is_project_active(env: &Env, project_id: u64) -> bool {
+        bump_instance(env);
         let key = project_id_to_bytes(env, project_id);
-        match env
-            .storage()
-            .instance()
-            .get::<DataKey, Project>(&DataKey::Project(key))
-        {
+        match read_persistent::<Project>(env, &DataKey::Project(key)) {
             Some(project) => project.status == ProjectStatus::Approved,
             None => false,
         }
@@ -300,10 +287,9 @@ impl ProjectRegistry {
 
     /// Get project status for oracle integration.
     pub fn get_project_status(env: &Env, project_id: u64) -> Result<ProjectStatus, RegistryError> {
+        bump_instance(env);
         let key = project_id_to_bytes(env, project_id);
-        env.storage()
-            .instance()
-            .get::<DataKey, Project>(&DataKey::Project(key))
+        read_persistent::<Project>(env, &DataKey::Project(key))
             .map(|project: Project| project.status)
             .ok_or(RegistryError::ProjectNotFound)
     }
@@ -316,10 +302,9 @@ impl ProjectRegistry {
         env: &Env,
         project_id: u64,
     ) -> Result<ProjectLinkage, RegistryError> {
+        bump_instance(env);
         let key = project_id_to_bytes(env, project_id);
-        env.storage()
-            .instance()
-            .get::<DataKey, Project>(&DataKey::Project(key))
+        read_persistent::<Project>(env, &DataKey::Project(key))
             .map(|project| ProjectLinkage {
                 id: project.id,
                 metadata_ipfs_hash: project.metadata_ipfs_hash,
@@ -335,19 +320,15 @@ impl ProjectRegistry {
         oracle_consumer_id: Address,
         nonce: u64,
     ) -> Result<(), RegistryError> {
+        bump_instance(&env);
         caller.require_auth();
 
-        let expected_nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Nonce(caller.clone()))
-            .unwrap_or(0);
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
         require_admin(&env, &caller)?;
 
@@ -367,27 +348,20 @@ impl ProjectRegistry {
         project_id: u64,
         nonce: u64,
     ) -> Result<(), RegistryError> {
+        bump_instance(&env);
         caller.require_auth();
 
-        let expected_nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Nonce(caller.clone()))
-            .unwrap_or(0);
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
         require_admin(&env, &caller)?;
 
         let key = project_id_to_bytes(&env, project_id);
-        let mut project: Project = env
-            .storage()
-            .instance()
-            .get(&DataKey::Project(key.clone()))
+        let mut project: Project = read_persistent(&env, &DataKey::Project(key.clone()))
             .ok_or(RegistryError::ProjectNotFound)?;
 
         if project.status != ProjectStatus::Pending {
@@ -395,9 +369,7 @@ impl ProjectRegistry {
         }
 
         project.status = ProjectStatus::Approved;
-        env.storage()
-            .instance()
-            .set(&DataKey::Project(key), &project);
+        write_persistent(&env, &DataKey::Project(key), &project);
 
         Ok(())
     }
@@ -408,27 +380,20 @@ impl ProjectRegistry {
         project_id: u64,
         nonce: u64,
     ) -> Result<(), RegistryError> {
+        bump_instance(&env);
         caller.require_auth();
 
-        let expected_nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Nonce(caller.clone()))
-            .unwrap_or(0);
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
         require_admin(&env, &caller)?;
 
         let key = project_id_to_bytes(&env, project_id);
-        let mut project: Project = env
-            .storage()
-            .instance()
-            .get(&DataKey::Project(key.clone()))
+        let mut project: Project = read_persistent(&env, &DataKey::Project(key.clone()))
             .ok_or(RegistryError::ProjectNotFound)?;
 
         if project.status != ProjectStatus::Pending {
@@ -436,52 +401,33 @@ impl ProjectRegistry {
         }
 
         project.status = ProjectStatus::Rejected;
-        env.storage()
-            .instance()
-            .set(&DataKey::Project(key), &project);
+        write_persistent(&env, &DataKey::Project(key), &project);
 
         Ok(())
     }
 
     pub fn get_project(env: Env, project_id: u64) -> Result<Project, RegistryError> {
+        bump_instance(&env);
         let key = project_id_to_bytes(&env, project_id);
-        env.storage()
-            .instance()
-            .get(&DataKey::Project(key))
-            .ok_or(RegistryError::ProjectNotFound)
+        read_persistent(&env, &DataKey::Project(key)).ok_or(RegistryError::ProjectNotFound)
     }
 
     pub fn get_project_status_by_hash(
         env: Env,
         hash: BytesN<32>,
     ) -> Result<ProjectStatus, RegistryError> {
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProjectCount)
-            .unwrap_or(0);
-
-        for i in 1..=count {
-            let key = project_id_to_bytes(&env, i);
-            if let Some(project) = env
-                .storage()
-                .instance()
-                .get::<_, Project>(&DataKey::Project(key))
-            {
-                if project.metadata_ipfs_hash == hash {
-                    return Ok(project.status);
-                }
-            }
-        }
-        Err(RegistryError::ProjectNotFound)
+        bump_instance(&env);
+        let project_id: u64 = read_persistent(&env, &DataKey::ProjectByHash(hash))
+            .ok_or(RegistryError::ProjectNotFound)?;
+        let key = project_id_to_bytes(&env, project_id);
+        let project: Project =
+            read_persistent(&env, &DataKey::Project(key)).ok_or(RegistryError::ProjectNotFound)?;
+        Ok(project.status)
     }
 
     pub fn list_projects(env: Env, page: u32, page_size: u32) -> Vec<ProjectSummary> {
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProjectCount)
-            .unwrap_or(0);
+        bump_instance(&env);
+        let count: u64 = read_persistent(&env, &DataKey::ProjectCount).unwrap_or(0);
 
         let page_size = page_size.min(50);
         let start = (page as u64) * (page_size as u64);
@@ -494,14 +440,10 @@ impl ProjectRegistry {
         let end = (start + page_size as u64).min(count);
         for i in (start + 1)..=end {
             let key = project_id_to_bytes(&env, i);
-            if let Some(project) = env
-                .storage()
-                .instance()
-                .get::<_, Project>(&DataKey::Project(key))
-            {
+            if let Some(project) = read_persistent::<Project>(&env, &DataKey::Project(key)) {
                 result.push_back(ProjectSummary {
                     id: project.id,
-                    name: Symbol::new(&env, ""),
+                    name: project.name,
                     status: project.status,
                     country: project.country,
                 });
@@ -512,10 +454,8 @@ impl ProjectRegistry {
     }
 
     pub fn project_count(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ProjectCount)
-            .unwrap_or(0)
+        bump_instance(&env);
+        read_persistent(&env, &DataKey::ProjectCount).unwrap_or(0)
     }
 
     /// Get project by metadata IPFS hash.
@@ -523,40 +463,26 @@ impl ProjectRegistry {
         env: Env,
         metadata_ipfs_hash: BytesN<32>,
     ) -> Result<Project, RegistryError> {
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProjectCount)
-            .unwrap_or(0);
-
-        for id in 1..=count {
-            let key = project_id_to_bytes(&env, id);
-            if let Some(project) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Project>(&DataKey::Project(key))
-            {
-                if project.metadata_ipfs_hash == metadata_ipfs_hash {
-                    return Ok(project);
-                }
-            }
-        }
-
-        Err(RegistryError::ProjectNotFound)
+        bump_instance(&env);
+        let project_id: u64 = read_persistent(
+            &env,
+            &DataKey::ProjectByHash(metadata_ipfs_hash),
+        )
+        .ok_or(RegistryError::ProjectNotFound)?;
+        let key = project_id_to_bytes(&env, project_id);
+        read_persistent(&env, &DataKey::Project(key)).ok_or(RegistryError::ProjectNotFound)
     }
 
     pub fn get_owner_projects(env: Env, owner: Address) -> Vec<u64> {
-        env.storage()
-            .instance()
-            .get(&DataKey::OwnerProjects(owner))
-            .unwrap_or(vec![&env])
+        bump_instance(&env);
+        read_persistent(&env, &DataKey::OwnerProjects(owner)).unwrap_or(vec![&env])
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger as _};
 
     fn create_hash(env: &Env, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
@@ -586,6 +512,7 @@ mod test {
         let id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -595,6 +522,7 @@ mod test {
         let project = client.get_project(&1);
         assert_eq!(project.id, 1);
         assert_eq!(project.owner, user);
+        assert_eq!(project.name, Symbol::new(&env, "Project"));
         assert_eq!(project.status, ProjectStatus::Pending);
         assert_eq!(project.metadata_ipfs_hash, hash);
     }
@@ -607,6 +535,7 @@ mod test {
         let result = client.try_register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &1,
@@ -620,6 +549,7 @@ mod test {
         let result = client.try_register_project(
             &user,
             &zero_hash(&env),
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -636,6 +566,7 @@ mod test {
         let id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -645,6 +576,7 @@ mod test {
         let result = client.try_register_project(
             &user2,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "GS"),
             &Symbol::new(&env, "BR"),
             &0,
@@ -656,6 +588,7 @@ mod test {
         let id2 = client.register_project(
             &user2,
             &hash2,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "GS"),
             &Symbol::new(&env, "BR"),
             &0,
@@ -672,6 +605,7 @@ mod test {
         let rejected_id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -681,6 +615,7 @@ mod test {
         let reused_id = client.register_project(
             &user2,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "GS"),
             &Symbol::new(&env, "BR"),
             &0,
@@ -700,6 +635,7 @@ mod test {
         let id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -719,6 +655,7 @@ mod test {
         let id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -737,6 +674,7 @@ mod test {
         let project_id = client.register_project(
             &user,
             &create_hash(&env, 8),
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -772,6 +710,7 @@ mod test {
         let id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -791,6 +730,7 @@ mod test {
         let id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -810,6 +750,7 @@ mod test {
         let id = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -833,6 +774,7 @@ mod test {
         let project_id = client.register_project(
             &user,
             &metadata_hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -860,6 +802,7 @@ mod test {
         client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -870,6 +813,7 @@ mod test {
         client.register_project(
             &user,
             &hash2,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "GS"),
             &Symbol::new(&env, "BR"),
             &1,
@@ -886,6 +830,7 @@ mod test {
             client.register_project(
                 &user,
                 &hash,
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &(i as u64),
@@ -895,6 +840,7 @@ mod test {
         let page1 = client.list_projects(&0, &3);
         assert_eq!(page1.len(), 3);
         assert_eq!(page1.get(0).unwrap().id, 1);
+        assert_eq!(page1.get(0).unwrap().name, Symbol::new(&env, "Project"));
         assert_eq!(page1.get(1).unwrap().id, 2);
         assert_eq!(page1.get(2).unwrap().id, 3);
 
@@ -913,6 +859,7 @@ mod test {
         let id1 = client.register_project(
             &user,
             &hash1,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -922,6 +869,7 @@ mod test {
         let id2 = client.register_project(
             &user,
             &hash2,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "GS"),
             &Symbol::new(&env, "BR"),
             &1,
@@ -931,6 +879,7 @@ mod test {
         let id3 = client.register_project(
             &user2,
             &hash3,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "KE"),
             &0,
@@ -955,6 +904,7 @@ mod test {
             client.register_project(
                 &user,
                 &hash,
+                &Symbol::new(&env, "Project"),
                 &Symbol::new(&env, "VCS"),
                 &Symbol::new(&env, "US"),
                 &(i as u64),
@@ -973,6 +923,7 @@ mod test {
         let id1 = client.register_project(
             &user,
             &hash,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "VCS"),
             &Symbol::new(&env, "US"),
             &0,
@@ -983,10 +934,123 @@ mod test {
         let id2 = client.register_project(
             &user,
             &hash2,
+            &Symbol::new(&env, "Project"),
             &Symbol::new(&env, "GS"),
             &Symbol::new(&env, "BR"),
             &1,
         );
         assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_project_data_is_persistent_and_bumped_on_write() {
+        let (env, client, _admin, user) = setup();
+        let hash = create_hash(&env, 42);
+        let id = client.register_project(
+            &user,
+            &hash,
+            &Symbol::new(&env, "Forest"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "GT"),
+            &0,
+        );
+
+        let project_key = DataKey::Project(project_id_to_bytes(&env, id));
+        let count_key = DataKey::ProjectCount;
+        let owner_key = DataKey::OwnerProjects(user.clone());
+        let hash_key = DataKey::ProjectByHash(hash.clone());
+
+        env.as_contract(&client.address, || {
+            for key in [&project_key, &count_key, &owner_key, &hash_key] {
+                assert!(env.storage().persistent().has(key));
+                assert!(!env.storage().instance().has(key));
+                assert!(env.storage().persistent().get_ttl(key) >= PERSISTENT_TTL_EXTEND_TO);
+            }
+
+            assert_eq!(
+                env.storage().persistent().get::<_, u64>(&hash_key),
+                Some(id)
+            );
+        });
+    }
+
+    #[test]
+    fn test_persistent_ttls_are_bumped_on_reads() {
+        let (env, client, _admin, user) = setup();
+        let hash = create_hash(&env, 43);
+        let id = client.register_project(
+            &user,
+            &hash,
+            &Symbol::new(&env, "Wetland"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "GT"),
+            &0,
+        );
+
+        let project_key = DataKey::Project(project_id_to_bytes(&env, id));
+        let count_key = DataKey::ProjectCount;
+        let owner_key = DataKey::OwnerProjects(user.clone());
+        let hash_key = DataKey::ProjectByHash(hash.clone());
+        let aged_by = PERSISTENT_TTL_EXTEND_TO - PERSISTENT_TTL_THRESHOLD / 2;
+        env.ledger()
+            .with_mut(|ledger| ledger.sequence_number += aged_by);
+
+        env.as_contract(&client.address, || {
+            for key in [&project_key, &count_key, &owner_key, &hash_key] {
+                assert!(env.storage().persistent().get_ttl(key) < PERSISTENT_TTL_THRESHOLD);
+            }
+        });
+
+        assert_eq!(client.get_project(&id).name, Symbol::new(&env, "Wetland"));
+        assert_eq!(
+            client.get_project_status_by_hash(&hash),
+            ProjectStatus::Pending
+        );
+        assert_eq!(client.list_projects(&0, &1).len(), 1);
+        assert_eq!(client.project_count(), 1);
+        assert_eq!(client.get_owner_projects(&user).get(0), Some(id));
+
+        env.as_contract(&client.address, || {
+            for key in [&project_key, &count_key, &owner_key, &hash_key] {
+                assert!(env.storage().persistent().get_ttl(key) >= PERSISTENT_TTL_EXTEND_TO);
+            }
+        });
+    }
+
+    #[test]
+    fn test_project_status_by_hash_uses_reverse_index() {
+        let (env, client, admin, user) = setup();
+        let hash = create_hash(&env, 44);
+        let id = client.register_project(
+            &user,
+            &hash,
+            &Symbol::new(&env, "Mangrove"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "GT"),
+            &0,
+        );
+
+        env.as_contract(&client.address, || {
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, u64>(&DataKey::ProjectByHash(hash.clone())),
+                Some(id)
+            );
+            // An indexed lookup must not depend on the project count.
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProjectCount, &0u64);
+        });
+
+        assert_eq!(
+            client.get_project_status_by_hash(&hash),
+            ProjectStatus::Pending
+        );
+        client.approve_project(&admin, &id, &0);
+        assert_eq!(
+            client.get_project_status_by_hash(&hash),
+            ProjectStatus::Approved
+        );
     }
 }
