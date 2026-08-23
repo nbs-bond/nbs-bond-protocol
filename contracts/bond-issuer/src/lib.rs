@@ -180,9 +180,10 @@ impl BondIssuer {
         env.storage()
             .persistent()
             .set(&DataKey::BondState(bond_id), &state);
+        let holders: Vec<Address> = vec![&env];
         env.storage()
             .persistent()
-            .set(&DataKey::HolderList(bond_id), &vec![&env]);
+            .set(&DataKey::HolderList(bond_id), &holders);
         env.storage()
             .persistent()
             .set(&DataKey::HolderCount(bond_id), &0u64);
@@ -624,10 +625,8 @@ impl BondIssuer {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::storage::{Instance as _, Persistent as _},
-        testutils::Address as _,
-        testutils::Ledger as _,
-        vec, BytesN,
+        testutils::storage::Persistent as _, testutils::Address as _, testutils::Ledger as _, vec,
+        BytesN,
     };
 
     fn create_project_id(env: &Env, value: u8) -> BytesN<32> {
