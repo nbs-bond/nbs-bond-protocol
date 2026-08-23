@@ -96,12 +96,16 @@ fn extend_bond_ttl(env: &Env, bond_id: u64, maturity_date: u64) {
     env.storage()
         .persistent()
         .extend_ttl(&state_key, threshold, extend_to);
-    env.storage()
-        .persistent()
-        .extend_ttl(&holder_list_key, threshold, extend_to);
-    env.storage()
-        .persistent()
-        .extend_ttl(&holder_count_key, threshold, extend_to);
+    if env.storage().persistent().has(&holder_list_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&holder_list_key, threshold, extend_to);
+    }
+    if env.storage().persistent().has(&holder_count_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&holder_count_key, threshold, extend_to);
+    }
 }
 
 #[contract]
