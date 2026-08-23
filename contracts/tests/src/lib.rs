@@ -1455,7 +1455,11 @@ mod integration {
 
     mod property {
         use super::*;
+        use nbbs_governance::{
+            AllowedCall, Governance, GovernanceClient, ProposalStatus, DEFAULT_TIMELOCK_SECONDS,
+        };
         use proptest::prelude::*;
+        use soroban_sdk::IntoVal;
 
         fn setup_project_and_bond(
             env: &Env,
@@ -1731,6 +1735,410 @@ mod integration {
                 prop_assert!(provider.stake >= 0);
                 prop_assert_eq!(provider.active, provider.stake > 0);
             }
+
+            // The headline cross-contract invariant, exercised across an
+            // arbitrary multi-holder, multi-period, multi-retirement scenario:
+            //
+            //   sum(accrued per holder) + undistributed == total credits ever
+            //   distributed
+            //   sum(retired per holder) <= sum(accrued per holder)
+            //
+            // and, after partial retirements, the accrued ledger holds exactly
+            // what was not retired — no double-spend across CouponEngine and
+            // CreditRetirement, neither of which exposes this on its own.
+            #[test]
+            fn credit_conservation_across_periods_and_retirements(
+                balances in proptest::collection::vec(1i128..10_000i128, 2..6),
+                carbon_0 in 1_000i128..10_000_000i128,
+                carbon_1 in 1_000i128..10_000_000i128,
+                retire_bps in 1u32..10_001u32,
+            ) {
+                let env = Env::default();
+                env.mock_all_auths_allowing_non_root_auth();
+
+                let admin = Address::generate(&env);
+                let alice = Address::generate(&env);
+                let oracle = Address::generate(&env);
+                let contracts = deploy_contracts(&env, &admin);
+
+                let total_supply: i128 = balances.iter().sum();
+                let project_id = make_project_id(&env, 1);
+                let pid = contracts.pr_client.register_project(
+                    &alice,
+                    &make_ipfs_hash(&env, 1),
+                    &Symbol::new(&env, "Project"),
+                    &Symbol::new(&env, "VCS"),
+                    &Symbol::new(&env, "US"),
+                    &0,
+                );
+                contracts.pr_client.approve_project(&admin, &pid, &0);
+
+                let config = make_bond_config(&env, project_id.clone(), total_supply);
+                let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
+
+                let holders: std::vec::Vec<Address> = balances
+                    .iter()
+                    .map(|_| Address::generate(&env))
+                    .collect();
+                for (holder, &amount) in holders.iter().zip(balances.iter()) {
+                    contracts.bi_client.subscribe(holder, &bond_id, &amount, &0);
+                }
+
+                contracts.oc_client.register_provider(
+                    &admin,
+                    &oracle,
+                    &Symbol::new(&env, "verra_vcs"),
+                    &0,
+                );
+                contracts
+                    .ce_client
+                    .register_bond(&admin, &bond_id, &project_id, &1);
+
+                // Two non-overlapping coupon periods over the same project and
+                // bond: [1000, 2000) then [2000, 3000).
+                let mut total_distributed_credits: i128 = 0;
+                for period in 0..2u32 {
+                    let carbon = if period == 0 { carbon_0 } else { carbon_1 };
+                    let report_id = contracts.oc_client.submit_report(
+                        &oracle,
+                        &pid,
+                        &(1000 + u64::from(period) * 1000),
+                        &(2000 + u64::from(period) * 1000),
+                        &carbon,
+                        &BiodiversityMetrics::Absent,
+                        &Symbol::new(&env, "verra_vcs"),
+                        &make_ipfs_hash(&env, 1),
+                        &u64::from(period),
+                    );
+                    contracts.oc_client.admin_override_report(
+                        &admin,
+                        &report_id,
+                        &ReportStatus::Verified,
+                        &(1 + u64::from(period)),
+                    );
+
+                    let mut holder_vec = soroban_sdk::Vec::new(&env);
+                    for (h, &bal) in holders.iter().zip(balances.iter()) {
+                        holder_vec.push_back((h.clone(), bal));
+                    }
+                    contracts.ce_client.distribute_coupon(
+                        &admin,
+                        &bond_id,
+                        &period,
+                        &holder_vec,
+                        &report_id,
+                        &(2 + u64::from(period)),
+                        &true,
+                    );
+                    total_distributed_credits += carbon / 1000;
+                }
+
+                // ── Conservation across both periods ───────────────────────
+                let sum_accrued: i128 = holders
+                    .iter()
+                    .map(|h| contracts.ce_client.accrued_credits(&bond_id, h))
+                    .sum();
+                let undistributed = contracts.ce_client.get_undistributed_total(&bond_id);
+                prop_assert_eq!(
+                    sum_accrued + undistributed,
+                    total_distributed_credits,
+                    "credit conservation violated: {} + {} != {}",
+                    sum_accrued,
+                    undistributed,
+                    total_distributed_credits
+                );
+
+                // ── Arbitrary partial retirements across all holders ───────
+                let accrued_per_holder: std::vec::Vec<i128> = holders
+                    .iter()
+                    .map(|h| contracts.ce_client.accrued_credits(&bond_id, h))
+                    .collect();
+
+                let mut sum_retired: i128 = 0;
+                for (holder, &accrued) in holders.iter().zip(accrued_per_holder.iter()) {
+                    let amount = accrued * i128::from(retire_bps) / 10_000;
+                    if amount > 0 {
+                        contracts.cr_client.retire_credits(
+                            holder,
+                            &bond_id,
+                            &project_id,
+                            &0u32,
+                            &amount,
+                            &CreditType::Carbon,
+                            &make_ipfs_hash(&env, 42),
+                            &0,
+                        );
+                        sum_retired += amount;
+                    }
+                }
+
+                // You can never retire more than was accrued.
+                prop_assert!(sum_retired <= sum_accrued);
+
+                // No double-spend: the accrued ledger holds exactly what was
+                // not retired.
+                let sum_remaining: i128 = holders
+                    .iter()
+                    .map(|h| contracts.ce_client.accrued_credits(&bond_id, h))
+                    .sum();
+                prop_assert_eq!(sum_remaining, sum_accrued - sum_retired);
+
+                // The full cross-contract ledger ties out: retired + remaining
+                // + dust == total credits ever distributed.
+                prop_assert_eq!(
+                    sum_retired + sum_remaining + undistributed,
+                    total_distributed_credits
+                );
+
+                // CreditRetirement's own per-holder totals agree with the
+                // amounts we retired.
+                let sum_total_retired: i128 = holders
+                    .iter()
+                    .map(|h| contracts.cr_client.get_total_retired(h))
+                    .sum();
+                prop_assert_eq!(sum_total_retired, sum_retired);
+
+                // Spot-check the claim path: claiming returns only the
+                // unretired remainder for the first holder.
+                let first_holder = &holders[0];
+                let first_accrued = accrued_per_holder[0];
+                let first_retired = first_accrued * i128::from(retire_bps) / 10_000;
+                let claimed = contracts.ce_client.claim_credits(first_holder, &bond_id, &0);
+                prop_assert_eq!(claimed, first_accrued - first_retired);
+            }
+
+            // Governance parameter changes propagate to the administered
+            // contract: for an arbitrary (signer set, threshold, provider set,
+            // new threshold) combination, the oracle's signature threshold ends
+            // up exactly equal to the value the multi-sig voted for — the
+            // parameter moved through the full propose → vote → timelock →
+            // execute path, not by a single admin.
+            #[test]
+            fn governance_parameter_change_propagates(
+                signer_count in 3..6u32,
+                threshold_raw in 1..6u32,
+                provider_count in 2..5u32,
+                new_threshold_raw in 1..5u32,
+            ) {
+                let env = Env::default();
+                env.mock_all_auths_allowing_non_root_auth();
+
+                // The multi-sig needs at least one non-proposing signer per
+                // vote, so clamp the governance threshold below signer count.
+                let threshold = threshold_raw.min(signer_count - 1);
+                let new_threshold = new_threshold_raw.min(provider_count);
+
+                let mut signers: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+                for _ in 0..signer_count {
+                    signers.push_back(Address::generate(&env));
+                }
+                let empty: soroban_sdk::Vec<AllowedCall> = soroban_sdk::Vec::new(&env);
+                let gov_id = env.register(
+                    Governance,
+                    (&signers, &threshold, &DEFAULT_TIMELOCK_SECONDS, &empty),
+                );
+                let gov_client = GovernanceClient::new(&env, &gov_id);
+
+                // Governance is the oracle's admin. The oracle's address only
+                // exists now, so the allowlist entry for it is bootstrapped by
+                // a self-administration proposal.
+                let oracle_id = env.register(nbbs_oracle_consumer::OracleConsumer, (&gov_id,));
+                let oracle = nbbs_oracle_consumer::OracleConsumerClient::new(&env, &oracle_id);
+                assert_eq!(oracle.get_signature_threshold(), 1u32);
+
+                let started_at = env.ledger().timestamp();
+                let seed_args = soroban_sdk::vec![
+                    &env,
+                    gov_id.clone().into_val(&env),
+                    soroban_sdk::vec![
+                        &env,
+                        AllowedCall {
+                            contract: oracle_id.clone(),
+                            function: Symbol::new(&env, "set_signature_threshold"),
+                        },
+                    ]
+                    .into_val(&env),
+                    0u64.into_val(&env),
+                ];
+                let seed_id = gov_client.propose(
+                    &signers.get(0).unwrap(),
+                    &gov_id,
+                    &Symbol::new(&env, "set_allowed_calls"),
+                    &seed_args,
+                    &Symbol::new(&env, "allowlist"),
+                    &0,
+                );
+                for i in 1..=threshold {
+                    gov_client.vote_approve(&signers.get(i).unwrap(), &seed_id, &0);
+                }
+                prop_assert_eq!(
+                    gov_client.get_proposal(&seed_id).status,
+                    ProposalStatus::Queued
+                );
+                env.ledger()
+                    .set_timestamp(started_at + DEFAULT_TIMELOCK_SECONDS);
+                gov_client.execute(&signers.get(0).unwrap(), &seed_id, &1);
+                prop_assert_eq!(
+                    gov_client.get_proposal(&seed_id).status,
+                    ProposalStatus::Executed
+                );
+
+                // Register the provider set through governance (the oracle's
+                // admin); each call consumes the governance address's nonce on
+                // the oracle contract.
+                for p in 0..provider_count {
+                    let provider = Address::generate(&env);
+                    oracle.register_provider(
+                        &gov_id,
+                        &provider,
+                        &Symbol::new(&env, "verra_vcs"),
+                        &u64::from(p),
+                    );
+                }
+
+                // Encode the full argument list set_signature_threshold
+                // expects: (caller = gov_id, threshold, nonce = provider_count).
+                let proposal_args = soroban_sdk::vec![
+                    &env,
+                    gov_id.clone().into_val(&env),
+                    new_threshold.into_val(&env),
+                    u64::from(provider_count).into_val(&env),
+                ];
+                let proposal_id = gov_client.propose(
+                    &signers.get(0).unwrap(),
+                    &oracle_id,
+                    &Symbol::new(&env, "set_signature_threshold"),
+                    &proposal_args,
+                    &Symbol::new(&env, "set_threshold"),
+                    &2,
+                );
+                for i in 1..=threshold {
+                    gov_client.vote_approve(&signers.get(i).unwrap(), &proposal_id, &1);
+                }
+                env.ledger()
+                    .set_timestamp(started_at + 2 * DEFAULT_TIMELOCK_SECONDS);
+                gov_client.execute(&signers.get(0).unwrap(), &proposal_id, &3);
+
+                let proposal = gov_client.get_proposal(&proposal_id);
+                prop_assert_eq!(proposal.status, ProposalStatus::Executed);
+
+                // The governed parameter now equals the proposed value on the
+                // target contract.
+                prop_assert_eq!(oracle.get_signature_threshold(), new_threshold);
+            }
+        }
+
+        // The full bond state machine composed end to end across every
+        // contract: register → subscribe → distribute → secondary-market
+        // transfer via DEXRouter → mature → redeem. After every holder
+        // redeems, total_subscribed returns to 0.
+        #[test]
+        fn maturity_lifecycle_full_sequence() {
+            let env = Env::default();
+            env.mock_all_auths_allowing_non_root_auth();
+
+            let admin = Address::generate(&env);
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let oracle = Address::generate(&env);
+            let contracts = deploy_contracts(&env, &admin);
+
+            // 1. Register + approve the project.
+            let project_id = make_project_id(&env, 1);
+            let pid = contracts.pr_client.register_project(
+                &alice,
+                &make_ipfs_hash(&env, 1),
+                &Symbol::new(&env, "Project"),
+                &Symbol::new(&env, "VCS"),
+                &Symbol::new(&env, "US"),
+                &0,
+            );
+            contracts.pr_client.approve_project(&admin, &pid, &0);
+
+            // 2. Issue the bond and subscribe.
+            let config = make_bond_config(&env, project_id.clone(), 10_000);
+            let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
+            contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            assert_eq!(contracts.bi_client.total_subscribed(&bond_id), 5_000);
+
+            // 3. Verified oracle report → distribute the coupon.
+            contracts.oc_client.register_provider(
+                &admin,
+                &oracle,
+                &Symbol::new(&env, "verra_vcs"),
+                &0,
+            );
+            let report_id = contracts.oc_client.submit_report(
+                &oracle,
+                &pid,
+                &1000u64,
+                &2000u64,
+                &100_000i128,
+                &BiodiversityMetrics::Absent,
+                &Symbol::new(&env, "verra_vcs"),
+                &make_ipfs_hash(&env, 1),
+                &0,
+            );
+            contracts.oc_client.admin_override_report(
+                &admin,
+                &report_id,
+                &ReportStatus::Verified,
+                &1,
+            );
+            contracts
+                .ce_client
+                .register_bond(&admin, &bond_id, &project_id, &1);
+
+            let holders = holders_with_balances(&env, &contracts.bi_client, bond_id, &[&alice]);
+            let result = contracts
+                .ce_client
+                .distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &2, &true);
+            assert!(result.total_credits > 0);
+            assert!(contracts.ce_client.accrued_credits(&bond_id, &alice) > 0);
+
+            // 4. Secondary market: alice lists 1_000 tokens, bob buys them via
+            //    DEXRouter, quote settled atomically against the transfer.
+            let order_id = contracts.dr_client.list_bond_tokens(
+                &alice,
+                &bond_id,
+                &1_000i128,
+                &100i128,
+                &Symbol::new(&env, "USDC"),
+                &3600u64,
+                &0,
+            );
+            contracts
+                .dr_client
+                .deposit_quote(&bob, &Symbol::new(&env, "USDC"), &100_000i128, &0);
+            contracts
+                .dr_client
+                .execute_purchase(&bob, &order_id, &100i128, &1_000i128, &1);
+
+            assert_eq!(
+                contracts.bi_client.get_holder_balance(&bond_id, &alice),
+                4_000
+            );
+            assert_eq!(
+                contracts.bi_client.get_holder_balance(&bond_id, &bob),
+                1_000
+            );
+            // A secondary-market transfer moves tokens, never creates them.
+            assert_eq!(contracts.bi_client.total_subscribed(&bond_id), 5_000);
+
+            // 5. Mature the bond once the maturity date arrives.
+            env.ledger().set_timestamp(config.maturity_date);
+            contracts.bi_client.mature_bond(&admin, &bond_id, &1);
+            assert_eq!(
+                contracts.bi_client.get_bond_state(&bond_id).status,
+                nbbs_shared::BondStatus::Matured
+            );
+
+            // 6. Both holders redeem in full; total_subscribed returns to 0.
+            contracts.bi_client.redeem(&alice, &bond_id, &4_000, &1);
+            contracts.bi_client.redeem(&bob, &bond_id, &1_000, &0);
+            assert_eq!(contracts.bi_client.get_holder_balance(&bond_id, &alice), 0);
+            assert_eq!(contracts.bi_client.get_holder_balance(&bond_id, &bob), 0);
+            assert_eq!(contracts.bi_client.total_subscribed(&bond_id), 0);
         }
     }
 }
