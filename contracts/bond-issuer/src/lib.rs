@@ -1033,6 +1033,25 @@ mod test {
     }
 
     #[test]
+    fn test_holder_count_written_to_persistent_storage() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &2000, &0);
+        client.subscribe(&user2, &bond_id, &3000, &0);
+
+        env.as_contract(&client.address, || {
+            let key = DataKey::HolderCount(bond_id);
+            assert!(env.storage().persistent().has(&key));
+            assert!(!env.storage().instance().has(&key));
+            let stored: u64 = env.storage().persistent().get(&key).unwrap();
+            assert_eq!(stored, 2);
+        });
+    }
+
+    #[test]
     fn test_holder_list_dedupes_repeat_subscriber() {
         let (env, client, admin, user) = setup();
         let config = make_config(&env);
