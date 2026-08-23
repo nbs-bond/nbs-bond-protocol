@@ -11,6 +11,24 @@ import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse } from './in
 
 const PROJECT_REGISTRY = () => process.env.PROJECT_REGISTRY_ADDRESS || '';
 
+/**
+ * Convert a human project name to a Soroban Symbol-safe slug.
+ *
+ * `register_project` takes `name: Symbol`, and Symbols allow at most 32
+ * characters of [a-zA-Z0-9_] — but real project names ("Amazon Reforestation")
+ * contain spaces and other characters. The full-fidelity name is already
+ * stored in the IPFS metadata (`metadata.name`), so the on-chain Symbol is a
+ * sanitized slug: invalid runs collapse to `_`, trimmed to 32 chars.
+ */
+export function toProjectNameSymbol(name: string): string {
+  const slug = name
+    .trim()
+    .replace(/[^a-zA-Z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32);
+  return slug || 'project';
+}
+
 @Injectable()
 export class ProjectsService implements OnModuleDestroy {
   private readonly logger = new Logger(ProjectsService.name);
@@ -50,6 +68,7 @@ export class ProjectsService implements OnModuleDestroy {
       [
         Address.fromString(ownerAddress).toScVal(),
         toBytes32(ipfsResult.hash),
+        nativeToScVal(toProjectNameSymbol(dto.name), { type: 'symbol' }),
         nativeToScVal(dto.methodology, { type: 'symbol' }),
         nativeToScVal(dto.country, { type: 'symbol' }),
       ],
