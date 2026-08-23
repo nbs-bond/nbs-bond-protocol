@@ -446,10 +446,7 @@ impl BondIssuer {
 
     /// Number of distinct holders ever recorded for `bond_id`.
     pub fn get_holder_count(env: Env, bond_id: u64) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::HolderCount(bond_id))
-            .unwrap_or(0)
+        holder_count_from_persistent(&env, bond_id)
     }
 
     /// Returns up to `count` holder addresses for `bond_id` starting at index
