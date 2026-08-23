@@ -1,4 +1,10 @@
-import { Injectable, CanActivate, ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+  UnauthorizedException,
+} from '@nestjs/common';
 
 @Injectable()
 export class AdminGuard implements CanActivate {
@@ -9,7 +15,7 @@ export class AdminGuard implements CanActivate {
       throw new UnauthorizedException('Admin key not configured');
     }
     if (request.user?.walletAddress !== adminKey) {
-      throw new UnauthorizedException('Admin access required');
+      throw new ForbiddenException('Admin access required');
     }
     return true;
   }

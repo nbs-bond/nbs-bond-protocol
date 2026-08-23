@@ -1,6 +1,7 @@
 import { TestBed, fakeAsync, tick } from '@angular/core/testing';
 import { WalletService, WalletError } from './wallet.service';
 import { BROWSER_WINDOW, FREIGHTER_API, FreighterWindow } from './freighter.tokens';
+import { environment } from '../../environments/environment';
 
 const ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const DECLINED = { code: -4, message: 'User declined access' };
@@ -193,6 +194,17 @@ describe('WalletService', () => {
 
     expect(signed).toBe('signed-xdr');
     expect(service.error()).toBeNull();
+  }));
+
+  it('signs with the passphrase from the environment config', fakeAsync(() => {
+    win.freighter = true;
+
+    service.signChallenge('challenge-xdr').catch(() => {});
+    tick();
+
+    expect(freighter.signTransaction).toHaveBeenCalledWith('challenge-xdr', {
+      networkPassphrase: environment.networkPassphrase,
+    });
   }));
 
   it('clears wallet state and errors on disconnect', fakeAsync(() => {

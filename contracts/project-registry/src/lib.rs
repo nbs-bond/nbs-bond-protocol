@@ -1,9 +1,10 @@
 #![no_std]
+#![allow(deprecated)]
 pub use nbbs_shared::Project;
 use nbbs_shared::{ProjectStatus, RegistryError};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
-    Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, String,
+    Symbol, TryFromVal, Val, Vec,
 };
 
 /// Ledgers closed in a day at the network's ~5 second close time.
@@ -23,6 +24,7 @@ pub enum DataKey {
     ProjectByHash(BytesN<32>),
     Nonce(Address),
     OwnerProjects(Address),
+    OracleConsumerId,
 }
 
 #[derive(Clone)]
@@ -32,6 +34,15 @@ pub struct ProjectSummary {
     pub name: Symbol,
     pub status: ProjectStatus,
     pub country: Symbol,
+}
+
+/// Minimal registry-owned data needed to link an oracle report to a project.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ProjectLinkage {
+    pub id: u64,
+    pub metadata_ipfs_hash: BytesN<32>,
+    pub status: ProjectStatus,
 }
 
 fn project_id_to_bytes(env: &Env, id: u64) -> BytesN<32> {
@@ -85,6 +96,43 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
     Ok(())
 }
 
+fn require_admin_or_oracle(env: &Env, caller: &Address) -> Result<(), RegistryError> {
+    if require_admin(env, caller).is_ok() {
+        return Ok(());
+    }
+
+    let oracle_consumer: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::OracleConsumerId)
+        .ok_or(RegistryError::OracleConsumerNotSet)?;
+    if caller != &oracle_consumer {
+        return Err(RegistryError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn ensure_metadata_hash_available(
+    env: &Env,
+    metadata_ipfs_hash: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    let hash_key = DataKey::ProjectByHash(metadata_ipfs_hash.clone());
+    if let Some(project_id) = read_persistent::<u64>(env, &hash_key) {
+        let project_key = DataKey::Project(project_id_to_bytes(env, project_id));
+        if let Some(project) = read_persistent::<Project>(env, &project_key) {
+            let active_project = matches!(
+                project.status,
+                ProjectStatus::Pending | ProjectStatus::Approved
+            );
+            if active_project {
+                return Err(RegistryError::ProjectAlreadyExists);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[contract]
 pub struct ProjectRegistry;
 
@@ -112,12 +160,14 @@ impl ProjectRegistry {
         if nonce != expected_nonce {
             return Err(RegistryError::InvalidNonce);
         }
-        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
         let hash_arr = metadata_ipfs_hash.to_array();
         if hash_arr.iter().all(|&b| b == 0) {
             return Err(RegistryError::ProjectNotFound);
         }
+        ensure_metadata_hash_available(&env, &metadata_ipfs_hash)?;
+
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
 
         let count: u64 = read_persistent(&env, &DataKey::ProjectCount).unwrap_or(0);
         let new_id = count + 1;
@@ -144,6 +194,152 @@ impl ProjectRegistry {
         write_persistent(&env, &owner_projects_key, &owner_projects);
 
         Ok(new_id)
+    }
+
+    /// Suspend an approved project (admin-only). Suspended projects cannot back new bonds
+    /// or generate credits until reinstated.
+    pub fn suspend_project(
+        env: Env,
+        caller: Address,
+        project_id: u64,
+        reason: String,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        bump_instance(&env);
+        caller.require_auth();
+
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        let key = project_id_to_bytes(&env, project_id);
+        let mut project: Project = read_persistent(&env, &DataKey::Project(key.clone()))
+            .ok_or(RegistryError::ProjectNotFound)?;
+
+        if project.status != ProjectStatus::Approved {
+            return Err(RegistryError::InvalidStatusTransition);
+        }
+
+        project.status = ProjectStatus::Inactive;
+        write_persistent(&env, &DataKey::Project(key), &project);
+
+        // Emit suspension event
+        env.events()
+            .publish((symbol_short!("P_SUSPEND"),), (project_id, caller, reason));
+
+        Ok(())
+    }
+
+    /// Revoke an approved project. The admin or configured oracle consumer may
+    /// revoke it; rejected oracle reports use the latter path. Revoked projects
+    /// are permanently removed from the active registry and cannot be reinstated.
+    pub fn revoke_project(
+        env: Env,
+        caller: Address,
+        project_id: u64,
+        reason: String,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        bump_instance(&env);
+        caller.require_auth();
+
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
+
+        require_admin_or_oracle(&env, &caller)?;
+
+        let key = project_id_to_bytes(&env, project_id);
+        let mut project: Project = read_persistent(&env, &DataKey::Project(key.clone()))
+            .ok_or(RegistryError::ProjectNotFound)?;
+
+        if project.status != ProjectStatus::Approved {
+            return Err(RegistryError::InvalidStatusTransition);
+        }
+
+        project.status = ProjectStatus::Rejected;
+        write_persistent(&env, &DataKey::Project(key), &project);
+
+        // Emit revocation event
+        env.events()
+            .publish((symbol_short!("P_REVOKE"),), (project_id, caller, reason));
+
+        Ok(())
+    }
+
+    /// Check if a project is active (Approved and not suspended).
+    pub fn is_project_active(env: &Env, project_id: u64) -> bool {
+        bump_instance(env);
+        let key = project_id_to_bytes(env, project_id);
+        match read_persistent::<Project>(env, &DataKey::Project(key)) {
+            Some(project) => project.status == ProjectStatus::Approved,
+            None => false,
+        }
+    }
+
+    /// Get project status for oracle integration.
+    pub fn get_project_status(env: &Env, project_id: u64) -> Result<ProjectStatus, RegistryError> {
+        bump_instance(env);
+        let key = project_id_to_bytes(env, project_id);
+        read_persistent::<Project>(env, &DataKey::Project(key))
+            .map(|project: Project| project.status)
+            .ok_or(RegistryError::ProjectNotFound)
+    }
+
+    /// Return the registry-owned identity, metadata hash, and current status
+    /// needed by consumers that link records to a project. `project_id` is the
+    /// canonical numeric [`Project::id`]; callers must not substitute the
+    /// project's metadata hash for this identifier.
+    pub fn get_project_linkage(
+        env: &Env,
+        project_id: u64,
+    ) -> Result<ProjectLinkage, RegistryError> {
+        bump_instance(env);
+        let key = project_id_to_bytes(env, project_id);
+        read_persistent::<Project>(env, &DataKey::Project(key))
+            .map(|project| ProjectLinkage {
+                id: project.id,
+                metadata_ipfs_hash: project.metadata_ipfs_hash,
+                status: project.status,
+            })
+            .ok_or(RegistryError::ProjectNotFound)
+    }
+
+    /// Set the oracle consumer contract address (admin-only).
+    pub fn set_oracle_consumer(
+        env: Env,
+        caller: Address,
+        oracle_consumer_id: Address,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        bump_instance(&env);
+        caller.require_auth();
+
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleConsumerId, &oracle_consumer_id);
+
+        env.events()
+            .publish((symbol_short!("ORA_SET"),), (caller, oracle_consumer_id));
+
+        Ok(())
     }
 
     pub fn approve_project(
@@ -262,6 +458,21 @@ impl ProjectRegistry {
         read_persistent(&env, &DataKey::ProjectCount).unwrap_or(0)
     }
 
+    /// Get project by metadata IPFS hash.
+    pub fn get_project_by_hash(
+        env: Env,
+        metadata_ipfs_hash: BytesN<32>,
+    ) -> Result<Project, RegistryError> {
+        bump_instance(&env);
+        let project_id: u64 = read_persistent(
+            &env,
+            &DataKey::ProjectByHash(metadata_ipfs_hash),
+        )
+        .ok_or(RegistryError::ProjectNotFound)?;
+        let key = project_id_to_bytes(&env, project_id);
+        read_persistent(&env, &DataKey::Project(key)).ok_or(RegistryError::ProjectNotFound)
+    }
+
     pub fn get_owner_projects(env: Env, owner: Address) -> Vec<u64> {
         bump_instance(&env);
         read_persistent(&env, &DataKey::OwnerProjects(owner)).unwrap_or(vec![&env])
@@ -347,6 +558,76 @@ mod test {
     }
 
     #[test]
+    fn test_register_project_duplicate_pending_hash() {
+        let (env, client, _admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let hash = create_hash(&env, 1);
+
+        let id = client.register_project(
+            &user,
+            &hash,
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        assert_eq!(id, 1);
+
+        let result = client.try_register_project(
+            &user2,
+            &hash,
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "GS"),
+            &Symbol::new(&env, "BR"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(RegistryError::ProjectAlreadyExists)));
+        assert_eq!(client.project_count(), 1);
+
+        let hash2 = create_hash(&env, 2);
+        let id2 = client.register_project(
+            &user2,
+            &hash2,
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "GS"),
+            &Symbol::new(&env, "BR"),
+            &0,
+        );
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_register_project_reuses_rejected_hash() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let hash = create_hash(&env, 1);
+
+        let rejected_id = client.register_project(
+            &user,
+            &hash,
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        client.reject_project(&admin, &rejected_id, &0);
+
+        let reused_id = client.register_project(
+            &user2,
+            &hash,
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "GS"),
+            &Symbol::new(&env, "BR"),
+            &0,
+        );
+        assert_eq!(reused_id, 2);
+
+        let project = client.get_project(&reused_id);
+        assert_eq!(project.status, ProjectStatus::Pending);
+        assert_eq!(project.metadata_ipfs_hash, hash);
+    }
+
+    #[test]
     fn test_approve_project() {
         let (env, client, admin, user) = setup();
         let hash = create_hash(&env, 1);
@@ -384,6 +665,34 @@ mod test {
 
         let project = client.get_project(&id);
         assert_eq!(project.status, ProjectStatus::Rejected);
+    }
+
+    #[test]
+    fn test_configured_oracle_can_revoke_approved_project() {
+        let (env, client, admin, user) = setup();
+        let oracle = Address::generate(&env);
+        let project_id = client.register_project(
+            &user,
+            &create_hash(&env, 8),
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        client.approve_project(&admin, &project_id, &0);
+        client.set_oracle_consumer(&admin, &oracle, &1);
+
+        client.revoke_project(
+            &oracle,
+            &project_id,
+            &String::from_str(&env, "rejected report"),
+            &0,
+        );
+
+        assert_eq!(
+            client.get_project_status(&project_id),
+            ProjectStatus::Rejected
+        );
     }
 
     #[test]
@@ -456,6 +765,31 @@ mod test {
         let (_env, client, _admin, _user) = setup();
         let result = client.try_get_project(&999);
         assert_eq!(result, Err(Ok(RegistryError::ProjectNotFound)));
+    }
+
+    #[test]
+    fn test_get_project_linkage_uses_numeric_id() {
+        let (env, client, admin, user) = setup();
+        let metadata_hash = create_hash(&env, 9);
+        let project_id = client.register_project(
+            &user,
+            &metadata_hash,
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        client.approve_project(&admin, &project_id, &0);
+
+        let linkage = client.get_project_linkage(&project_id);
+        assert_eq!(linkage.id, project_id);
+        assert_eq!(linkage.metadata_ipfs_hash, metadata_hash);
+        assert_eq!(linkage.status, ProjectStatus::Approved);
+
+        assert_eq!(
+            client.try_get_project_linkage(&999),
+            Err(Ok(RegistryError::ProjectNotFound))
+        );
     }
 
     #[test]

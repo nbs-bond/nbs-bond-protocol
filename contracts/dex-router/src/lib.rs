@@ -47,6 +47,13 @@ pub enum OrderStatus {
     Expired,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[contracttype]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
 fn require_admin(env: &Env, caller: &Address) -> Result<(), DEXError> {
     let admin: Address = env
         .storage()
@@ -497,6 +504,116 @@ impl DEXRouter {
             .unwrap_or(0)
     }
 
+    /// Quotes a market-sized fill without requiring the caller to fetch every
+    /// order over RPC. The returned tuple is `(average_price, total,
+    /// slippage_bps)`, where one basis point is 0.01%.
+    pub fn get_best_price(
+        env: Env,
+        bond_id: u64,
+        side: Side,
+        amount: i128,
+    ) -> Result<(i128, i128, i128), DEXError> {
+        if amount <= 0 {
+            return Err(DEXError::ZeroAmount);
+        }
+
+        let bond_orders_key = DataKey::BondOrders(bond_id);
+        let order_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&bond_orders_key)
+            .unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&bond_orders_key) {
+            bump_persistent(&env, &bond_orders_key);
+        }
+
+        // Keep the quote deterministic for equal price levels by using order
+        // id (time priority) as the secondary key.
+        let mut sorted: Vec<Order> = Vec::new(&env);
+        for order_id in order_ids.iter() {
+            let key = DataKey::Order(order_id);
+            let Some(order) = env.storage().persistent().get::<DataKey, Order>(&key) else {
+                continue;
+            };
+            bump_persistent(&env, &key);
+
+            if order.bond_id != bond_id
+                || order.amount <= 0
+                || (order.status != OrderStatus::Open
+                    && order.status != OrderStatus::PartiallyFilled)
+                || is_order_expired(&env, &order)
+            {
+                continue;
+            }
+
+            let mut position = 0;
+            while position < sorted.len() {
+                let current = sorted.get(position).unwrap();
+                let precedes = match side {
+                    Side::Buy => {
+                        order.price_per_token < current.price_per_token
+                            || (order.price_per_token == current.price_per_token
+                                && order.id < current.id)
+                    }
+                    Side::Sell => {
+                        order.price_per_token > current.price_per_token
+                            || (order.price_per_token == current.price_per_token
+                                && order.id < current.id)
+                    }
+                };
+                if precedes {
+                    break;
+                }
+                position += 1;
+            }
+            sorted.insert(position, order);
+        }
+
+        let Some(first) = sorted.first() else {
+            return Ok((0, 0, 0));
+        };
+        let best_price = first.price_per_token;
+        let mut remaining = amount;
+        let mut filled = 0i128;
+        let mut total = 0i128;
+
+        for order in sorted.iter() {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(order.amount);
+            let cost = take
+                .checked_mul(order.price_per_token)
+                .ok_or(DEXError::Overflow)?;
+            total = total.checked_add(cost).ok_or(DEXError::Overflow)?;
+            filled = filled.checked_add(take).ok_or(DEXError::Overflow)?;
+            remaining -= take;
+        }
+
+        if filled == 0 {
+            return Ok((0, 0, 0));
+        }
+
+        let average_price = total / filled;
+        let ideal_total = filled
+            .checked_mul(best_price)
+            .ok_or(DEXError::Overflow)?;
+        let adverse_delta = match side {
+            Side::Buy => total.saturating_sub(ideal_total),
+            Side::Sell => ideal_total.saturating_sub(total),
+        };
+        let slippage_bps = if ideal_total > 0 {
+            adverse_delta
+                .checked_mul(10_000)
+                .ok_or(DEXError::Overflow)?
+                / ideal_total
+        } else {
+            0
+        };
+
+        Ok((average_price, total, slippage_bps))
+    }
+
     pub fn clean_expired_orders(
         env: Env,
         caller: Address,
@@ -518,24 +635,66 @@ impl DEXRouter {
             .get(&DataKey::OrderCount)
             .unwrap_or(0);
 
+        if count == 0 {
+            return Ok(0);
+        }
+
+        Self::clean_expired_orders_range_impl(&env, 1, count)
+    }
+
+    pub fn clean_expired_orders_range(
+        env: Env,
+        caller: Address,
+        nonce: u64,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<u32, DEXError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(DEXError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OrderCount)
+            .unwrap_or(0);
+
+        if start_id < 1 || end_id > count || start_id > end_id {
+            return Err(DEXError::InvalidRange);
+        }
+
+        Self::clean_expired_orders_range_impl(&env, start_id, end_id)
+    }
+
+    fn clean_expired_orders_range_impl(
+        env: &Env,
+        start_id: u64,
+        end_id: u64,
+    ) -> Result<u32, DEXError> {
         let mut cleaned: u32 = 0;
-        for id in 1..=count {
+        for id in start_id..=end_id {
             let key = DataKey::Order(id);
             if let Some(mut order) = env.storage().persistent().get::<DataKey, Order>(&key) {
                 if (order.status == OrderStatus::Open
                     || order.status == OrderStatus::PartiallyFilled)
-                    && is_order_expired(&env, &order)
+                    && is_order_expired(env, &order)
                 {
                     order.status = OrderStatus::Expired;
                     env.storage().persistent().set(&key, &order);
-                    bump_persistent(&env, &key);
+                    bump_persistent(env, &key);
                     cleaned += 1;
                 }
             }
         }
 
         env.events().publish(
-            (Symbol::new(&env, "expired_orders_cleaned"),),
+            (Symbol::new(env, "expired_orders_cleaned"),),
             (cleaned,),
         );
 
@@ -630,6 +789,70 @@ mod test {
         assert_eq!(seller_orders.get(0).unwrap(), order_id);
 
         assert_eq!(client.order_count(), 1);
+    }
+
+    #[test]
+    fn test_get_best_price_quotes_multiple_levels_in_one_call() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+        let contract_id = env.register(
+            DEXRouter,
+            (admin, issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+        let quote_asset = Symbol::new(&env, "USDC");
+
+        client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &5i128,
+            &20i128,
+            &quote_asset,
+            &3_600u64,
+            &0,
+        );
+        client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &5i128,
+            &10i128,
+            &quote_asset,
+            &3_600u64,
+            &1,
+        );
+
+        let (average_price, total, slippage_bps) =
+            client.get_best_price(&bond_id, &Side::Buy, &10i128);
+
+        assert_eq!(average_price, 15);
+        assert_eq!(total, 150);
+        assert_eq!(slippage_bps, 5_000);
+    }
+
+    #[test]
+    fn test_get_best_price_handles_empty_and_rejects_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(
+            DEXRouter,
+            (admin, Address::generate(&env), Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.get_best_price(&99, &Side::Buy, &10),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            client.try_get_best_price(&99, &Side::Buy, &0),
+            Err(Ok(DEXError::ZeroAmount))
+        );
     }
 
     #[test]
@@ -1187,6 +1410,176 @@ mod test {
             &0,
         );
         assert_eq!(result, Err(Ok(DEXError::OrderAlreadyFilled)));
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_basic() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        // order 1: expires in 100s (will be expired at t=1_000_200)
+        let order1_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &0,
+        );
+        // order 2: expires in 10_000s (not expired)
+        let order2_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &500i128,
+            &200i128,
+            &Symbol::new(&env, "XLM"),
+            &10_000u64,
+            &1,
+        );
+        // order 3: expires in 100s (will be expired at t=1_000_200)
+        let order3_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &300i128,
+            &50i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &2,
+        );
+
+        env.ledger().set_timestamp(1_000_200);
+
+        // Only clean orders 2..=3 — order 1 should remain open
+        let cleaned = client.clean_expired_orders_range(&admin, &0, &2, &3);
+        assert_eq!(cleaned, 1); // only order 3
+
+        assert_eq!(client.get_order(&order1_id).status, OrderStatus::Open);
+        assert_eq!(client.get_order(&order2_id).status, OrderStatus::Open);
+        assert_eq!(client.get_order(&order3_id).status, OrderStatus::Expired);
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &100u64,
+            &0,
+        );
+
+        env.ledger().set_timestamp(1_000_200);
+
+        let cleaned1 = client.clean_expired_orders_range(&admin, &0, &1, &1);
+        assert_eq!(cleaned1, 1);
+
+        // Second call on same range — already expired, should clean 0
+        let cleaned2 = client.clean_expired_orders_range(&admin, &1, &1, &1);
+        assert_eq!(cleaned2, 0);
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_invalid() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, _bond_id, _seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        // start_id < 1
+        let r = client.try_clean_expired_orders_range(&admin, &0, &0, &5);
+        assert_eq!(r, Err(Ok(DEXError::InvalidRange)));
+
+        // end_id > order_count (count is 0)
+        let r = client.try_clean_expired_orders_range(&admin, &0, &1, &5);
+        assert_eq!(r, Err(Ok(DEXError::InvalidRange)));
+
+        // start_id > end_id
+        let r = client.try_clean_expired_orders_range(&admin, &0, &5, &3);
+        assert_eq!(r, Err(Ok(DEXError::InvalidRange)));
+    }
+
+    #[test]
+    fn test_clean_expired_orders_range_gaps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+
+        // Create 3 orders
+        let order1 = client.list_bond_tokens(
+            &seller, &bond_id, &1_000i128, &100i128,
+            &Symbol::new(&env, "USDC"), &100u64, &0,
+        );
+        client.list_bond_tokens(
+            &seller, &bond_id, &500i128, &200i128,
+            &Symbol::new(&env, "XLM"), &10_000u64, &1,
+        );
+        let order3 = client.list_bond_tokens(
+            &seller, &bond_id, &300i128, &50i128,
+            &Symbol::new(&env, "USDC"), &100u64, &2,
+        );
+
+        // Cancel order 2 to create a gap
+        client.cancel_listing(&seller, &2, &3);
+
+        env.ledger().set_timestamp(1_000_200);
+
+        // Sweep range 1..=3 — order 2 is Cancelled so skipped gracefully
+        let cleaned = client.clean_expired_orders_range(&admin, &0, &1, &3);
+        assert_eq!(cleaned, 2); // orders 1 and 3 are expired and open
+
+        assert_eq!(client.get_order(&order1).status, OrderStatus::Expired);
+        assert_eq!(client.get_order(&order3).status, OrderStatus::Expired);
     }
 
     #[test]

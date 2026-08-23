@@ -1,5 +1,5 @@
 #![no_std]
-mod types;
 mod errors;
-pub use types::*;
+mod types;
 pub use errors::*;
+pub use types::*;

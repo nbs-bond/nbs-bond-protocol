@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { RouterModule, Router } from '@angular/router';
 import { FormBuilder, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
 import { ApiService } from '../../shared/services/api.service';
+import { latitudeValidator, longitudeValidator } from '../../shared/validators/form-validators';
 
 @Component({
   selector: 'app-project-create',
@@ -74,14 +75,22 @@ import { ApiService } from '../../shared/services/api.service';
             <label class="form-label" for="locationLat">Latitude</label>
             <input id="locationLat" type="number" step="0.000001" class="form-input" formControlName="locationLat" placeholder="-3.4653" />
             @if (form.get('locationLat')?.invalid && form.get('locationLat')?.touched) {
-              <span class="form-error">Latitude is required</span>
+              @if (form.get('locationLat')?.errors?.['required']) {
+                <span class="form-error">Latitude is required</span>
+              } @else if (form.get('locationLat')?.errors?.['latitudeRange']) {
+                <span class="form-error">Latitude must be between -90 and 90</span>
+              }
             }
           </div>
           <div class="form-group">
             <label class="form-label" for="locationLng">Longitude</label>
             <input id="locationLng" type="number" step="0.000001" class="form-input" formControlName="locationLng" placeholder="-62.2159" />
             @if (form.get('locationLng')?.invalid && form.get('locationLng')?.touched) {
-              <span class="form-error">Longitude is required</span>
+              @if (form.get('locationLng')?.errors?.['required']) {
+                <span class="form-error">Longitude is required</span>
+              } @else if (form.get('locationLng')?.errors?.['longitudeRange']) {
+                <span class="form-error">Longitude must be between -180 and 180</span>
+              }
             }
           </div>
         </div>
@@ -134,8 +143,8 @@ export class ProjectCreateComponent {
     totalAreaHa: [null, [Validators.required, Validators.min(0.01)]],
     carbonSequestrationEstimate: [null, [Validators.required, Validators.min(0.01)]],
     blueCarbon: [false],
-    locationLat: [null, Validators.required],
-    locationLng: [null, Validators.required],
+    locationLat: [null, [Validators.required, latitudeValidator()]],
+    locationLng: [null, [Validators.required, longitudeValidator()]],
   });
 
   onSubmit(): void {

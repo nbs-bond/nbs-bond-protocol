@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { createClient, RedisClientType } from '@redis/client';
 import { ProjectsService } from '../projects/projects.service';
 import { OracleService } from './oracle.service';
@@ -35,7 +35,7 @@ function graceSeconds(): number {
 }
 
 @Injectable()
-export class OracleMonitoringService {
+export class OracleMonitoringService implements OnModuleDestroy {
   private readonly logger = new Logger(OracleMonitoringService.name);
   private redis: RedisClientType;
 
@@ -178,5 +178,22 @@ export class OracleMonitoringService {
     const days = Math.floor(seconds / (24 * 60 * 60));
     const hours = Math.floor((seconds % (24 * 60 * 60)) / (60 * 60));
     return `${days}d ${hours}h`;
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('OracleMonitoringService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `OracleMonitoringService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

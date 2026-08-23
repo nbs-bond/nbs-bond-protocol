@@ -95,12 +95,20 @@ export async function aggregateBlueCarbonProject(
     habitat: 'mangrove' | 'seagrass' | 'saltmarsh';
     area_ha: number;
     baseline_carbon_t_per_ha: number;
-    root_shoot_ratio?: number;
+    root_shoot_ratio: number;
   },
   period: { periodStart: string; periodEnd: string },
   options: BlueCarbonAdapterOptions = {},
 ): Promise<ReturnType<typeof buildOracleReport>> {
-  const validatedProject = BlueCarbonProjectConfigSchema.parse(project);
+  let validatedProject: z.infer<typeof BlueCarbonProjectConfigSchema>;
+  try {
+    validatedProject = BlueCarbonProjectConfigSchema.parse(project);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      throw new BlueCarbonSchemaError('project config', error.issues);
+    }
+    throw error;
+  }
   const baseUrl = (options.baseUrl || DEFAULT_BLUE_CARBON_URL).replace(/\/$/, '');
   const http = options.http ?? createAxiosHttpClient(options.timeoutMs);
   const { periodStart, periodEnd } = period;

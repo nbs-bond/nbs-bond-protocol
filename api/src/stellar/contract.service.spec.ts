@@ -354,28 +354,64 @@ describe('ContractService', () => {
     it('extracts returnValue from successful Soroban meta', () => {
       const retval = nativeToScVal(BigInt(77), { type: 'u64' });
       const response = buildSuccessTxResponse(retval);
-      const result = (service as any).extractReturnValue(response);
+      const result = (service as any).extractReturnValue(response, CONTRACT, METHOD);
       expect(scValToNative(result)).toBe(BigInt(77));
     });
 
-    it('returns scvVoid when meta extraction throws', () => {
+    it('returns scvVoid (without warning) for a method that genuinely returns void', () => {
+      const response = {
+        status: 'SUCCESS' as const,
+        hash: 'tx-hash-void',
+        ledger: 100,
+        createdAt: '2024-01-01T00:00:00Z',
+        resultMetaXdr: {
+          v3: jest.fn().mockReturnValue({
+            sorobanMeta: jest.fn().mockReturnValue({
+              returnValue: jest.fn().mockReturnValue(undefined),
+            }),
+          }),
+        },
+      };
+      const warnSpy = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => {});
+      const result = (service as any).extractReturnValue(response, CONTRACT, METHOD);
+      expect(result.switch().name).toBe('scvVoid');
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it('returns scvVoid for non-SUCCESS status', () => {
+      const warnSpy = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => {});
+      const result = (service as any).extractReturnValue(
+        { status: 'NOT_FOUND' },
+        CONTRACT,
+        METHOD,
+      );
+      expect(result.switch().name).toBe('scvVoid');
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it('logs a WARN (not a silent void) when meta extraction throws', () => {
       const brokenResponse = {
         status: 'SUCCESS',
         resultMetaXdr: {
           v3: () => {
-            throw new Error('broken');
+            throw new Error('ABI mismatch');
           },
         },
       };
-      const result = (service as any).extractReturnValue(brokenResponse);
-      expect(result.switch().name).toBe('scvVoid');
-    });
+      const warnSpy = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => {});
 
-    it('returns scvVoid for non-SUCCESS status', () => {
-      const result = (service as any).extractReturnValue({
-        status: 'NOT_FOUND',
-      });
+      const result = (service as any).extractReturnValue(brokenResponse, CONTRACT, METHOD);
+
       expect(result.switch().name).toBe('scvVoid');
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [message, meta] = warnSpy.mock.calls[0];
+      expect(message).toContain('ABI mismatch');
+      expect(message).toContain(CONTRACT);
+      expect(message).toContain(METHOD);
+      expect(meta).toMatchObject({ contractAddress: CONTRACT, method: METHOD });
+      warnSpy.mockRestore();
     });
   });
 

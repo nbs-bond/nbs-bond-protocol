@@ -37,6 +37,31 @@ carbon_sequestered_kg = delta_carbon_t_per_ha * area_ha * (44 / 12) * 1000
 - The `44 / 12` factor converts tonnes of carbon to tonnes of CO2e (mass ratio of CO2 to atomic C).
 - Reports where the mean stock falls below baseline contribute zero credits (conservative, no discounting of prior periods).
 
+### `root_shoot_ratio` (required)
+
+`root_shoot_ratio` is a **required** field in `BlueCarbonProjectConfigSchema`.
+Project configurations that omit it fail schema validation with a
+`BlueCarbonSchemaError`.
+
+The ratio is used to estimate belowground biomass from aboveground biomass:
+
+```
+belowground_biomass = aboveground_biomass × root_shoot_ratio
+```
+
+Project developers must select a value appropriate to their ecosystem and
+methodology. The IPCC Wetlands Supplement (2013) provides the following
+indicative ranges (not universal constants):
+
+| Ecosystem     | Typical `root_shoot_ratio` range |
+|---------------|----------------------------------|
+| Mangroves     | 0.49 – 1.0                       |
+| Seagrass      | varies by species/system          |
+| Saltmarsh     | ~0.5 – 3.0                       |
+
+Always refer to the project's approved methodology and the IPCC Wetlands
+Supplement for ecosystem-specific guidance.
+
 ## Biodiversity Credit Calculation
 
 Biodiversity credits are calculated using project-specific metrics:

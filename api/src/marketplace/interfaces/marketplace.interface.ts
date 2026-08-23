@@ -29,6 +29,7 @@ export interface QuoteTransactionResponse {
   address: string;
   asset: QuoteAsset;
   amount: number;
+  balance: number;
   transactionHash?: string;
 }
 
@@ -52,4 +53,10 @@ export interface SlippageResponse {
   averagePrice: number;
   estimatedTotal: number;
   slippagePercent: number;
+}
+
+export interface OnChainPriceQuote {
+  price: number;
+  total: number;
+  slippageBps: number;
 }

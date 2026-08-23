@@ -195,6 +195,43 @@ describe('NonceService', () => {
   });
 
   // ── Case (d) ───────────────────────────────────────────────────────────────
+  // Redis INCR failure → next() falls back to on-chain sync() instead of a
+  // timestamp nonce.
+  describe('next() — Redis INCR failure', () => {
+    it('falls back to on-chain sync and returns the on-chain nonce', async () => {
+      // Key already exists, so the missing-key sync path is skipped.
+      redisMock.exists.mockResolvedValueOnce(1);
+      // INCR+EXPIRE Lua script fails (Redis outage).
+      redisMock.eval.mockRejectedValueOnce(new Error('redis connection lost'));
+      // On-chain sync succeeds with nonce 7.
+      getContractDataMock.mockResolvedValueOnce(makeLedgerEntry(7));
+
+      const nonce = await service.next(CONTRACT, ADDRESS);
+
+      // sync() must have been invoked to recover the authoritative nonce.
+      expect(getContractDataMock).toHaveBeenCalledTimes(1);
+      expect(nonce).toBe(7);
+      // sync() re-seeds Redis with the recovered value (atomic SET ... EX).
+      expect(redisMock.set).toHaveBeenCalledWith(
+        `nonce:${CONTRACT}:${ADDRESS}`,
+        '7',
+        { EX: 30 * 24 * 60 * 60 },
+      );
+    });
+
+    it('throws when both Redis INCR and on-chain sync fail', async () => {
+      redisMock.exists.mockResolvedValueOnce(1);
+      redisMock.eval.mockRejectedValueOnce(new Error('redis connection lost'));
+      // On-chain sync also fails with a non-"not found" RPC error.
+      getContractDataMock.mockRejectedValueOnce(new Error('RPC node unreachable'));
+
+      await expect(service.next(CONTRACT, ADDRESS)).rejects.toThrow(
+        'RPC node unreachable',
+      );
+    });
+  });
+
+  // ── Case (e) ───────────────────────────────────────────────────────────────
   // sync() defaults to 0 when on-chain entry is absent (new address).
   describe('sync() — on-chain entry absent', () => {
     it('seeds Redis with 0 when getContractData throws (brand-new address)', async () => {

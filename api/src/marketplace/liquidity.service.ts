@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { DexService } from './dex.service';
 import {
   PriceFeedResponse,
@@ -9,7 +9,8 @@ import {
 import { createClient, RedisClientType } from '@redis/client';
 
 @Injectable()
-export class LiquidityService {
+export class LiquidityService implements OnModuleDestroy {
+  private readonly logger = new Logger(LiquidityService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -42,6 +43,7 @@ export class LiquidityService {
     const feeds: PriceFeedResponse[] = [];
 
     for (const [id, group] of grouped) {
+      if (group.prices.length === 0) continue;
       const bestPrice = Math.min(...group.prices);
       const averagePrice = group.prices.reduce((a, b) => a + b, 0) / group.prices.length;
 
@@ -78,33 +80,31 @@ export class LiquidityService {
   }
 
   async calculateSlippage(bondId: number, amount: number): Promise<SlippageResponse> {
-    const ordersResult = await this.dexService.listOrders(bondId, 'Open', 1, 100);
-    const openOrders = ordersResult.data;
-
-    const sorted = [...openOrders].sort((a, b) => a.pricePerToken - b.pricePerToken);
-
-    let remaining = amount;
-    let totalCost = 0;
-    let totalAmount = 0;
-
-    for (const order of sorted) {
-      if (remaining <= 0) break;
-      const take = Math.min(remaining, order.amount);
-      totalCost += take * order.pricePerToken;
-      totalAmount += take;
-      remaining -= take;
-    }
-
-    const averagePrice = totalAmount > 0 ? totalCost / totalAmount : 0;
-    const idealCost = amount > 0 ? amount * (sorted[0]?.pricePerToken || 0) : 0;
-    const slippagePercent = idealCost > 0 ? ((totalCost - idealCost) / idealCost) * 100 : 0;
+    const quote = await this.dexService.getBestPrice(bondId, 'buy', amount);
 
     return {
       bondId,
       amount,
-      averagePrice,
-      estimatedTotal: totalCost,
-      slippagePercent: Math.max(0, slippagePercent),
+      averagePrice: quote.price,
+      estimatedTotal: quote.total,
+      slippagePercent: quote.slippageBps / 100,
     };
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('LiquidityService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `LiquidityService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }
