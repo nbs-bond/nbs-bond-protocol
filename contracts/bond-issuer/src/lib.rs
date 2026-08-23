@@ -180,6 +180,12 @@ impl BondIssuer {
         env.storage()
             .persistent()
             .set(&DataKey::BondState(bond_id), &state);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HolderList(bond_id), &vec![&env]);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HolderCount(bond_id), &0u64);
 
         extend_bond_ttl(&env, bond_id, config.maturity_date);
 
