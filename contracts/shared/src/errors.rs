@@ -77,6 +77,12 @@ pub enum OracleError {
     /// `ProviderAlreadyExists` (= 5), which is reserved for
     /// `register_provider`'s duplicate-provider check.
     ChallengeAlreadyExists = 20,
+    /// `accept_admin_transfer` or `cancel_admin_transfer` was called with no
+    /// admin transfer currently proposed.
+    NoPendingAdminChange = 21,
+    /// `accept_admin_transfer` was called before the proposal's timelock
+    /// elapsed.
+    TimelockNotElapsed = 22,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +116,12 @@ pub enum RegistryError {
     ProjectNotApproved = 8,
     ProjectInactive = 9,
     CannotSuspend = 10,
+    /// `accept_admin_transfer` or `cancel_admin_transfer` was called with no
+    /// admin transfer currently proposed.
+    NoPendingAdminChange = 11,
+    /// `accept_admin_transfer` was called before the proposal's timelock
+    /// elapsed.
+    TimelockNotElapsed = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -14,6 +14,13 @@ const PERSISTENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 30;
 /// Keep project data and the contract instance alive for another 120 days.
 const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 120;
 
+/// Delay, in seconds, between an admin transfer being proposed and it
+/// becoming acceptable (issue #206); 48 hours. Turns a single instant,
+/// silent admin change into a two-step, on-chain-visible one: a compromised
+/// or mistaken key rotation is observable (via the `admin_transfer_proposed`
+/// event) and cancellable by the current admin before it can take effect.
+const ADMIN_TRANSFER_TIMELOCK_SECONDS: u64 = 172_800;
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -25,6 +32,17 @@ pub enum DataKey {
     Nonce(Address),
     OwnerProjects(Address),
     OracleConsumerId,
+    /// A proposed but not-yet-accepted admin transfer, if any (issue #206).
+    PendingAdmin,
+}
+
+/// A proposed admin rotation awaiting acceptance by `candidate` once
+/// `executable_at` has passed. See [`ProjectRegistry::propose_admin_transfer`].
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PendingAdminChange {
+    pub candidate: Address,
+    pub executable_at: u64,
 }
 
 #[derive(Clone)]
@@ -476,6 +494,141 @@ impl ProjectRegistry {
     pub fn get_owner_projects(env: Env, owner: Address) -> Vec<u64> {
         bump_instance(&env);
         read_persistent(&env, &DataKey::OwnerProjects(owner)).unwrap_or(vec![&env])
+    }
+
+    /// Begin rotating the admin key. Only the current admin may propose, and
+    /// the change only takes effect once `candidate` itself calls
+    /// [`Self::accept_admin_transfer`] after `ADMIN_TRANSFER_TIMELOCK_SECONDS`
+    /// has elapsed (issue #206).
+    ///
+    /// The two-step, timelocked design avoids two hazards a direct
+    /// `set_admin` would carry: the candidate must be able to sign to claim
+    /// the role, so a transfer can never land on a mistyped or unreachable
+    /// address; and the `admin_transfer_proposed` event plus the delay give
+    /// observers a window to notice and, via [`Self::cancel_admin_transfer`],
+    /// stop an unwanted rotation (e.g. one made under a compromised key)
+    /// before it can complete.
+    pub fn propose_admin_transfer(
+        env: Env,
+        caller: Address,
+        candidate: Address,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        bump_instance(&env);
+        caller.require_auth();
+
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        let executable_at = env.ledger().timestamp() + ADMIN_TRANSFER_TIMELOCK_SECONDS;
+        write_persistent(
+            &env,
+            &DataKey::PendingAdmin,
+            &PendingAdminChange {
+                candidate: candidate.clone(),
+                executable_at,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_transfer_proposed"),),
+            (caller, candidate, executable_at),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending admin transfer before it is accepted. Admin-only, so
+    /// the current admin can undo a proposal it did not intend (or that was
+    /// made under a since-revoked key) any time before `accept_admin_transfer`
+    /// is called.
+    pub fn cancel_admin_transfer(
+        env: Env,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        bump_instance(&env);
+        caller.require_auth();
+
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
+
+        require_admin(&env, &caller)?;
+
+        if !env.storage().persistent().has(&DataKey::PendingAdmin) {
+            return Err(RegistryError::NoPendingAdminChange);
+        }
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_transfer_cancelled"),), (caller,));
+
+        Ok(())
+    }
+
+    /// Complete a pending admin transfer. Must be called by the proposed
+    /// `candidate` itself, once the timelock has elapsed; this is the only
+    /// path by which `Admin` changes, which is what makes the contract
+    /// recoverable if the current admin key is lost or compromised: a fresh
+    /// admin key can be handed control without redeploying, by whoever the
+    /// existing admin (or, before compromise, its operators) designates.
+    pub fn accept_admin_transfer(
+        env: Env,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), RegistryError> {
+        bump_instance(&env);
+        caller.require_auth();
+
+        let nonce_key = DataKey::Nonce(caller.clone());
+        let expected_nonce: u64 = read_persistent(&env, &nonce_key).unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        write_persistent(&env, &nonce_key, &(expected_nonce + 1));
+
+        let pending: PendingAdminChange = read_persistent(&env, &DataKey::PendingAdmin)
+            .ok_or(RegistryError::NoPendingAdminChange)?;
+
+        if caller != pending.candidate {
+            return Err(RegistryError::Unauthorized);
+        }
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(RegistryError::TimelockNotElapsed);
+        }
+
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)?;
+
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_changed"),), (old_admin, caller));
+
+        Ok(())
+    }
+
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    pub fn get_pending_admin(env: Env) -> Option<PendingAdminChange> {
+        bump_instance(&env);
+        read_persistent(&env, &DataKey::PendingAdmin)
     }
 }
 
@@ -1052,5 +1205,114 @@ mod test {
             client.get_project_status_by_hash(&hash),
             ProjectStatus::Approved
         );
+    }
+
+    // ── Admin rotation / recovery (issue #206) ───────────────────────────────
+
+    #[test]
+    fn test_admin_transfer_propose_accept_rotates_admin() {
+        let (env, client, admin, new_admin) = setup();
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+
+        let pending = client.get_pending_admin().expect("pending admin change");
+        assert_eq!(pending.candidate, new_admin);
+        assert_eq!(
+            pending.executable_at,
+            1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS
+        );
+        // Not rotated yet.
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS);
+        client.accept_admin_transfer(&new_admin, &0);
+
+        assert_eq!(client.get_admin(), Some(new_admin.clone()));
+        assert_eq!(client.get_pending_admin(), None);
+
+        // The old admin has lost admin rights ...
+        let result = client.try_set_oracle_consumer(&admin, &Address::generate(&env), &1);
+        assert_eq!(result, Err(Ok(RegistryError::Unauthorized)));
+
+        // ... and the new admin can act immediately (nonce 1: its 0 was
+        // spent on `accept_admin_transfer`).
+        client.set_oracle_consumer(&new_admin, &Address::generate(&env), &1);
+    }
+
+    #[test]
+    fn test_accept_admin_transfer_before_timelock_rejected() {
+        let (env, client, admin, new_admin) = setup();
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+
+        // One second short of the timelock.
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS - 1);
+        let result = client.try_accept_admin_transfer(&new_admin, &0);
+        assert_eq!(result, Err(Ok(RegistryError::TimelockNotElapsed)));
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_accept_admin_transfer_wrong_candidate_rejected() {
+        let (env, client, admin, new_admin) = setup();
+        let impostor = Address::generate(&env);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS);
+
+        let result = client.try_accept_admin_transfer(&impostor, &0);
+        assert_eq!(result, Err(Ok(RegistryError::Unauthorized)));
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_propose_admin_transfer_requires_admin() {
+        let (env, client, _admin, attacker) = setup();
+        let candidate = Address::generate(&env);
+
+        let result = client.try_propose_admin_transfer(&attacker, &candidate, &0);
+        assert_eq!(result, Err(Ok(RegistryError::Unauthorized)));
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_clears_pending() {
+        let (env, client, admin, new_admin) = setup();
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+        client.cancel_admin_transfer(&admin, &1);
+        assert_eq!(client.get_pending_admin(), None);
+
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS);
+        let result = client.try_accept_admin_transfer(&new_admin, &0);
+        assert_eq!(result, Err(Ok(RegistryError::NoPendingAdminChange)));
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_requires_admin() {
+        let (env, client, admin, new_admin) = setup();
+        let attacker = Address::generate(&env);
+
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+        let result = client.try_cancel_admin_transfer(&attacker, &0);
+        assert_eq!(result, Err(Ok(RegistryError::Unauthorized)));
+        assert!(client.get_pending_admin().is_some());
+    }
+
+    #[test]
+    fn test_accept_admin_transfer_without_proposal_rejected() {
+        let (_env, client, _admin, candidate) = setup();
+
+        let result = client.try_accept_admin_transfer(&candidate, &0);
+        assert_eq!(result, Err(Ok(RegistryError::NoPendingAdminChange)));
     }
 }
