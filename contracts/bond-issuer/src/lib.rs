@@ -46,7 +46,7 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
 /// the set of addresses that have ever held the bond without duplicating
 /// entries. Addresses that later transfer their entire balance out remain in
 /// the list (with a zero balance) and are filtered at coupon distribution.
-fn append_holder(env: &Env, bond_id: u64, holder: Address) {
+fn append_holder(env: &Env, bond_id: u64, maturity_date: u64, holder: Address) {
     let key = DataKey::HolderList(bond_id);
     let mut list: Vec<Address> = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
     list.push_back(holder);
@@ -55,6 +55,7 @@ fn append_holder(env: &Env, bond_id: u64, holder: Address) {
     env.storage()
         .persistent()
         .set(&DataKey::HolderCount(bond_id), &(list.len() as u64));
+    extend_bond_ttl(env, bond_id, maturity_date);
 }
 
 fn holder_count_from_persistent(env: &Env, bond_id: u64) -> u64 {
@@ -259,7 +260,7 @@ impl BondIssuer {
         env.storage().persistent().set(&balance_key, &new_balance);
 
         if current_balance == 0 {
-            append_holder(&env, bond_id, investor.clone());
+            append_holder(&env, bond_id, config.maturity_date, investor.clone());
         }
 
         state.total_subscribed = new_total;
@@ -331,7 +332,7 @@ impl BondIssuer {
         env.storage().persistent().set(&to_key, &new_to_balance);
 
         if to_balance == 0 {
-            append_holder(&env, bond_id, to.clone());
+            append_holder(&env, bond_id, config.maturity_date, to.clone());
         }
 
         env.events().publish(
