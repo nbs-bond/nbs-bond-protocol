@@ -1601,11 +1601,11 @@ mod test {
                             client.subscribe(&users[a], &bond_id, &amount, &nonces[a]);
                             balances[a] += amount;
                             total_subscribed += amount;
+                            nonces[a] += 1;
                         } else {
                             let res = client.try_subscribe(&users[a], &bond_id, &amount, &nonces[a]);
                             prop_assert_eq!(res, Err(Ok(BondError::InsufficientSupply)));
                         }
-                        nonces[a] += 1;
                     } else {
                         let to = if a == b { (b + 1) % 3 } else { b };
                         if amount <= balances[a] {
