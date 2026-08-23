@@ -1562,6 +1562,60 @@ mod test {
                 }
             }
 
+            #[test]
+            fn holder_count_matches_list_len_across_operations(
+                supply in 100i128..1_000_000i128,
+                ops in proptest::collection::vec(
+                    (any::<bool>(), 0usize..3, 0usize..3, 1i128..50_000i128),
+                    0..50
+                ),
+            ) {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let users: std::vec::Vec<Address> =
+                    (0..3).map(|_| Address::generate(&env)).collect();
+                let contract_id = env.register(BondIssuer, (&admin,));
+                let client = BondIssuerClient::new(&env, &contract_id);
+
+                let mut config = make_config(&env);
+                config.total_supply = supply;
+                let bond_id = client.issue_bond(&admin, &config, &0);
+
+                let mut balances = [0i128; 3];
+                let mut total_subscribed = 0i128;
+                let mut nonces = [0u64; 3];
+
+                for (is_subscribe, a, b, amount) in ops {
+                    if is_subscribe {
+                        if amount <= supply - total_subscribed {
+                            client.subscribe(&users[a], &bond_id, &amount, &nonces[a]);
+                            balances[a] += amount;
+                            total_subscribed += amount;
+                        } else {
+                            let res = client.try_subscribe(&users[a], &bond_id, &amount, &nonces[a]);
+                            prop_assert_eq!(res, Err(Ok(BondError::InsufficientSupply)));
+                        }
+                        nonces[a] += 1;
+                    } else {
+                        let to = if a == b { (b + 1) % 3 } else { b };
+                        if amount <= balances[a] {
+                            client.transfer(&users[a], &users[to], &bond_id, &amount);
+                            balances[a] -= amount;
+                            balances[to] += amount;
+                        } else {
+                            let res = client.try_transfer(&users[a], &users[to], &bond_id, &amount);
+                            prop_assert_eq!(res, Err(Ok(BondError::InsufficientBalance)));
+                        }
+                    }
+
+                    prop_assert_eq!(
+                        client.get_holder_count(&bond_id),
+                        client.get_holder_list(&bond_id).len() as u64
+                    );
+                }
+            }
+
             // Subscription/maturity state machine: Active permits subscribe and
             // transfer, only the admin can mature and only at/after maturity_date,
             // and after Matured subscribe/transfer are locked while redeem burns
