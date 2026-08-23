@@ -1329,17 +1329,24 @@ mod test {
         let contract_addr = client.address.clone();
         let config_key = DataKey::BondConfig(bond_id);
         let state_key = DataKey::BondState(bond_id);
+        let holder_list_key = DataKey::HolderList(bond_id);
+        let holder_count_key = DataKey::HolderCount(bond_id);
 
         env.ledger().set_sequence_number(100);
         client.subscribe(&user, &bond_id, &500, &0);
-        let (ttl_config, ttl_state) = env.as_contract(&contract_addr, || {
-            (
-                env.storage().persistent().get_ttl(&config_key),
-                env.storage().persistent().get_ttl(&state_key),
-            )
-        });
+        let (ttl_config, ttl_state, ttl_holder_list, ttl_holder_count) =
+            env.as_contract(&contract_addr, || {
+                (
+                    env.storage().persistent().get_ttl(&config_key),
+                    env.storage().persistent().get_ttl(&state_key),
+                    env.storage().persistent().get_ttl(&holder_list_key),
+                    env.storage().persistent().get_ttl(&holder_count_key),
+                )
+            });
         assert!(ttl_config > 0);
         assert!(ttl_state > 0);
+        assert!(ttl_holder_list > 0);
+        assert!(ttl_holder_count > 0);
     }
 
     #[test]
@@ -1353,17 +1360,24 @@ mod test {
         let contract_addr = client.address.clone();
         let config_key = DataKey::BondConfig(bond_id);
         let state_key = DataKey::BondState(bond_id);
+        let holder_list_key = DataKey::HolderList(bond_id);
+        let holder_count_key = DataKey::HolderCount(bond_id);
 
         env.ledger().set_sequence_number(100);
         client.transfer(&user, &user2, &bond_id, &500);
-        let (ttl_config, ttl_state) = env.as_contract(&contract_addr, || {
-            (
-                env.storage().persistent().get_ttl(&config_key),
-                env.storage().persistent().get_ttl(&state_key),
-            )
-        });
+        let (ttl_config, ttl_state, ttl_holder_list, ttl_holder_count) =
+            env.as_contract(&contract_addr, || {
+                (
+                    env.storage().persistent().get_ttl(&config_key),
+                    env.storage().persistent().get_ttl(&state_key),
+                    env.storage().persistent().get_ttl(&holder_list_key),
+                    env.storage().persistent().get_ttl(&holder_count_key),
+                )
+            });
         assert!(ttl_config > 0);
         assert!(ttl_state > 0);
+        assert!(ttl_holder_list > 0);
+        assert!(ttl_holder_count > 0);
     }
 
     #[test]
