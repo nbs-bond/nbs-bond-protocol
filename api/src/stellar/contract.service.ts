@@ -161,7 +161,9 @@ export class ContractService implements OnModuleDestroy {
       // Track the confirmation promise so onModuleDestroy() can wait for it.
       const confirmationPromise = this.pollTransactionConfirmation(hash, contractAddress, keypair, method);
       this.inFlightTransactions.add(confirmationPromise);
-      confirmationPromise.finally(() => this.inFlightTransactions.delete(confirmationPromise));
+      confirmationPromise
+        .catch(() => {}) // prevent unhandled-rejection detection; error re-thrown via await below
+        .finally(() => this.inFlightTransactions.delete(confirmationPromise));
 
       // Poll getTransaction until the transaction is included in a ledger
       // or the timeout expires.  Without this confirmation step the nonce
