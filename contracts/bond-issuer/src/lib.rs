@@ -87,12 +87,20 @@ fn extend_bond_ttl(env: &Env, bond_id: u64, maturity_date: u64) {
 
     let config_key = DataKey::BondConfig(bond_id);
     let state_key = DataKey::BondState(bond_id);
+    let holder_list_key = DataKey::HolderList(bond_id);
+    let holder_count_key = DataKey::HolderCount(bond_id);
     env.storage()
         .persistent()
         .extend_ttl(&config_key, threshold, extend_to);
     env.storage()
         .persistent()
         .extend_ttl(&state_key, threshold, extend_to);
+    env.storage()
+        .persistent()
+        .extend_ttl(&holder_list_key, threshold, extend_to);
+    env.storage()
+        .persistent()
+        .extend_ttl(&holder_count_key, threshold, extend_to);
 }
 
 #[contract]
