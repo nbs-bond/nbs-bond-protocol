@@ -35,6 +35,8 @@ export interface Order {
   pricePerToken: number;
   quoteAsset: QuoteAsset;
   status: 'Open' | 'PartiallyFilled' | 'Filled' | 'Cancelled' | 'Expired';
+  /** Unix timestamp in seconds (as returned by DEXRouter.Order on-chain). */
+  expiresAt: number;
   createdAt: string;
 }
 
