@@ -613,8 +613,10 @@ impl BondIssuer {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::storage::Persistent as _, testutils::Address as _, testutils::Ledger as _, vec,
-        BytesN,
+        testutils::storage::{Instance as _, Persistent as _},
+        testutils::Address as _,
+        testutils::Ledger as _,
+        vec, BytesN,
     };
 
     fn create_project_id(env: &Env, value: u8) -> BytesN<32> {
@@ -1117,6 +1119,55 @@ mod test {
         );
         assert_eq!(client.get_holder_list_range(&bond_id, &3, &20), vec![&env]);
         assert_eq!(client.get_holder_list_range(&bond_id, &0, &0), vec![&env]);
+    }
+
+    #[test]
+    fn test_holder_count_survives_instance_archival() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &1000, &0);
+        client.subscribe(&user2, &bond_id, &1000, &0);
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .remove(&DataKey::HolderCount(bond_id));
+        });
+
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_count(&bond_id),
+            client.get_holder_list(&bond_id).len() as u64
+        );
+    }
+
+    #[test]
+    fn test_holder_count_migrates_from_persistent_list_when_count_missing() {
+        let (env, client, admin, user) = setup();
+        let user2 = Address::generate(&env);
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        client.subscribe(&user, &bond_id, &1000, &0);
+        client.subscribe(&user2, &bond_id, &1000, &0);
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::HolderCount(bond_id));
+            env.storage()
+                .instance()
+                .set(&DataKey::HolderCount(bond_id), &0u64);
+        });
+
+        assert_eq!(client.get_holder_count(&bond_id), 2);
+        assert_eq!(
+            client.get_holder_count(&bond_id),
+            client.get_holder_list(&bond_id).len() as u64
+        );
     }
 
     #[test]
