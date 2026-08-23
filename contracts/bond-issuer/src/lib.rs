@@ -52,14 +52,26 @@ fn append_holder(env: &Env, bond_id: u64, holder: Address) {
     list.push_back(holder);
     env.storage().persistent().set(&key, &list);
 
-    let count: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::HolderCount(bond_id))
-        .unwrap_or(0);
     env.storage()
-        .instance()
-        .set(&DataKey::HolderCount(bond_id), &(count + 1));
+        .persistent()
+        .set(&DataKey::HolderCount(bond_id), &(list.len() as u64));
+}
+
+fn holder_count_from_persistent(env: &Env, bond_id: u64) -> u64 {
+    if let Some(count) = env
+        .storage()
+        .persistent()
+        .get(&DataKey::HolderCount(bond_id))
+    {
+        return count;
+    }
+
+    let list: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::HolderList(bond_id))
+        .unwrap_or(vec![env]);
+    list.len() as u64
 }
 
 fn extend_bond_ttl(env: &Env, bond_id: u64, maturity_date: u64) {
