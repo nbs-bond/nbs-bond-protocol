@@ -3,7 +3,8 @@
 use nbbs_oracle_consumer::Report;
 use nbbs_shared::{BiodiversityMetrics, CouponEngineError, CreditType, ReportStatus};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal, Symbol, Vec,
+    contract, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
+    Val, Vec,
 };
 
 pub const FIXED_POINT: i128 = 10_000_000;
@@ -11,6 +12,20 @@ pub const CREDIT_DIVISOR: i128 = 1_000;
 pub const HABITAT_CREDIT_RATE: i128 = 1_000_000;
 pub const SPECIES_CREDIT_RATE: i128 = 100_000;
 pub const UNIT_CREDIT_RATE: i128 = 1_000_000;
+
+/// Ledgers per day at the network's 5-second cadence.
+const LEDGERS_PER_DAY: u32 = 17_280;
+/// Refresh a persistent entry once it is within ~30 days of expiry.
+const PERSISTENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 30;
+/// Push it back out to ~120 days (2 073 600 ledgers), comfortably below the
+/// network's maximum entry TTL.
+///
+/// Bonds run for years: a holder who never claims their accrued credits, or a
+/// bond whose period history is only read by off-chain indexers, would
+/// otherwise have those entries pruned long before maturity. Every write to —
+/// and every single-entry read of — the durable keys below bumps the entry's
+/// TTL so nothing silently expires mid-bond.
+const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 120;
 
 #[derive(Clone)]
 #[contracttype]
@@ -285,6 +300,11 @@ impl CouponEngine {
                     .ok_or(CouponEngineError::AccountingMismatch)?;
                 total_subscribed = balance_state.0;
                 processed_balance = balance_state.1;
+                // A period may be resumed long after the previous batch call;
+                // refresh both entries so the gap can never expire the state
+                // an in-flight distribution depends on.
+                extend_ttl(&env, &batch_key);
+                extend_ttl(&env, &balance_key);
                 s
             }
             None => {
@@ -373,10 +393,8 @@ impl CouponEngine {
                 };
                 // Store immediately so it is visible to the loop below even
                 // if the first batch is also the final batch.
-                env.storage().persistent().set(&batch_key, &s);
-                env.storage()
-                    .persistent()
-                    .set(&balance_key, &(total_subscribed, 0i128));
+                write(&env, &batch_key, &s);
+                write(&env, &balance_key, &(total_subscribed, 0i128));
                 processed_balance = 0;
                 s
             }
@@ -392,6 +410,10 @@ impl CouponEngine {
             // Skip holders already processed in a prior batch (idempotent).
             let processed_key = DataKey::HolderDistributed(bond_id, period_index, holder.clone());
             if env.storage().persistent().has(&processed_key) {
+                // Refresh the flag: if it expired during a long gap between
+                // batches, the skip below would stop working and the holder
+                // could be paid twice for the same period.
+                extend_ttl(&env, &processed_key);
                 continue;
             }
 
@@ -484,7 +506,7 @@ impl CouponEngine {
 
                 // Mark this holder as processed so subsequent batch calls
                 // (or a retry of this one) skip them.
-                env.storage().persistent().set(&processed_key, &true);
+                write(&env, &processed_key, &true);
             }
         }
 
@@ -502,10 +524,8 @@ impl CouponEngine {
             .checked_add(biodiversity_holder_credits)
             .ok_or(CouponEngineError::Overflow)?;
         state.holder_count_so_far += holder_count;
-        env.storage().persistent().set(&batch_key, &state);
-        env.storage()
-            .persistent()
-            .set(&balance_key, &(total_subscribed, processed_balance));
+        write(&env, &batch_key, &state);
+        write(&env, &balance_key, &(total_subscribed, processed_balance));
 
         // ── Finalise if this is the last batch ───────────────────────────────
         if is_final_batch {
@@ -552,9 +572,11 @@ impl CouponEngine {
                 report_id,
                 undistributed,
             };
-            env.storage()
-                .persistent()
-                .set(&DataKey::PeriodInfo(bond_id, period_index), &period_info);
+            write(
+                &env,
+                &DataKey::PeriodInfo(bond_id, period_index),
+                &period_info,
+            );
 
             if undistributed > 0 {
                 let undistributed_total: i128 = env
@@ -565,9 +587,7 @@ impl CouponEngine {
                 let new_total = undistributed_total
                     .checked_add(undistributed)
                     .ok_or(CouponEngineError::Overflow)?;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::UndistributedTotal(bond_id), &new_total);
+                write(&env, &DataKey::UndistributedTotal(bond_id), &new_total);
             }
             if carbon_undistributed > 0 {
                 let key = DataKey::UndistributedByType(bond_id, CreditType::Carbon);
@@ -575,7 +595,7 @@ impl CouponEngine {
                 let new_total = existing
                     .checked_add(carbon_undistributed)
                     .ok_or(CouponEngineError::Overflow)?;
-                env.storage().persistent().set(&key, &new_total);
+                write(&env, &key, &new_total);
             }
             if biodiversity_undistributed > 0 {
                 let key = DataKey::UndistributedByType(bond_id, CreditType::Biodiversity);
@@ -583,7 +603,7 @@ impl CouponEngine {
                 let new_total = existing
                     .checked_add(biodiversity_undistributed)
                     .ok_or(CouponEngineError::Overflow)?;
-                env.storage().persistent().set(&key, &new_total);
+                write(&env, &key, &new_total);
             }
 
             let count: u32 = env
@@ -591,9 +611,7 @@ impl CouponEngine {
                 .persistent()
                 .get(&DataKey::PeriodCount(bond_id))
                 .unwrap_or(0);
-            env.storage()
-                .persistent()
-                .set(&DataKey::PeriodCount(bond_id), &(count + 1));
+            write(&env, &DataKey::PeriodCount(bond_id), &(count + 1));
 
             // Clean up the transient BatchState now that the period is closed.
             env.storage().persistent().remove(&batch_key);
@@ -629,10 +647,7 @@ impl CouponEngine {
     }
 
     pub fn accrued_credits(env: Env, bond_id: u64, holder: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AccruedCredits(bond_id, holder))
-            .unwrap_or(0)
+        read_refresh_ttl(&env, &DataKey::AccruedCredits(bond_id, holder)).unwrap_or(0)
     }
 
     pub fn accrued_credits_by_type(
@@ -648,14 +663,11 @@ impl CouponEngine {
             CreditType::BlueCarbon => CreditType::Carbon,
             other => other,
         };
-        env.storage()
-            .persistent()
-            .get(&DataKey::AccruedCreditsByType(
-                bond_id,
-                holder,
-                storage_type,
-            ))
-            .unwrap_or(0)
+        read_refresh_ttl(
+            &env,
+            &DataKey::AccruedCreditsByType(bond_id, holder, storage_type),
+        )
+        .unwrap_or(0)
     }
 
     pub fn get_bond_credit_type(env: Env, bond_id: u64) -> Result<CreditType, CouponEngineError> {
@@ -763,7 +775,7 @@ impl CouponEngine {
             // ── (4) zero combined, (5) zero per-type ─────────────────────
             // Only reached once every per-type balance has been confirmed
             // consistent with the combined total.
-            env.storage().persistent().set(&combined_key, &0i128);
+            write(&env, &combined_key, &0i128);
             match credit_type {
                 Some(CreditType::Carbon) | Some(CreditType::BlueCarbon) => {
                     clear_accrued(&env, bond_id, &caller, CreditType::Carbon);
@@ -802,9 +814,7 @@ impl CouponEngine {
         bond_id: u64,
         period_index: u32,
     ) -> Result<PeriodInfo, CouponEngineError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PeriodInfo(bond_id, period_index))
+        read_refresh_ttl(&env, &DataKey::PeriodInfo(bond_id, period_index))
             .ok_or(CouponEngineError::PeriodNotFound)
     }
 
@@ -845,17 +855,11 @@ impl CouponEngine {
     }
 
     pub fn get_period_count(env: Env, bond_id: u64) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PeriodCount(bond_id))
-            .unwrap_or(0)
+        read_refresh_ttl(&env, &DataKey::PeriodCount(bond_id)).unwrap_or(0)
     }
 
     pub fn get_undistributed_total(env: Env, bond_id: u64) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UndistributedTotal(bond_id))
-            .unwrap_or(0)
+        read_refresh_ttl(&env, &DataKey::UndistributedTotal(bond_id)).unwrap_or(0)
     }
 
     /// Per-type breakdown of `bond_id`'s undistributed dust. For a
@@ -868,10 +872,7 @@ impl CouponEngine {
             CreditType::BlueCarbon => CreditType::Carbon,
             other => other,
         };
-        env.storage()
-            .persistent()
-            .get(&DataKey::UndistributedByType(bond_id, storage_type))
-            .unwrap_or(0)
+        read_refresh_ttl(&env, &DataKey::UndistributedByType(bond_id, storage_type)).unwrap_or(0)
     }
 
     /// Sweep `bond_id`'s undistributed dust to `destination`.
@@ -942,9 +943,9 @@ impl CouponEngine {
         }
 
         // Validated — safe to zero.
-        env.storage().persistent().set(&combined_key, &0i128);
-        env.storage().persistent().set(&carbon_key, &0i128);
-        env.storage().persistent().set(&biodiversity_key, &0i128);
+        write(&env, &combined_key, &0i128);
+        write(&env, &carbon_key, &0i128);
+        write(&env, &biodiversity_key, &0i128);
 
         // Credit `destination` through the same accrual path holders use, so
         // the swept amount actually becomes claimable rather than vanishing.
@@ -1042,12 +1043,8 @@ impl CouponEngine {
             return Err(CouponEngineError::Overflow);
         }
 
-        env.storage()
-            .persistent()
-            .set(&combined_key, &(combined - amount));
-        env.storage()
-            .persistent()
-            .set(&by_type_key, &(by_type - amount));
+        write(&env, &combined_key, &(combined - amount));
+        write(&env, &by_type_key, &(by_type - amount));
 
         env.events().publish(
             (Symbol::new(&env, "credits_deducted"),),
@@ -1068,6 +1065,45 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), CouponEngineError> {
         return Err(CouponEngineError::Unauthorized);
     }
     Ok(())
+}
+
+/// Bump a persistent entry's TTL once it is within ~30 days of expiry,
+/// mirroring the guarantee `credit-retirement` gives its records. No-op cost
+/// on entries that were just written; must only be called for keys that are
+/// known to exist (the host errors otherwise).
+fn extend_ttl(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+/// Write to persistent storage and refresh the entry's TTL in one step.
+///
+/// A bare `set` creates the entry with the default (minimum) TTL; without the
+/// follow-up bump, balances and history written once and never touched again
+/// would be pruned within weeks of their last write.
+fn write<V>(env: &Env, key: &DataKey, value: &V)
+where
+    V: IntoVal<Env, Val>,
+{
+    env.storage().persistent().set(key, value);
+    extend_ttl(env, key);
+}
+
+/// Read from persistent storage and refresh a hit entry's TTL.
+///
+/// Used by the public getters (`accrued_credits`, `accrued_credits_by_type`,
+/// `get_period_info`, …) so an off-chain indexer or a holder checking their
+/// balance keeps the data alive even across years of inactivity.
+fn read_refresh_ttl<V>(env: &Env, key: &DataKey) -> Option<V>
+where
+    V: TryFromVal<Env, Val>,
+{
+    let value: Option<V> = env.storage().persistent().get(key);
+    if value.is_some() {
+        extend_ttl(env, key);
+    }
+    value
 }
 
 fn get_nonce(env: &Env, addr: &Address) -> u64 {
@@ -1104,7 +1140,8 @@ fn accrue_credits(
 ) -> Result<(), CouponEngineError> {
     let by_type_key = DataKey::AccruedCreditsByType(bond_id, holder.clone(), credit_type);
     let by_type: i128 = env.storage().persistent().get(&by_type_key).unwrap_or(0);
-    env.storage().persistent().set(
+    write(
+        env,
         &by_type_key,
         &by_type
             .checked_add(amount)
@@ -1113,7 +1150,8 @@ fn accrue_credits(
 
     let combined_key = DataKey::AccruedCredits(bond_id, holder);
     let combined: i128 = env.storage().persistent().get(&combined_key).unwrap_or(0);
-    env.storage().persistent().set(
+    write(
+        env,
         &combined_key,
         &combined
             .checked_add(amount)
@@ -1124,7 +1162,7 @@ fn accrue_credits(
 
 fn clear_accrued(env: &Env, bond_id: u64, holder: &Address, credit_type: CreditType) {
     let key = DataKey::AccruedCreditsByType(bond_id, holder.clone(), credit_type);
-    env.storage().persistent().set(&key, &0i128);
+    write(env, &key, &0i128);
 }
 
 #[cfg(test)]
@@ -1132,7 +1170,8 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::{testutils::Address as _, vec, BytesN, Env, Symbol};
+    use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, vec, BytesN, Env, Symbol};
 
     fn setup_project(env: &Env, t: &TestEnv, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
@@ -1277,7 +1316,12 @@ mod test {
         let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &t.registry_id);
         let registry_project_id = registry.get_project_by_hash(project_id).id;
         let provider = Address::generate(env);
-        oc.register_provider(&t.admin, &provider, &Symbol::new(env, "verra_vcs"), &admin_nonce);
+        oc.register_provider(
+            &t.admin,
+            &provider,
+            &Symbol::new(env, "verra_vcs"),
+            &admin_nonce,
+        );
         let (period_start, period_end) = period_for_nonce(admin_nonce);
         let report_id = oc.submit_report(
             &provider,
@@ -1313,7 +1357,12 @@ mod test {
         let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &t.registry_id);
         let registry_project_id = registry.get_project_by_hash(project_id).id;
         let provider = Address::generate(env);
-        oc.register_provider(&t.admin, &provider, &Symbol::new(env, "verra_vcs"), &admin_nonce);
+        oc.register_provider(
+            &t.admin,
+            &provider,
+            &Symbol::new(env, "verra_vcs"),
+            &admin_nonce,
+        );
         let (period_start, period_end) = period_for_nonce(admin_nonce);
         oc.submit_report(
             &provider,
@@ -2632,15 +2681,8 @@ mod test {
         );
 
         let first_batch = vec![&t._env, (holder_a.clone(), 6_000i128)];
-        t.client.distribute_coupon(
-            &t.admin,
-            &bond_id,
-            &0,
-            &first_batch,
-            &report_id,
-            &1,
-            &false,
-        );
+        t.client
+            .distribute_coupon(&t.admin, &bond_id, &0, &first_batch, &report_id, &1, &false);
 
         // The second supplied balance is inflated: 6_000 + 5_000 > 10_000.
         let inflated_final_batch = vec![&t._env, (holder_b.clone(), 5_000i128)];
@@ -2891,6 +2933,226 @@ mod test {
             "credit conservation violated: {} + {} != {}",
             sum_accrued,
             undistributed,
+            total_credits
+        );
+    }
+
+    /// Set up a bond with three unevenly-subscribed holders so distribution
+    /// leaves rounding dust in `UndistributedTotal`, then distribute a single
+    /// (final) coupon batch. Returns the test env, bond id and holders.
+    fn setup_distributed_bond() -> (TestEnv, u64, std::vec::Vec<Address>) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 7);
+        let holders_std: std::vec::Vec<Address> =
+            (0..3).map(|_| Address::generate(&t._env)).collect();
+
+        // 3 x 3_333 = 9_999 subscribed: per-holder floor rounding strands dust.
+        let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
+        let config = make_bond_config(&t._env, &project_id);
+        let bond_id = issuer.issue_bond(&t.issuer_admin, &config, &0);
+        for h in &holders_std {
+            issuer.subscribe(h, &bond_id, &3_333, &0);
+        }
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        let report_id = submit_verified_report(
+            &t._env,
+            &t,
+            &project_id,
+            100_000,
+            BiodiversityMetrics::Absent,
+            0,
+        );
+        let holder_refs: std::vec::Vec<&Address> = holders_std.iter().collect();
+        let holders = holders_with_balances(&t._env, &t, bond_id, &holder_refs);
+        t.client
+            .distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
+
+        (t, bond_id, holders_std)
+    }
+
+    /// Every durable entry written by a coupon distribution must be created
+    /// with its TTL already pushed out to the full window, not the default
+    /// minimum.
+    #[test]
+    fn test_persistent_entries_created_with_extended_ttl() {
+        let (t, bond_id, holders) = setup_distributed_bond();
+        let ce_addr = t.client.address.clone();
+
+        let key_accrued = DataKey::AccruedCredits(bond_id, holders[0].clone());
+        let key_by_type =
+            DataKey::AccruedCreditsByType(bond_id, holders[0].clone(), CreditType::Carbon);
+        let key_holder_done = DataKey::HolderDistributed(bond_id, 0, holders[0].clone());
+        let key_period = DataKey::PeriodInfo(bond_id, 0);
+        let key_period_count = DataKey::PeriodCount(bond_id);
+        let key_undistributed = DataKey::UndistributedTotal(bond_id);
+
+        t._env.as_contract(&ce_addr, || {
+            for (name, key) in [
+                ("AccruedCredits", &key_accrued),
+                ("AccruedCreditsByType", &key_by_type),
+                ("HolderDistributed", &key_holder_done),
+                ("PeriodInfo", &key_period),
+                ("PeriodCount", &key_period_count),
+                ("UndistributedTotal", &key_undistributed),
+            ] {
+                assert!(t._env.storage().persistent().has(key));
+                assert!(
+                    t._env.storage().persistent().get_ttl(key) >= PERSISTENT_TTL_EXTEND_TO,
+                    "{name} was not created with an extended TTL"
+                );
+            }
+        });
+
+        // Rounding dust from the 3x3333 subscription must have landed in
+        // UndistributedTotal (so the assertion above covers a real entry).
+        assert!(t.client.get_undistributed_total(&bond_id) > 0);
+    }
+
+    /// The acceptance test for issue #170: after a ledger jump long enough to
+    /// age an entry below the refresh threshold, reading it through the
+    /// public getters refreshes its TTL back out to the full window and the
+    /// data survives unchanged.
+    #[test]
+    fn test_entry_ttl_refreshed_after_long_ledger_jump() {
+        let (t, bond_id, holders) = setup_distributed_bond();
+        let ce_addr = t.client.address.clone();
+
+        let accrued_before = t.client.accrued_credits(&bond_id, &holders[0]);
+        assert!(accrued_before > 0);
+        let period_before = t.client.get_period_info(&bond_id, &0);
+
+        // Age every entry most of the way to expiry (~105 days).
+        let aged_by = PERSISTENT_TTL_EXTEND_TO - PERSISTENT_TTL_THRESHOLD / 2;
+        t._env.ledger().with_mut(|li| li.sequence_number += aged_by);
+
+        let key_accrued = DataKey::AccruedCredits(bond_id, holders[0].clone());
+        let ttl_before_bump = t._env.as_contract(&ce_addr, || {
+            t._env.storage().persistent().get_ttl(&key_accrued)
+        });
+        assert!(
+            ttl_before_bump < PERSISTENT_TTL_THRESHOLD,
+            "entry should have aged below the threshold before the bump"
+        );
+
+        // A balance check by the holder (or an indexer poll) refreshes it.
+        let accrued_after = t.client.accrued_credits(&bond_id, &holders[0]);
+        assert_eq!(accrued_after, accrued_before);
+        let ttl_accrued = t._env.as_contract(&ce_addr, || {
+            t._env.storage().persistent().get_ttl(&key_accrued)
+        });
+        assert!(ttl_accrued >= PERSISTENT_TTL_EXTEND_TO);
+
+        // Same guarantee for the period history getter.
+        let key_period = DataKey::PeriodInfo(bond_id, 0);
+        let ttl_period_before = t._env.as_contract(&ce_addr, || {
+            t._env.storage().persistent().get_ttl(&key_period)
+        });
+        assert!(ttl_period_before < PERSISTENT_TTL_THRESHOLD);
+
+        let period_after = t.client.get_period_info(&bond_id, &0);
+        assert_eq!(period_after, period_before);
+        let ttl_period = t._env.as_contract(&ce_addr, || {
+            t._env.storage().persistent().get_ttl(&key_period)
+        });
+        assert!(ttl_period >= PERSISTENT_TTL_EXTEND_TO);
+
+        // And for the per-type balance getter.
+        let key_by_type =
+            DataKey::AccruedCreditsByType(bond_id, holders[0].clone(), CreditType::Carbon);
+        let ttl_by_type_before = t._env.as_contract(&ce_addr, || {
+            t._env.storage().persistent().get_ttl(&key_by_type)
+        });
+        assert!(ttl_by_type_before < PERSISTENT_TTL_THRESHOLD);
+        assert_eq!(
+            t.client
+                .accrued_credits_by_type(&bond_id, &holders[0], &CreditType::Carbon),
+            accrued_before
+        );
+        let ttl_by_type = t._env.as_contract(&ce_addr, || {
+            t._env.storage().persistent().get_ttl(&key_by_type)
+        });
+        assert!(ttl_by_type >= PERSISTENT_TTL_EXTEND_TO);
+    }
+
+    /// An interrupted multi-batch distribution must stay resumable no matter
+    /// how long the gap between batch calls: `BatchState`,
+    /// `DistributionBalance` and the `HolderDistributed` flags are refreshed
+    /// as batches touch them, so the period can still be finalised and the
+    /// already-paid holder is not paid twice.
+    #[test]
+    fn test_batch_state_ttl_refreshed_between_batches() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+
+        let project_id = setup_project(&t._env, &t, 7);
+        let holder_a = Address::generate(&t._env);
+        let holder_b = Address::generate(&t._env);
+
+        // 5_000 + 5_000 = the 10_000 total supply.
+        let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
+        let config = make_bond_config(&t._env, &project_id);
+        let bond_id = issuer.issue_bond(&t.issuer_admin, &config, &0);
+        issuer.subscribe(&holder_a, &bond_id, &5_000, &0);
+        issuer.subscribe(&holder_b, &bond_id, &5_000, &0);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+
+        let report_id = submit_verified_report(
+            &t._env,
+            &t,
+            &project_id,
+            100_000,
+            BiodiversityMetrics::Absent,
+            0,
+        );
+
+        // Batch 1 pays only holder_a; the period stays open.
+        let batch1 = holders_with_balances(&t._env, &t, bond_id, &[&holder_a]);
+        t.client
+            .distribute_coupon(&t.admin, &bond_id, &0, &batch1, &report_id, &1, &false);
+        let a_after_batch1 = t.client.accrued_credits(&bond_id, &holder_a);
+        assert!(a_after_batch1 > 0);
+
+        // Age every entry most of the way to expiry (~105 days).
+        let aged_by = PERSISTENT_TTL_EXTEND_TO - PERSISTENT_TTL_THRESHOLD / 2;
+        t._env.ledger().with_mut(|li| li.sequence_number += aged_by);
+
+        // The in-flight state must have aged below the threshold…
+        let ce_addr = t.client.address.clone();
+        let key_batch = DataKey::BatchState(bond_id, 0);
+        let ttl_before = t._env.as_contract(&ce_addr, || {
+            t._env.storage().persistent().get_ttl(&key_batch)
+        });
+        assert!(ttl_before < PERSISTENT_TTL_THRESHOLD);
+
+        // …yet the distribution resumes cleanly: holder_a is skipped (flag
+        // survived), holder_b is paid, and the period finalises.
+        let batch2 = holders_with_balances(&t._env, &t, bond_id, &[&holder_a, &holder_b]);
+        let result = t
+            .client
+            .distribute_coupon(&t.admin, &bond_id, &0, &batch2, &report_id, &2, &true);
+
+        assert_eq!(result.holder_count, 2);
+        assert_eq!(
+            t.client.accrued_credits(&bond_id, &holder_a),
+            a_after_batch1
+        );
+        assert!(t.client.accrued_credits(&bond_id, &holder_b) > 0);
+        assert!(t.client.get_period_info(&bond_id, &0).distributed);
+
+        // Credit conservation holds after the long gap.
+        let total_credits = 100i128; // 100_000 kg / 1_000 divisor
+        let undistributed = t.client.get_undistributed_total(&bond_id);
+        assert_eq!(
+            a_after_batch1 + t.client.accrued_credits(&bond_id, &holder_b) + undistributed,
             total_credits
         );
     }
