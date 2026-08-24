@@ -96,6 +96,11 @@ export interface AccruedCreditsResponse {
 
 export interface SweepUndistributedResponse {
   bondId: number;
+  destination: string;
+  amount: number;
+  carbonAmount: number;
+  biodiversityAmount: number;
+  /** Alias of `amount` for clients that still read `swept`. */
   swept: number;
   transactionHash: string;
 }

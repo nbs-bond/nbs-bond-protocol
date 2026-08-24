@@ -21,7 +21,7 @@ pub fn bond_count(...)
 // Public functions
 pub fn distribute_coupon(caller, bond_id, period, holders, report_id, nonce)
 pub fn claim_credits(caller, bond_id, nonce)   // withdraw accrued credits
-pub fn sweep_undistributed(caller, bond_id, nonce)  // admin-only dust recovery
+pub fn sweep_undistributed(caller, bond_id, destination, nonce)  // admin-only: credit dust to destination
 pub fn accrued_credits(...)
 pub fn accrued_credits_by_type(bond_id, holder, credit_type)  // per-type split for Basket bonds
 pub fn get_bond_credit_type(bond_id)
@@ -138,7 +138,7 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 - It reads the report from the `OracleConsumer` contract and rejects any report whose status is not `Verified` (`ReportNotVerified`).
 - The report's registry-authenticated `project_metadata_hash` must match the bond's registered project metadata hash, otherwise distribution is rejected; the report's canonical registry identity remains its numeric `project_id`.
 - The verified report id is persisted in `PeriodInfo`, making every distribution auditable back to its evidence.
-- Integer-division remainder that cannot be allocated to holders is recorded as `undistributed` per period and aggregated in `UndistributedTotal`; the admin can recover it via `sweep_undistributed`, preventing value from being silently lost.
+- Integer-division remainder that cannot be allocated to holders is recorded as `undistributed` per period and aggregated in `UndistributedTotal`; the admin can recover it via `sweep_undistributed`, which credits the dust to a `destination` wallet's `AccruedCredits` rather than destroying it.
 
 ## Retirement Certificates
 
@@ -160,7 +160,7 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | POST | /bonds/:id/claim | Claim accrued credits (JWT; claims for the session wallet only) |
 | GET | /bonds/:id/undistributed | Get undistributed coupon dust total |
 | GET | /bonds/:id/periods | Coupon period history (paginated, optional `?include_report=true`) |
-| POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust (admin only) |
+| POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust to `destination` (defaults to admin) |
 | POST | /bonds/:id/transfer | Transfer bond tokens to another address |
 | POST | /projects | Register project |
 | GET | /projects | List projects |
@@ -197,6 +197,32 @@ holder's `AccruedCredits` balance for the bond.
 
 ```json
 { "bondId": 1, "investorAddress": "G...", "credits": 500, "transactionHash": "..." }
+```
+
+### POST /bonds/:id/sweep-undistributed
+
+Admin-only. Calls `CouponEngine.sweep_undistributed` and credits leftover
+coupon dust to a wallet's `AccruedCredits` (the same path holders use, so
+the destination can later `claim_credits`).
+
+- **Destination.** Optional body field `destination` (a Stellar public
+  key). When omitted the API credits the protocol admin — the public key of
+  `ADMIN_SECRET_KEY`. Pass a dedicated treasury address when dust should
+  not land on the admin wallet; there is no separate `TREASURY_*` env
+  default.
+- **Response.** Mirrors on-chain `SweepReceipt`: `amount` (also aliased as
+  `swept`), `carbonAmount`, `biodiversityAmount`, and `destination`.
+
+```json
+{
+  "bondId": 1,
+  "destination": "G...",
+  "amount": 42,
+  "carbonAmount": 30,
+  "biodiversityAmount": 12,
+  "swept": 42,
+  "transactionHash": "..."
+}
 ```
 
 ## Frontend

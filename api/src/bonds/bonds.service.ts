@@ -727,9 +727,19 @@ export class BondsService implements OnModuleDestroy {
     ) ?? 'Pending';
   }
 
-  async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
+  /**
+   * Credits undistributed coupon dust to `destination` via CouponEngine
+   * `sweep_undistributed`. The caller is always the protocol admin; `destination`
+   * defaults to that same admin wallet when omitted so a dedicated treasury
+   * is opt-in (`POST /bonds/:id/sweep-undistributed` `{ "destination": "G..." }`).
+   */
+  async sweepUndistributed(
+    id: number,
+    destination?: string,
+  ): Promise<SweepUndistributedResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+    const creditTo = destination || adminAddress;
     const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
 
     const { result, transactionHash } = await this.contractService.invokeContractMethod(
@@ -737,14 +747,50 @@ export class BondsService implements OnModuleDestroy {
       [
         Address.fromString(adminAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
+        Address.fromString(creditTo).toScVal(),
       ],
       nonce,
     );
 
+    const receipt = this.decodeSweepReceipt(result);
     return {
-      bondId: id,
-      swept: Number(scValToNative(result)),
+      bondId: receipt.bondId || id,
+      destination: receipt.destination || creditTo,
+      amount: receipt.amount,
+      carbonAmount: receipt.carbonAmount,
+      biodiversityAmount: receipt.biodiversityAmount,
+      swept: receipt.amount,
       transactionHash: transactionHash || '',
+    };
+  }
+
+  /**
+   * Decodes CouponEngine `SweepReceipt` (`bond_id`, `destination`, `amount`,
+   * `carbon_amount`, `biodiversity_amount`) from either a 5-field tuple or a
+   * named struct/map, matching how `scValToNative` surfaces Soroban values.
+   */
+  private decodeSweepReceipt(result: xdr.ScVal): {
+    bondId: number;
+    destination: string;
+    amount: number;
+    carbonAmount: number;
+    biodiversityAmount: number;
+  } {
+    const native = scValToNative(result) as unknown;
+    const read = (key: string, index: number): unknown => {
+      if (Array.isArray(native)) return native[index];
+      if (native instanceof Map) return native.get(key);
+      if (native && typeof native === 'object') {
+        return (native as Record<string, unknown>)[key];
+      }
+      return undefined;
+    };
+    return {
+      bondId: Number(read('bond_id', 0) ?? 0),
+      destination: String(read('destination', 1) ?? ''),
+      amount: Number(read('amount', 2) ?? 0),
+      carbonAmount: Number(read('carbon_amount', 3) ?? 0),
+      biodiversityAmount: Number(read('biodiversity_amount', 4) ?? 0),
     };
   }
 

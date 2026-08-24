@@ -86,6 +86,16 @@ export interface AccruedCreditsResponse {
 
 export interface SweepUndistributedResponse {
   bondId: number;
+  /** Wallet that received the swept credits as AccruedCredits. */
+  destination: string;
+  /** Total credits credited to `destination`. */
+  amount: number;
+  carbonAmount: number;
+  biodiversityAmount: number;
+  /**
+   * Alias of `amount`, kept so existing clients that read `swept` keep
+   * working after SweepReceipt replaced the bare i128 return.
+   */
   swept: number;
   transactionHash: string;
 }
