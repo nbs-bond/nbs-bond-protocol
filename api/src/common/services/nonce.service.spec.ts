@@ -18,6 +18,8 @@ const redisMock = {
   exists: jest.fn(),
   set: jest.fn(),
   eval: jest.fn(),
+  sAdd: jest.fn(),
+  sMembers: jest.fn(),
 };
 
 jest.mock('@redis/client', () => ({
@@ -75,9 +77,11 @@ describe('NonceService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    // Default: Redis SET and eval succeed.
+    // Default: Redis SET, eval, and set operations succeed.
     redisMock.set.mockResolvedValue('OK');
     redisMock.eval.mockResolvedValue(1); // INCR returns 1 → nonce 0
+    redisMock.sAdd.mockResolvedValue(1);
+    redisMock.sMembers.mockResolvedValue([]);
     service = new NonceService();
   });
 
@@ -228,6 +232,85 @@ describe('NonceService', () => {
       await expect(service.next(CONTRACT, ADDRESS)).rejects.toThrow(
         'RPC node unreachable',
       );
+    });
+  });
+
+  // ── Known-pairs registry (feeds NonceReconcilerService) ─────────────────────
+
+  describe('known-pairs tracking', () => {
+    it('records the pair in the registry when next() is called', async () => {
+      redisMock.exists.mockResolvedValueOnce(1); // warm key, skip sync
+      redisMock.eval.mockResolvedValueOnce(6); // INCR → 6 → nonce 5
+
+      await service.next(CONTRACT, ADDRESS);
+
+      expect(redisMock.sAdd).toHaveBeenCalledWith(
+        'nonce:known-pairs',
+        `${CONTRACT}:${ADDRESS}`,
+      );
+    });
+
+    it('records the pair in the registry when sync() is called directly', async () => {
+      getContractDataMock.mockResolvedValueOnce(makeLedgerEntry(7));
+
+      await service.sync(CONTRACT, ADDRESS);
+
+      expect(redisMock.sAdd).toHaveBeenCalledWith(
+        'nonce:known-pairs',
+        `${CONTRACT}:${ADDRESS}`,
+      );
+    });
+
+    it('never fails nonce allocation when registry tracking fails', async () => {
+      redisMock.sAdd.mockRejectedValueOnce(new Error('redis down'));
+      redisMock.exists.mockResolvedValueOnce(1);
+      redisMock.eval.mockResolvedValueOnce(6);
+
+      const nonce = await service.next(CONTRACT, ADDRESS);
+
+      expect(nonce).toBe(5);
+    });
+
+    it('lists known pairs for the reconciler, skipping malformed members', async () => {
+      redisMock.sMembers.mockResolvedValueOnce([
+        `${CONTRACT}:${ADDRESS}`,
+        'malformed-no-colon',
+        'trailing-colon:',
+      ]);
+
+      const pairs = await service.listKnownPairs();
+
+      expect(pairs).toEqual([{ contractAddress: CONTRACT, address: ADDRESS }]);
+    });
+  });
+
+  // ── Self-healing after a Redis flush ───────────────────────────────────────
+  // The exact operational outage from issue #85: Redis loses all nonce keys
+  // (restart, eviction, container replacement) while the on-chain counters
+  // keep their real values. The very next API call must recover on its own.
+
+  describe('next() — self-healing after a simulated Redis flush', () => {
+    it('re-syncs from the chain without manual intervention once the key is lost', async () => {
+      // Warm-up: the key exists in Redis, so this call never touches the chain.
+      redisMock.exists.mockResolvedValueOnce(1);
+      redisMock.eval.mockResolvedValueOnce(6); // INCR → 6 → nonce 5
+      await service.next(CONTRACT, ADDRESS);
+      expect(getContractDataMock).not.toHaveBeenCalled();
+
+      // Simulate the flush: every nonce key is now gone from Redis.
+      redisMock.exists.mockResolvedValueOnce(0); // key missing post-flush
+      redisMock.set.mockResolvedValueOnce('OK'); // lock acquired
+      redisMock.set.mockResolvedValueOnce('OK'); // sync() seeds the key
+      redisMock.eval.mockResolvedValueOnce(1); // lock release
+      redisMock.eval.mockResolvedValueOnce(8); // INCR from 7 → 8
+      // The chain still holds the ground truth: nonce 7 for this address.
+      getContractDataMock.mockResolvedValueOnce(makeLedgerEntry(7));
+
+      const nonce = await service.next(CONTRACT, ADDRESS);
+
+      // Recovered the authoritative value — no manual Redis reset required.
+      expect(getContractDataMock).toHaveBeenCalledTimes(1);
+      expect(nonce).toBe(7);
     });
   });
 

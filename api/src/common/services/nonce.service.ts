@@ -12,6 +12,17 @@ import {
 const NONCE_KEY_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 /**
+ * Redis set of every `${contractAddress}:${address}` pair that has ever
+ * requested a nonce. Consumed by NonceReconcilerService so the background
+ * cron knows which on-chain nonces to re-sync, and self-heals drift even
+ * when the per-pair nonce key itself still exists with a stale value.
+ *
+ * Intentionally TTL-less: this is the durable registry of pairs that must
+ * be reconciled, not a cache.
+ */
+export const KNOWN_PAIRS_KEY = 'nonce:known-pairs';
+
+/**
  * How long the sync() lock is held, in milliseconds.
  *
  * This only needs to cover the duration of a single getContractData() RPC
@@ -90,6 +101,7 @@ export class NonceService implements OnModuleDestroy {
    */
   async sync(contractAddress: string, address: string): Promise<number> {
     const key = `nonce:${contractAddress}:${address}`;
+    await this.trackPair(contractAddress, address);
     let onChainNonce = 0;
 
     try {
@@ -180,6 +192,11 @@ export class NonceService implements OnModuleDestroy {
   async next(contractAddress: string, address: string): Promise<number> {
     const key = `nonce:${contractAddress}:${address}`;
 
+    // Record this pair in the known-pairs registry so the background
+    // reconciliation cron (NonceReconcilerService) can re-sync it from the
+    // chain every cycle. Tracking failures must never block nonce allocation.
+    await this.trackPair(contractAddress, address);
+
     // If the key is absent (first call ever, or expired after 30 days of
     // inactivity), sync the real on-chain value before incrementing.
     // DO NOT skip this check and fall through to INCR — a missing key
@@ -212,6 +229,58 @@ export class NonceService implements OnModuleDestroy {
       );
       return await this.sync(contractAddress, address);
     }
+  }
+
+  /**
+   * Register a (contractAddress, address) pair in the known-pairs registry
+   * used by the reconciliation cron.
+   *
+   * Errors are swallowed with a debug log: SADD is bookkeeping for a
+   * background job and must never fail (or slow down) a live nonce
+   * allocation. If the registry is unavailable, next() and sync() still
+   * behave correctly — the per-call missing-key sync path is unaffected.
+   */
+  private async trackPair(
+    contractAddress: string,
+    address: string,
+  ): Promise<void> {
+    try {
+      await this.redis.sAdd(KNOWN_PAIRS_KEY, `${contractAddress}:${address}`);
+    } catch (error) {
+      this.logger.debug(
+        `trackPair(): could not record ${contractAddress}:${address} in ` +
+          `${KNOWN_PAIRS_KEY}: ${error?.message ?? error}`,
+      );
+    }
+  }
+
+  /**
+   * Return every (contractAddress, address) pair that has ever requested a
+   * nonce, for the background reconciliation cron (NonceReconcilerService).
+   *
+   * Members are stored as `${contractAddress}:${address}`. Contract and
+   * Stellar addresses never contain a colon, so splitting on the first ':'
+   * is unambiguous. Malformed members are skipped with a debug log.
+   */
+  async listKnownPairs(): Promise<
+    Array<{ contractAddress: string; address: string }>
+  > {
+    const members = await this.redis.sMembers(KNOWN_PAIRS_KEY);
+    const pairs: Array<{ contractAddress: string; address: string }> = [];
+    for (const member of members) {
+      const separator = member.indexOf(':');
+      if (separator <= 0 || separator === member.length - 1) {
+        this.logger.debug(
+          `listKnownPairs(): skipping malformed member "${member}"`,
+        );
+        continue;
+      }
+      pairs.push({
+        contractAddress: member.slice(0, separator),
+        address: member.slice(separator + 1),
+      });
+    }
+    return pairs;
   }
 
   /**
