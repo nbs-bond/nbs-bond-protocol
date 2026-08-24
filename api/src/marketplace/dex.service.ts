@@ -61,7 +61,7 @@ export class DexService implements OnModuleDestroy {
     status?: string,
     page = 1,
     limit = 20,
-  ): Promise<PaginatedResponse<OrderResponse> & { meta: { hasMore: boolean } }> {
+  ): Promise<PaginatedResponse<OrderResponse> & { meta: { hasMore?: boolean } }> {
     const cacheKey = `orders:${bondId || 'all'}:${status || 'all'}:${page}:${limit}`;
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);

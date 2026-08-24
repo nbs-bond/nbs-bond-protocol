@@ -1059,54 +1059,43 @@ describe('DexService', () => {
      * Build a simulateCall mock that serves `count` orders (IDs 1..count) and
      * then throws an OrderNotFound error on the next ID, mimicking the real
      * contract's end-of-list signal.
+     * NOTE: use setupOrderSequenceViaDecode in most tests — this helper is kept
+     * only for reference and is not called directly.
      */
     function setupOrderSequence(count: number): void {
-      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
-        const id = Number(args[0]._value ?? scValToNative(args[0]));
-        if (id > count) {
-          throw new Error(`Transaction simulation failed: Error(Contract, #4)`);
-        }
-        // Return a native array matching decodeOrder's expectations
-        return {
-          _type: 'vec',
-          _value: makeRawOrder({ id: BigInt(id), bondId: BigInt(1) }),
-          // scValToNative is called on this; stub it to return the raw array directly
-          toJSON: () => makeRawOrder({ id: BigInt(id), bondId: BigInt(1) }),
-        };
-      });
-
-      // scValToNative is imported; stub simulateCall to resolve with a plain
-      // array so decodeOrder receives what it expects.
-      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
-        const scVal = args[0];
-        const id = Number(scValToNative(scVal));
-        if (id > count) {
-          throw new Error(`simulate failed: Error(Contract, #4) end of list`);
-        }
-        return makeRawOrder({ id: BigInt(id), bondId: BigInt(1) }) as any;
-      });
+      // This helper is superseded by setupOrderSequenceViaDecode.
+      // Kept only to avoid removing a function referenced in comments.
+      setupOrderSequenceViaDecode(count);
     }
 
     /**
      * Simpler helper: spy on decodeOrder to skip ScVal encoding entirely,
      * so tests can focus purely on listOrders control-flow behaviour.
+     *
+     * simulateCall returns a real (but dummy) ScVal so scValToNative() does not
+     * throw. decodeOrder is fully mocked and ignores its input; the order ID is
+     * tracked via the closure variable `nextId` that increments in lock-step
+     * with the simulateCall mock.
      */
     function setupOrderSequenceViaDecode(
       count: number,
       overridePerOrder?: (id: number) => Partial<OrderResponse>,
     ): void {
-      // simulateCall resolves with the numeric id; decodeOrder is spied to
-      // return a proper OrderResponse.
+      let nextId = 0;
+
       simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
         const id = Number(scValToNative(args[0]));
         if (id > count) {
           throw new Error(`Error(Contract, #4) OrderNotFound`);
         }
-        return id as any; // decodeOrder is mocked below, value doesn't matter
+        nextId = id;
+        // Return a real ScVal so scValToNative() in the service doesn't throw.
+        // decodeOrder is mocked below so its actual value is irrelevant.
+        return nativeToScVal(0, { type: 'u32' });
       });
 
-      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => {
-        const id = typeof raw === 'number' ? raw : Number(raw);
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => {
+        const id = nextId;
         const base: OrderResponse = {
           id,
           seller: SELLER,
@@ -1152,21 +1141,18 @@ describe('DexService', () => {
 
     it('throws instead of silently truncating on a non-OrderNotFound error mid-scan', async () => {
       // Orders 1-5 succeed; order 6 throws a transient network error (not code 4).
-      let call = 0;
+      let callCount = 0;
       simulateCallMock.mockImplementation(async () => {
-        call++;
-        if (call === 6) {
+        callCount++;
+        if (callCount === 6) {
           throw new Error('network timeout contacting horizon');
         }
-        jest.spyOn(service as any, 'decodeOrder').mockReturnValue({
-          ...STUB_ORDER,
-          id: call,
-        });
-        return call as any;
+        // Return a real ScVal so scValToNative() doesn't throw; decodeOrder is mocked.
+        return nativeToScVal(callCount, { type: 'u32' });
       });
-      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => ({
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => ({
         ...STUB_ORDER,
-        id: typeof raw === 'number' ? raw : call,
+        id: callCount,
       }));
 
       await expect(service.listOrders(undefined, undefined, 1, 20))
@@ -1187,13 +1173,15 @@ describe('DexService', () => {
 
     it('filters by bondId without counting non-matching orders against limit', async () => {
       // 40 orders: odd IDs have bondId=1, even IDs have bondId=2
+      let nextId = 0;
       simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
         const id = Number(scValToNative(args[0]));
         if (id > 40) throw new Error('Error(Contract, #4) OrderNotFound');
-        return id as any;
+        nextId = id;
+        return nativeToScVal(0, { type: 'u32' });
       });
-      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => {
-        const id = typeof raw === 'number' ? raw : Number(raw);
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => {
+        const id = nextId;
         return {
           ...STUB_ORDER,
           id,
@@ -1210,13 +1198,15 @@ describe('DexService', () => {
 
     it('filters by status correctly', async () => {
       const statuses = [OrderStatus.Open, OrderStatus.Filled, OrderStatus.Open, OrderStatus.Cancelled, OrderStatus.Open];
+      let nextId = 0;
       simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
         const id = Number(scValToNative(args[0]));
         if (id > statuses.length) throw new Error('Error(Contract, #4) OrderNotFound');
-        return id as any;
+        nextId = id;
+        return nativeToScVal(0, { type: 'u32' });
       });
-      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => {
-        const id = typeof raw === 'number' ? raw : Number(raw);
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => {
+        const id = nextId;
         return { ...STUB_ORDER, id, status: statuses[id - 1] } as OrderResponse;
       });
 
