@@ -30,7 +30,10 @@ export class NonceReconcilerService implements OnModuleDestroy {
     private readonly schedulerRegistry: SchedulerRegistry,
   ) {}
 
-  @Cron(CronExpression.EVERY_5_MINUTES)
+  // The explicit `name` is required: @nestjs/schedule v4 registers cron jobs
+  // under a random UUID when no name is given, which would make the
+  // onModuleDestroy cleanup below a silent no-op.
+  @Cron(CronExpression.EVERY_5_MINUTES, { name: 'reconcileNonces' })
   async reconcileNonces(): Promise<void> {
     let pairs: Array<{ contractAddress: string; address: string }> = [];
     try {

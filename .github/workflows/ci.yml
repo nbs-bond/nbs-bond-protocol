@@ -85,8 +85,8 @@ jobs:
         working-directory: api
         env:
           REDIS_URL: redis://localhost:6379
-      - name: Nonce recovery e2e (Redis integration)
-        run: npm run test:e2e -- nonce-recovery
+      - name: Nonce e2e (Redis integration + cron registration)
+        run: npm run test:e2e -- nonce
         working-directory: api
         env:
           REDIS_URL: redis://localhost:6379
