@@ -304,16 +304,24 @@ export class NonceService implements OnModuleDestroy {
       this.heldLocks.set(lockKey, lockToken);
 
       // We hold the lock — run sync() and then release.
+      let syncFailed = false;
+      let syncError: unknown;
       try {
         await this.sync(contractAddress, address);
-      } catch (syncError) {
-        // Log and continue; the INCR below will operate on whatever state
-        // sync() managed to write (or on a pre-existing key if another
-        // racing caller already seeded it).
-        this.logger.warn(
-          `next(): sync() failed for ${address}; proceeding with INCR from 0. ` +
-            `This may produce an InvalidNonce error if the address has prior transactions. ` +
-            `Error: ${syncError?.message ?? syncError}`,
+      } catch (err) {
+        // sync() threw a transport / RPC error — we must NOT continue to
+        // INCR because the nonce key was never seeded with the real on-chain
+        // value. Doing so would let Redis INCR treat the absent key as 0 and
+        // emit nonce 0, corrupting the mirror for up to 30 days.
+        //
+        // Record the failure so we can rethrow after the lock is released
+        // (the finally block must always run to release the lock).
+        syncFailed = true;
+        syncError = err;
+        this.logger.error(
+          `syncWithLock(): sync() failed for ${address} on ${contractAddress}; ` +
+            `aborting nonce allocation to prevent mirror corruption. ` +
+            `Error: ${(err as Error)?.message ?? err}`,
         );
       } finally {
         // Release the lock only if we still own it. Using a Lua script makes
@@ -336,6 +344,15 @@ export class NonceService implements OnModuleDestroy {
           });
         // Deregister the lock regardless of whether the DEL succeeded.
         this.heldLocks.delete(lockKey);
+      }
+
+      // Rethrow AFTER the lock has been released (the finally block above
+      // runs before this line). If sync() failed with a transport error we
+      // must not fall through to the INCR+EXPIRE step — the nonce key was
+      // never seeded, so INCR would silently start from 0 and corrupt the
+      // mirror for every subsequent call until the 30-day TTL expires.
+      if (syncFailed) {
+        throw syncError;
       }
     } else {
       // Another request holds the lock and is currently running sync().

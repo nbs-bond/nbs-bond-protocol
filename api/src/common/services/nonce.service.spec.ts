@@ -328,4 +328,139 @@ describe('NonceService', () => {
       expect(caughtError).toBeInstanceOf(InternalServerErrorException);
     });
   });
+
+  // ── RPC transport-error mirror-integrity tests (AC-1 through AC-5) ─────────
+
+  describe('sync() — transport RPC error: does NOT overwrite the Redis mirror', () => {
+    it('throws and never calls redis.set when getContractData fails with a transport error', async () => {
+      // Simulate a network-level RPC failure (not "entry not found").
+      getContractDataMock.mockRejectedValueOnce(new Error('connect ECONNREFUSED 127.0.0.1:8000'));
+
+      await expect(service.sync(CONTRACT, ADDRESS)).rejects.toThrow(
+        'connect ECONNREFUSED',
+      );
+
+      // redis.set must NOT have been called — the mirror must remain intact.
+      expect(redisMock.set).not.toHaveBeenCalled();
+    });
+
+    it('throws and never calls redis.set when getContractData returns a 5xx-style error', async () => {
+      getContractDataMock.mockRejectedValueOnce(new Error('Request failed with status code 503'));
+
+      await expect(service.sync(CONTRACT, ADDRESS)).rejects.toThrow(
+        'status code 503',
+      );
+
+      expect(redisMock.set).not.toHaveBeenCalled();
+    });
+
+    it('throws and never calls redis.set on an RPC timeout', async () => {
+      getContractDataMock.mockRejectedValueOnce(new Error('timeout of 5000ms exceeded'));
+
+      await expect(service.sync(CONTRACT, ADDRESS)).rejects.toThrow(
+        'timeout',
+      );
+
+      expect(redisMock.set).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('next() — RPC transport error during sync: throws and does not corrupt mirror', () => {
+    it('propagates the RPC error and does not emit nonce 0 when sync() throws on transport error', async () => {
+      // Nonce key absent → triggers syncWithLock() → sync() → getContractData fails.
+      redisMock.exists.mockResolvedValueOnce(0);
+      // Lock acquired successfully.
+      redisMock.set.mockResolvedValueOnce('OK');
+      // Simulate transient RPC failure.
+      getContractDataMock.mockRejectedValueOnce(new Error('RPC node unreachable'));
+      // Lock release eval succeeds.
+      redisMock.eval.mockResolvedValueOnce(1);
+
+      // next() must throw — not return a nonce.
+      await expect(service.next(CONTRACT, ADDRESS)).rejects.toThrow(
+        'RPC node unreachable',
+      );
+
+      // Redis INCR must NOT have been called — no nonce was emitted.
+      // The eval call count should be exactly 1 (the lock release), not 2.
+      const incrCallMade = redisMock.eval.mock.calls.some(
+        ([script]: [string]) => script?.includes('INCR'),
+      );
+      expect(incrCallMade).toBe(false);
+
+      // redis.set (used by sync() to write the mirror) must not have been
+      // called with the nonce key — the mirror must remain absent/unchanged.
+      const mirrorWritten = redisMock.set.mock.calls.some(
+        ([k]: [string]) => k === `nonce:${CONTRACT}:${ADDRESS}`,
+      );
+      expect(mirrorWritten).toBe(false);
+    });
+  });
+
+  describe('next() — key already present: RPC transport error during forced sync does not overwrite mirror', () => {
+    it('preserves the existing mirror value when Redis INCR fails and on-chain sync also fails', async () => {
+      // Key is present (seeded from a previous successful sync at nonce 42).
+      redisMock.exists.mockResolvedValueOnce(1);
+      // INCR+EXPIRE Lua script fails (transient Redis outage).
+      redisMock.eval.mockRejectedValueOnce(new Error('redis connection lost'));
+      // On-chain sync also fails with an RPC error — the mirror must NOT be
+      // overwritten with 0; next() must throw instead.
+      getContractDataMock.mockRejectedValueOnce(new Error('RPC timeout'));
+
+      await expect(service.next(CONTRACT, ADDRESS)).rejects.toThrow(
+        'RPC timeout',
+      );
+
+      // sync() must have been attempted (the Redis-INCR fallback path calls it).
+      expect(getContractDataMock).toHaveBeenCalledTimes(1);
+
+      // redis.set must NOT have been called — the pre-existing mirror at 42
+      // must remain untouched.
+      expect(redisMock.set).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('next() — concurrent calls: waiter surfaces error when lock holder\'s sync fails', () => {
+    it('throws InternalServerErrorException when the key is never seeded because the lock holder sync failed', async () => {
+      // Both callers see the key as absent.
+      // After the lock holder's sync fails, the key is still absent for the
+      // waiter's poll loop.
+      redisMock.exists.mockResolvedValue(0); // initial check + all polls return 0
+
+      // Caller A wins the lock; caller B does not.
+      redisMock.set
+        .mockResolvedValueOnce('OK')   // caller A acquires lock
+        .mockResolvedValueOnce(null);  // caller B does not acquire lock
+
+      // Lock holder (caller A) encounters an RPC transport error.
+      getContractDataMock.mockRejectedValueOnce(new Error('DNS lookup failed'));
+
+      // Lock release eval succeeds for caller A.
+      redisMock.eval.mockResolvedValueOnce(1);
+
+      jest.useFakeTimers();
+
+      const errorsA: unknown[] = [];
+      const errorsB: unknown[] = [];
+
+      const promiseA = service.next(CONTRACT, ADDRESS).catch((e) => errorsA.push(e));
+      const promiseB = service.next(CONTRACT, ADDRESS).catch((e) => errorsB.push(e));
+
+      // Advance time past the lock wait timeout so caller B's poll loop
+      // also times out, preventing the test from hanging.
+      await jest.advanceTimersByTimeAsync(5_000);
+
+      await Promise.all([promiseA, promiseB]);
+
+      jest.useRealTimers();
+
+      // Caller A must have received the RPC error (propagated from sync()).
+      expect(errorsA).toHaveLength(1);
+      expect((errorsA[0] as Error).message).toMatch(/DNS lookup failed/);
+
+      // Caller B must have received a timeout error (the key was never seeded).
+      expect(errorsB).toHaveLength(1);
+      expect(errorsB[0]).toBeInstanceOf(InternalServerErrorException);
+    });
+  });
 });
