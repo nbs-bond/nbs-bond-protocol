@@ -1046,6 +1046,236 @@ describe('DexService', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // listOrders — bounded scan, error classification, filter correctness
+  // ---------------------------------------------------------------------------
+
+  describe('listOrders', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      (redisMock.__store as Map<string, string>).clear();
+    });
+
+    /**
+     * Build a simulateCall mock that serves `count` orders (IDs 1..count) and
+     * then throws an OrderNotFound error on the next ID, mimicking the real
+     * contract's end-of-list signal.
+     */
+    function setupOrderSequence(count: number): void {
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const id = Number(args[0]._value ?? scValToNative(args[0]));
+        if (id > count) {
+          throw new Error(`Transaction simulation failed: Error(Contract, #4)`);
+        }
+        // Return a native array matching decodeOrder's expectations
+        return {
+          _type: 'vec',
+          _value: makeRawOrder({ id: BigInt(id), bondId: BigInt(1) }),
+          // scValToNative is called on this; stub it to return the raw array directly
+          toJSON: () => makeRawOrder({ id: BigInt(id), bondId: BigInt(1) }),
+        };
+      });
+
+      // scValToNative is imported; stub simulateCall to resolve with a plain
+      // array so decodeOrder receives what it expects.
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const scVal = args[0];
+        const id = Number(scValToNative(scVal));
+        if (id > count) {
+          throw new Error(`simulate failed: Error(Contract, #4) end of list`);
+        }
+        return makeRawOrder({ id: BigInt(id), bondId: BigInt(1) }) as any;
+      });
+    }
+
+    /**
+     * Simpler helper: spy on decodeOrder to skip ScVal encoding entirely,
+     * so tests can focus purely on listOrders control-flow behaviour.
+     */
+    function setupOrderSequenceViaDecode(
+      count: number,
+      overridePerOrder?: (id: number) => Partial<OrderResponse>,
+    ): void {
+      // simulateCall resolves with the numeric id; decodeOrder is spied to
+      // return a proper OrderResponse.
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const id = Number(scValToNative(args[0]));
+        if (id > count) {
+          throw new Error(`Error(Contract, #4) OrderNotFound`);
+        }
+        return id as any; // decodeOrder is mocked below, value doesn't matter
+      });
+
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => {
+        const id = typeof raw === 'number' ? raw : Number(raw);
+        const base: OrderResponse = {
+          id,
+          seller: SELLER,
+          bondId: 1,
+          amount: 100,
+          pricePerToken: 10,
+          quoteAsset: 'USDC',
+          status: OrderStatus.Open,
+          createdAt: new Date(1700000000 * 1000).toISOString(),
+        };
+        return overridePerOrder ? { ...base, ...overridePerOrder(id) } : base;
+      });
+    }
+
+    it('returns at most `limit` orders even when many more exist', async () => {
+      setupOrderSequenceViaDecode(200);
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(20);
+      // Only 20 RPCs should have been issued (plus one more that hit the limit
+      // loop exit) — certainly not 200.
+      expect(simulateCallMock).toHaveBeenCalledTimes(20);
+      expect(result.meta.hasMore).toBe(true);
+    });
+
+    it('issues exactly `limit` simulateCall RPCs for a full page (no over-fetch)', async () => {
+      setupOrderSequenceViaDecode(500);
+
+      await service.listOrders(undefined, undefined, 1, 10);
+
+      expect(simulateCallMock).toHaveBeenCalledTimes(10);
+    });
+
+    it('sets hasMore=false when fewer than limit orders exist', async () => {
+      setupOrderSequenceViaDecode(3);
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(3);
+      expect(result.meta.hasMore).toBe(false);
+    });
+
+    it('throws instead of silently truncating on a non-OrderNotFound error mid-scan', async () => {
+      // Orders 1-5 succeed; order 6 throws a transient network error (not code 4).
+      let call = 0;
+      simulateCallMock.mockImplementation(async () => {
+        call++;
+        if (call === 6) {
+          throw new Error('network timeout contacting horizon');
+        }
+        jest.spyOn(service as any, 'decodeOrder').mockReturnValue({
+          ...STUB_ORDER,
+          id: call,
+        });
+        return call as any;
+      });
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => ({
+        ...STUB_ORDER,
+        id: typeof raw === 'number' ? raw : call,
+      }));
+
+      await expect(service.listOrders(undefined, undefined, 1, 20))
+        .rejects
+        .toThrow('network timeout contacting horizon');
+    });
+
+    it('treats an OrderNotFound error mid-list as end-of-list (ID gap / normal end)', async () => {
+      // Simulate 4 orders then an OrderNotFound — should return exactly 4, no throw.
+      setupOrderSequenceViaDecode(4);
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(4);
+      expect(result.meta.hasMore).toBe(false);
+      // No unhandled rejection
+    });
+
+    it('filters by bondId without counting non-matching orders against limit', async () => {
+      // 40 orders: odd IDs have bondId=1, even IDs have bondId=2
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const id = Number(scValToNative(args[0]));
+        if (id > 40) throw new Error('Error(Contract, #4) OrderNotFound');
+        return id as any;
+      });
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => {
+        const id = typeof raw === 'number' ? raw : Number(raw);
+        return {
+          ...STUB_ORDER,
+          id,
+          bondId: id % 2 === 0 ? 2 : 1,
+        } as OrderResponse;
+      });
+
+      const result = await service.listOrders(2, undefined, 1, 5);
+
+      // Only even IDs (bondId=2) should appear
+      expect(result.data).toHaveLength(5);
+      result.data.forEach((o) => expect(o.bondId).toBe(2));
+    });
+
+    it('filters by status correctly', async () => {
+      const statuses = [OrderStatus.Open, OrderStatus.Filled, OrderStatus.Open, OrderStatus.Cancelled, OrderStatus.Open];
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const id = Number(scValToNative(args[0]));
+        if (id > statuses.length) throw new Error('Error(Contract, #4) OrderNotFound');
+        return id as any;
+      });
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation((raw: any) => {
+        const id = typeof raw === 'number' ? raw : Number(raw);
+        return { ...STUB_ORDER, id, status: statuses[id - 1] } as OrderResponse;
+      });
+
+      const result = await service.listOrders(undefined, OrderStatus.Open, 1, 20);
+
+      expect(result.data).toHaveLength(3);
+      result.data.forEach((o) => expect(o.status).toBe(OrderStatus.Open));
+    });
+
+    it('returns an empty page when no orders match the filter', async () => {
+      setupOrderSequenceViaDecode(5);
+
+      const result = await service.listOrders(999, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(0);
+      expect(result.meta.hasMore).toBe(false);
+    });
+
+    it('serves subsequent pages by skipping earlier matches', async () => {
+      setupOrderSequenceViaDecode(10);
+
+      const page1 = await service.listOrders(undefined, undefined, 1, 3);
+      // Clear cache between calls so page2 isn't served from cache
+      (redisMock.__store as Map<string, string>).clear();
+      const page2 = await service.listOrders(undefined, undefined, 2, 3);
+
+      expect(page1.data.map((o) => o.id)).toEqual([1, 2, 3]);
+      expect(page2.data.map((o) => o.id)).toEqual([4, 5, 6]);
+    });
+
+    it('returns the cached result without issuing any simulateCall RPCs', async () => {
+      setupOrderSequenceViaDecode(5);
+
+      // Warm the cache
+      await service.listOrders(undefined, undefined, 1, 20);
+      const firstCallCount = simulateCallMock.mock.calls.length;
+      jest.clearAllMocks();
+
+      // Second call should hit cache
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(simulateCallMock).not.toHaveBeenCalled();
+      expect(result.data).toHaveLength(firstCallCount < 5 ? firstCallCount : 5);
+    });
+
+    it('handles an empty order book (first ID throws OrderNotFound)', async () => {
+      simulateCallMock.mockRejectedValue(
+        new Error('Error(Contract, #4) OrderNotFound'),
+      );
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(0);
+      expect(result.meta.hasMore).toBe(false);
+      expect(simulateCallMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Escrow cycle integration — deposit → list → buy → verify → withdraw
   // ---------------------------------------------------------------------------
 
