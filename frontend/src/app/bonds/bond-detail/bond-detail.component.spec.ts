@@ -46,7 +46,15 @@ describe('BondDetailComponent', () => {
       of({ bondId: 1, undistributedTotal: 7 }),
     );
     apiService.sweepUndistributed.and.returnValue(
-      of({ bondId: 1, swept: 7, transactionHash: '0xabc' }),
+      of({
+        bondId: 1,
+        destination: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        amount: 7,
+        carbonAmount: 7,
+        biodiversityAmount: 0,
+        swept: 7,
+        transactionHash: '0xabc',
+      }),
     );
     apiService.getAccruedCredits.and.returnValue(
       of({

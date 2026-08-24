@@ -8,6 +8,7 @@ import { SubscribeDto } from './dto/subscribe.dto';
 import { DistributeCouponDto } from './dto/distribute-coupon.dto';
 import { ClaimCreditsDto } from './dto/claim-credits.dto';
 import { TransferBondDto } from './dto/transfer-bond.dto';
+import { SweepUndistributedDto } from './dto/sweep-undistributed.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
 import { PeriodsQueryDto } from './dto/periods-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -121,13 +122,19 @@ export class BondsController {
     return this.bondsService.getAccruedCredits(id, holder);
   }
 
+  /**
+   * Admin dust recovery. Swept remainder is credited to `destination`'s
+   * AccruedCredits (claimable via POST /bonds/:id/claim). When `destination`
+   * is omitted the protocol admin wallet is used.
+   */
   @Post(':id/sweep-undistributed')
   @UseGuards(JwtAuthGuard, AdminGuard)
   @HttpCode(HttpStatus.OK)
   async sweepUndistributed(
     @Param('id', ParseIntPipe) id: number,
+    @Body() dto: SweepUndistributedDto,
   ): Promise<SweepUndistributedResponse> {
-    return this.bondsService.sweepUndistributed(id);
+    return this.bondsService.sweepUndistributed(id, dto?.destination);
   }
 
   @Post(':id/transfer')
