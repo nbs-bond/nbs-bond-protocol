@@ -488,6 +488,55 @@ describe('OracleService', () => {
       evidenceHash: 'QmYwAPJzv5CZsnAzt8auVZRnGi2C8Qp9G2YB3hM9oWZpDa',
     };
 
+    it('resolves a metadata hash to the registry numeric project id before submit_report', async () => {
+      process.env.ADMIN_SECRET_KEY = 'test-admin-secret';
+      process.env.PROJECT_REGISTRY_ADDRESS = 'CPROJECTREGISTRY';
+      try {
+        const adminPublicKey = 'GAJRCN6P67RAKN2WHGHRP7D7UGIFNIGD5CIBI2XYPAEG7J5VMXO53KWQ';
+        const adminKeypairService = {
+          getKeypairFromSecret: jest.fn().mockReturnValue({ publicKey: () => adminPublicKey }),
+        };
+
+        const localContractService = {
+          simulateCall: jest.fn().mockResolvedValue(
+            xdr.ScVal.scvVec([
+              nativeToScVal(BigInt(7), { type: 'u64' }),
+              xdr.ScVal.scvBytes(Buffer.alloc(32, 0)),
+            ]),
+          ),
+          invokeContractMethod: jest.fn().mockResolvedValue({
+            result: nativeToScVal(BigInt(1), { type: 'u64' }),
+          }),
+        };
+        const localIpfsService = {
+          uploadJson: jest.fn().mockResolvedValue({ hash: 'QmYwAPJzv5CZsnAzt8auVZRnGi2C8Qp9G2YB3hM9oWZpDa' }),
+        };
+        const localNonceService = { next: jest.fn().mockResolvedValue(0) };
+
+        const localService = new OracleService(
+          localContractService as any,
+          localIpfsService as any,
+          adminKeypairService as any,
+          localNonceService as any,
+        );
+
+        await localService.submitReport(dto, PROVIDER_ADDRESS);
+
+        expect(localContractService.simulateCall).toHaveBeenCalledWith(
+          expect.objectContaining({
+            contractAddress: 'CPROJECTREGISTRY',
+            method: 'get_project_by_hash',
+          }),
+        );
+
+        const callArgs = localContractService.invokeContractMethod.mock.calls[0][3] as xdr.ScVal[];
+        expect(Number(scValToNative(callArgs[1]))).toBe(7);
+      } finally {
+        delete process.env.ADMIN_SECRET_KEY;
+        delete process.env.PROJECT_REGISTRY_ADDRESS;
+      }
+    });
+
     it('allocates nonce for the admin signer, not the provider address', async () => {
       process.env.ADMIN_SECRET_KEY = 'test-admin-secret';
       try {
