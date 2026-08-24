@@ -1,7 +1,9 @@
 import { Component, inject, OnInit, ChangeDetectionStrategy, signal, computed } from '@angular/core';
+import { toSignal } from '@angular/core/rxjs-interop';
 import { CommonModule } from '@angular/common';
 import { RouterModule, ActivatedRoute, Router } from '@angular/router';
 import { FormsModule } from '@angular/forms';
+import { interval, map, startWith } from 'rxjs';
 import { ApiService } from '../../shared/services/api.service';
 import { AuthService } from '../../auth/auth.service';
 import { WalletService } from '../../auth/wallet.service';
@@ -9,6 +11,13 @@ import { StatusBadgeComponent } from '../../shared/components/status-badge/statu
 import { LoadingSpinnerComponent } from '../../shared/components/loading-spinner/loading-spinner.component';
 import { QuoteBalanceComponent, QuoteBalances } from '../../shared/components/quote-balance/quote-balance.component';
 import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface';
+
+/**
+ * Seconds remaining at which an order's countdown switches to the
+ * "expiring soon" amber highlight. Kept here, not as a magic number in
+ * the template, so it can be tuned without hunting through markup.
+ */
+const EXPIRY_WARNING_THRESHOLD_S = 60;
 
 @Component({
   selector: 'app-marketplace-list',
@@ -84,6 +93,7 @@ import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface'
                     <th>Price</th>
                     <th>Asset</th>
                     <th>Status</th>
+                    <th>Expires</th>
                     <th>Created</th>
                     <th>Action</th>
                   </tr>
@@ -98,10 +108,15 @@ import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface'
                       <td>{{ order.pricePerToken }}</td>
                       <td>{{ order.quoteAsset }}</td>
                       <td><app-status-badge [status]="order.status" variant="bond" /></td>
+                      <td [class.expiry-soon]="isExpiringSoon(order)" [class.expiry-expired]="isExpired(order)">
+                        {{ formatCountdown(secondsRemaining(order)) }}
+                      </td>
                       <td>{{ order.createdAt | date }}</td>
                       <td>
                           @if (order.status === 'Open' || order.status === 'PartiallyFilled') {
-                            @if (buyOrderId() === order.id) {
+                            @if (isExpired(order)) {
+                              <span class="expiry-expired-label">Expired</span>
+                            } @else if (buyOrderId() === order.id) {
                               <div class="buy-form">
                                 <input type="number" class="buy-input" placeholder="Amount" [(ngModel)]="buyAmount" min="1" />
                                 <input type="number" class="buy-input" placeholder="Max price" [(ngModel)]="buyMaxPrice" min="0.01" />
@@ -122,7 +137,7 @@ import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface'
                                   </div>
                                 }
                                 <div class="buy-actions">
-                                  <button class="btn btn-sm btn-primary" (click)="onBuy(order)" [disabled]="buySubmitting() || !canConfirm(order)">Confirm</button>
+                                  <button class="btn btn-sm btn-primary" (click)="onBuy(order)" [disabled]="buySubmitting() || !canConfirm(order) || isExpired(order)">Confirm</button>
                                   <button class="btn btn-sm btn-outline" (click)="cancelBuy()">Cancel</button>
                                 </div>
                                 @if (buyError()) {
@@ -154,6 +169,7 @@ import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface'
                     <th>Amount</th>
                     <th>Price</th>
                     <th>Status</th>
+                    <th>Expires</th>
                     <th>Created</th>
                     <th>Action</th>
                   </tr>
@@ -166,8 +182,11 @@ import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface'
                       <td>{{ order.amount }}</td>
                       <td>{{ order.pricePerToken }}</td>
                       <td><app-status-badge [status]="order.status" variant="bond" /></td>
+                      <td [class.expiry-soon]="isExpiringSoon(order)" [class.expiry-expired]="isExpired(order)">
+                        {{ formatCountdown(secondsRemaining(order)) }}
+                      </td>
                       <td>{{ order.createdAt | date }}</td>
-                      <td>—</td>
+                      <td>&mdash;</td>
                     </tr>
                   }
                 </tbody>
@@ -191,18 +210,18 @@ import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface'
     .section-title { font-size: 1rem; font-weight: 600; margin-bottom: 12px; }
     .price-overview { margin-bottom: 24px; }
     .price-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
-    .price-card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); display: flex; flex-direction: column; gap: 4px; }
+    .price-card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px4px rgba(0,0,0,0.08); display: flex; flex-direction: column; gap: 4px; }
     .price-bond { font-weight: 600; font-size: 0.875rem; }
     .price-best { font-size: 0.8125rem; color: #22c55e; }
     .price-avg { font-size: 0.75rem; color: #6b7280; }
     .loading-section { display: flex; justify-content: center; padding: 48px 0; }
     .empty-section { text-align: center; padding: 48px 0; color: #6b7280; }
     .orders-section { margin-bottom: 32px; }
-    .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .section-header { display: flex; justify-content: space-between; align-items: center;margin-bottom: 12px; }
     .my-orders { margin-top: 32px; padding-top: 24px; border-top: 1px solid #e5e7eb; }
     .orders-table-wrapper { overflow-x: auto; background: #fff; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
     .orders-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
-    .orders-table th { text-align: left; padding: 12px 16px; font-weight: 600; color: #6b7280; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e5e7eb; background: #f9fafb; }
+    .orders-table th { text-align: left; padding: 12px 16px; font-weight: 600; color: #6b7280; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; border-bottom:1px solid #e5e7eb; background: #f9fafb; }
     .orders-table td { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; }
     .orders-table tr:last-child td { border-bottom: none; }
     .mono { font-family: monospace; font-size: 0.8125rem; }
@@ -221,6 +240,9 @@ import { Order, Bond, QuoteAsset } from '../../shared/interfaces/bond.interface'
     .sufficient-msg { color: #22c55e; }
     .insufficient-msg { color: #ef4444; }
     .error-msg { font-size: 0.75rem; color: #ef4444; }
+    .expiry-soon { color: #f59e0b; font-weight: 600; }
+    .expiry-expired { color: #9ca3af; text-decoration: line-through; }
+    .expiry-expired-label { color: #9ca3af; font-size: 0.8125rem; }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
@@ -246,6 +268,20 @@ export class MarketplaceListComponent implements OnInit {
   readonly balances = signal<QuoteBalances>({ USDC: 0, XLM: 0 });
   readonly balancesLoaded = signal(false);
   quotePanel?: QuoteBalanceComponent;
+
+  /**
+   * A single shared clock tick, driving every order's countdown from one
+   * interval rather than one timer per visible row. `startWith(0)` fires
+   * immediately so countdowns render on first paint instead of waiting a
+   * full second for the first tick.
+   */
+  private readonly now = toSignal(
+    interval(1000).pipe(
+      startWith(0),
+      map(() => Date.now()),
+    ),
+    { initialValue: Date.now() },
+  );
 
   readonly bestPrices = computed(() => {
     const orders = this.orders();
@@ -344,7 +380,7 @@ export class MarketplaceListComponent implements OnInit {
     sufficient: boolean;
   } | null {
     if (this.buyOrderId() !== order.id || !this.balancesLoaded()) return null;
-    if (!this.buyAmount || this.buyAmount < 1 || !this.buyMaxPrice || this.buyMaxPrice <= 0) return null;
+    if (!this.buyAmount || this.buyAmount < 1 || !this.buyMaxPrice || this.buyMaxPrice <=0) return null;
 
     const asset = order.quoteAsset;
     const required = this.buyAmount * order.pricePerToken;
@@ -364,11 +400,42 @@ export class MarketplaceListComponent implements OnInit {
   }
 
   focusQuotePanel(): void {
-    document.getElementById('quote-balance')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    document.getElementById('quote-balance')?.scrollIntoView({ behavior: 'smooth', block:'center' });
+  }
+
+  /**
+   * Seconds remaining until `order` expires, floored at 0. `expiresAt`
+   * comes from the contract as Unix seconds, so it's multiplied by 1000
+   * to compare against `Date.now()` — done in exactly one place to avoid
+   * an off-by-1000 unit error creeping in elsewhere.
+   */
+  secondsRemaining(order: Order): number {
+    const remainingMs = order.expiresAt * 1000 - this.now();
+    return Math.max(0, Math.floor(remainingMs / 1000));
+  }
+
+  isExpired(order: Order): boolean {
+    return this.secondsRemaining(order) <= 0;
+  }
+
+  isExpiringSoon(order: Order): boolean {
+    const remaining = this.secondsRemaining(order);
+    return remaining > 0 && remaining <= EXPIRY_WARNING_THRESHOLD_S;
+  }
+
+  formatCountdown(seconds: number): string {
+    if (seconds <= 0) return 'Expired';
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
   }
 
   onBuy(order: Order): void {
-    if (!this.buyAmount || this.buyAmount < 1 || !this.buyMaxPrice || this.buyMaxPrice <= 0) return;
+    if (!this.buyAmount || this.buyAmount < 1 || !this.buyMaxPrice || this.buyMaxPrice <=0) return;
+    if (this.isExpired(order)) {
+      this.buyError.set('This order has expired.');
+      return;
+    }
     this.buySubmitting.set(true);
     this.buyError.set('');
 

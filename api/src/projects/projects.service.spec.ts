@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { nativeToScVal, Address, xdr } from '@stellar/stellar-sdk';
-import { ProjectsService } from './projects.service';
+import { ProjectsService, toProjectNameSymbol } from './projects.service';
+import { scValToNative } from '@stellar/stellar-sdk';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { IpfsService } from './ipfs.service';
@@ -130,6 +131,42 @@ describe('ProjectsService', () => {
       );
       expect(result.id).toBe(1);
       expect(result.name).toBe('Amazon Reforestation');
+    });
+
+    it('sends all 5 contract args in signature order, including the name Symbol (issue #235)', async () => {
+      contractService.simulateCall.mockResolvedValue(mockProjectScVal(1));
+
+      const dto = {
+        name: 'Amazon Reforestation',
+        methodology: 'VM0003',
+        country: 'BRA',
+        location: { lat: -3.4653, lng: -62.2159 },
+        totalAreaHa: 500,
+        carbonSequestrationEstimate: 1000,
+      };
+
+      await service.register(dto, mockOwnerAddress);
+
+      const args = (contractService.invokeContractMethod as jest.Mock).mock.calls[0][3];
+      // register_project(caller, metadata_ipfs_hash, name, methodology, country)
+      expect(args).toHaveLength(5);
+      expect(scValToNative(args[2])).toBe('Amazon_Reforestation'); // name, Symbol-slugged
+      expect(scValToNative(args[3])).toBe('VM0003'); // methodology shifted to position 4
+      expect(scValToNative(args[4])).toBe('BRA'); // country shifted to position 5
+    });
+  });
+
+  describe('toProjectNameSymbol', () => {
+    it('slugs names to the Soroban Symbol charset ([a-zA-Z0-9_], max 32)', () => {
+      expect(toProjectNameSymbol('Amazon Reforestation')).toBe('Amazon_Reforestation');
+      expect(toProjectNameSymbol('Mangrove Restoration #4!')).toBe('Mangrove_Restoration_4');
+      expect(toProjectNameSymbol('  spaced  out  ')).toBe('spaced_out');
+      expect(toProjectNameSymbol('a'.repeat(40))).toHaveLength(32);
+      expect(toProjectNameSymbol('™£€')).toBe('project'); // nothing usable → fallback
+      // Every output is a valid Symbol.
+      for (const name of ['Amazon Reforestation', 'x', '™£€', 'a'.repeat(99)]) {
+        expect(toProjectNameSymbol(name)).toMatch(/^[a-zA-Z0-9_]{1,32}$/);
+      }
     });
   });
 

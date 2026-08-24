@@ -1,22 +1,12 @@
-import {
-  Injectable,
-  BadRequestException,
-  UnauthorizedException,
-  Logger,
-  OnModuleDestroy,
-} from "@nestjs/common";
-import { JwtService } from "@nestjs/jwt";
-import { createClient, RedisClientType } from "@redis/client";
-import { Keypair } from "@stellar/stellar-sdk";
-import * as crypto from "crypto";
-import { StellarService } from "../stellar/stellar.service";
-import { KycService } from "./kyc.service";
-import { VerifySignatureDto } from "./dto/verify-signature.dto";
-import {
-  ChallengeResponse,
-  AuthTokenResponse,
-  UserProfileResponse,
-} from "./interfaces/auth.interface";
+import { Injectable, BadRequestException, UnauthorizedException, Logger, OnModuleDestroy } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { createClient, RedisClientType } from '@redis/client';
+import { Keypair } from '@stellar/stellar-sdk';
+import * as crypto from 'crypto';
+import { StellarService } from '../stellar/stellar.service';
+import { KycService } from './kyc.service';
+import { VerifySignatureDto } from './dto/verify-signature.dto';
+import { ChallengeResponse, AuthTokenResponse, UserProfileResponse } from './interfaces/auth.interface';
 
 @Injectable()
 export class AuthService implements OnModuleDestroy {
@@ -100,13 +90,9 @@ export class AuthService implements OnModuleDestroy {
    */
   async onModuleDestroy(): Promise<void> {
     try {
-      if (this.redis.isReady) {
+      if (this.redis.isOpen) {
         await this.redis.quit();
         this.logger.log('AuthService: Redis connection closed gracefully');
-      } else if (this.redis.isOpen) {
-        // The connection never reached the ready state (e.g. Redis was
-        // unavailable on startup); quit() would hang waiting for a reply.
-        this.redis.disconnect();
       }
     } catch (error) {
       this.logger.warn(

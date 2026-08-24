@@ -1,4 +1,4 @@
-import { ForbiddenException, Injectable, Logger, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { ForbiddenException, Injectable, Logger, OnModuleDestroy, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { createClient, RedisClientType } from '@redis/client';
 import { KycStatus } from '../common/interfaces/authenticated-request.interface';
 
@@ -217,7 +217,7 @@ export class KycCircuitBreaker {
 }
 
 @Injectable()
-export class KycService {
+export class KycService implements OnModuleDestroy {
   private readonly logger = new Logger(KycService.name);
   private redis: RedisClientType;
   private readonly provider: KycProviderClient;
@@ -421,5 +421,22 @@ export class KycService {
   private compareStatus(actual: KycStatus, required: KycStatus): boolean {
     const order = [KycStatus.NONE, KycStatus.PENDING, KycStatus.VERIFIED, KycStatus.ACCREDITED];
     return order.indexOf(actual) >= order.indexOf(required);
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('KycService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `KycService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

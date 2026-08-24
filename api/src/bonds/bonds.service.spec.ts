@@ -320,18 +320,62 @@ describe('BondsService', () => {
   });
 
   describe('sweepUndistributed arg encoding', () => {
-    it('invokes sweep_undistributed as the admin and returns swept total', async () => {
+    const ADMIN =
+      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+    const encodeReceiptVec = (opts: {
+      bondId: number;
+      destination: string;
+      amount: number;
+      carbonAmount: number;
+      biodiversityAmount: number;
+    }) =>
+      xdr.ScVal.scvVec([
+        nativeToScVal(BigInt(opts.bondId), { type: 'u64' }),
+        Address.fromString(opts.destination).toScVal(),
+        nativeToScVal(BigInt(opts.amount), { type: 'i128' }),
+        nativeToScVal(BigInt(opts.carbonAmount), { type: 'i128' }),
+        nativeToScVal(BigInt(opts.biodiversityAmount), { type: 'i128' }),
+      ]);
+
+    const encodeReceiptMap = (opts: {
+      bondId: number;
+      destination: string;
+      amount: number;
+      carbonAmount: number;
+      biodiversityAmount: number;
+    }) => {
+      const entry = (key: string, val: xdr.ScVal) =>
+        new xdr.ScMapEntry({
+          key: nativeToScVal(key, { type: 'symbol' }),
+          val,
+        });
+      return xdr.ScVal.scvMap([
+        entry('amount', nativeToScVal(BigInt(opts.amount), { type: 'i128' })),
+        entry(
+          'biodiversity_amount',
+          nativeToScVal(BigInt(opts.biodiversityAmount), { type: 'i128' }),
+        ),
+        entry('bond_id', nativeToScVal(BigInt(opts.bondId), { type: 'u64' })),
+        entry(
+          'carbon_amount',
+          nativeToScVal(BigInt(opts.carbonAmount), { type: 'i128' }),
+        ),
+        entry('destination', Address.fromString(opts.destination).toScVal()),
+      ]);
+    };
+
+    const buildSvc = async (result: xdr.ScVal) => {
       const contractService = {
         invokeContractMethod: jest.fn().mockResolvedValue({
-          result: nativeToScVal(BigInt(42), { type: 'i128' }),
+          result,
           transactionHash: '0xabc',
           successful: true,
         }),
       };
       const stellarService = {
         getKeypairFromSecret: jest.fn().mockReturnValue({
-          publicKey: () =>
-            'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+          publicKey: () => ADMIN,
         }),
       };
 
@@ -348,7 +392,23 @@ describe('BondsService', () => {
         ],
       }).compile();
 
-      const svc = moduleRef.get(BondsService);
+      return {
+        svc: moduleRef.get(BondsService),
+        contractService,
+      };
+    };
+
+    it('invokes sweep_undistributed with admin destination and decodes SweepReceipt', async () => {
+      const { svc, contractService } = await buildSvc(
+        encodeReceiptVec({
+          bondId: 3,
+          destination: ADMIN,
+          amount: 42,
+          carbonAmount: 30,
+          biodiversityAmount: 12,
+        }),
+      );
+
       const result = await svc.sweepUndistributed(3);
 
       const [contractAddress, method, callerSecret, args, nonce] =
@@ -357,13 +417,65 @@ describe('BondsService', () => {
       expect(contractAddress).toBe('');
       expect(method).toBe('sweep_undistributed');
       expect(callerSecret).toBe('');
-      expect(args.length).toBe(2);
-      expect(scValToNative(args[0])).toBe(
-        'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-      );
+      expect(args.length).toBe(3);
+      expect(scValToNative(args[0])).toBe(ADMIN);
       expect(scValToNative(args[1])).toBe(BigInt(3));
+      expect(scValToNative(args[2])).toBe(ADMIN);
       expect(nonce).toBe(0);
-      expect(result).toEqual({ bondId: 3, swept: 42, transactionHash: '0xabc' });
+      expect(result).toEqual({
+        bondId: 3,
+        destination: ADMIN,
+        amount: 42,
+        carbonAmount: 30,
+        biodiversityAmount: 12,
+        swept: 42,
+        transactionHash: '0xabc',
+      });
+    });
+
+    it('passes an explicit destination as the third argument', async () => {
+      const treasury = Keypair.random().publicKey();
+      const { svc, contractService } = await buildSvc(
+        encodeReceiptVec({
+          bondId: 3,
+          destination: treasury,
+          amount: 7,
+          carbonAmount: 7,
+          biodiversityAmount: 0,
+        }),
+      );
+
+      const result = await svc.sweepUndistributed(3, treasury);
+
+      const args = contractService.invokeContractMethod.mock.calls[0][3];
+      expect(args.length).toBe(3);
+      expect(scValToNative(args[0])).toBe(ADMIN);
+      expect(scValToNative(args[2])).toBe(treasury);
+      expect(result.destination).toBe(treasury);
+      expect(result.amount).toBe(7);
+      expect(result.swept).toBe(7);
+    });
+
+    it('decodes a named SweepReceipt struct/map', async () => {
+      const { svc } = await buildSvc(
+        encodeReceiptMap({
+          bondId: 9,
+          destination: ADMIN,
+          amount: 15,
+          carbonAmount: 10,
+          biodiversityAmount: 5,
+        }),
+      );
+
+      await expect(svc.sweepUndistributed(9)).resolves.toEqual({
+        bondId: 9,
+        destination: ADMIN,
+        amount: 15,
+        carbonAmount: 10,
+        biodiversityAmount: 5,
+        swept: 15,
+        transactionHash: '0xabc',
+      });
     });
   });
 
@@ -391,11 +503,11 @@ describe('BondsService', () => {
       return moduleRef.get(BondsService);
     };
 
-    it('maps a before-maturity Overflow to a 400 with a clear message', async () => {
+    it('maps a before-maturity NotYetMature (code 14) to a 400 with a clear message', async () => {
       const contractService = {
         invokeContractMethod: jest.fn().mockRejectedValue(
           new BadRequestException(
-            'Contract error on TEST.mature_bond (contract error code 9)',
+            'Contract error on TEST.mature_bond (contract error code 14)',
           ),
         ),
       };
@@ -425,6 +537,124 @@ describe('BondsService', () => {
         status: 400,
         message:
           'Contract error on TEST.mature_bond (contract error code 4)',
+      });
+    });
+
+    it('rethrows a genuine arithmetic Overflow (code 9) unchanged', async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockRejectedValue(
+          new BadRequestException(
+            'Contract error on TEST.mature_bond (contract error code 9)',
+          ),
+        ),
+      };
+
+      const svc = await buildModule(contractService);
+
+      await expect(svc.mature(7)).rejects.toMatchObject({
+        status: 400,
+        message: 'Contract error on TEST.mature_bond (contract error code 9)',
+      });
+    });
+  });
+
+  describe('create', () => {
+    const adminStub = () => ({
+      getKeypairFromSecret: jest.fn().mockReturnValue({
+        publicKey: () =>
+          'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      }),
+    });
+
+    const buildModule = async (contractService: any) => {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: adminStub() },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+      return moduleRef.get(BondsService);
+    };
+
+    const dto: any = {
+      projectId: '0'.repeat(64),
+      faceValue: 1000,
+      couponSchedule: [1000000, 2000000],
+      creditType: 'Carbon',
+      maturityDate: 500,
+      totalSupply: 10000,
+    };
+
+    it('maps a past-maturity-date MaturityDateInPast (code 15) to a clear 400', async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockRejectedValue(
+          new BadRequestException(
+            'Contract error on TEST.issue_bond (contract error code 15)',
+          ),
+        ),
+      };
+
+      const svc = await buildModule(contractService);
+
+      await expect(svc.create(dto)).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining(
+          'maturity date must be in the future',
+        ),
+      });
+    });
+  });
+
+  describe('transfer', () => {
+    const investorStub = () => ({
+      getKeypairFromSecret: jest.fn().mockReturnValue({
+        publicKey: () =>
+          'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      }),
+    });
+
+    const buildModule = async (contractService: any) => {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: investorStub() },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+      return moduleRef.get(BondsService);
+    };
+
+    const dto: any = {
+      fromAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      toAddress: 'GBO6AXD5GLGDR45HENK4RZMFXOTZIJYL3NWGNGWXYI3RTFNIYK32YGJQ',
+      amount: 600,
+    };
+
+    it('maps an InsufficientBalance (code 16) to a clear 400', async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockRejectedValue(
+          new BadRequestException(
+            'Contract error on TEST.transfer (contract error code 16)',
+          ),
+        ),
+      };
+
+      const svc = await buildModule(contractService);
+
+      await expect(svc.transfer(7, dto)).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('Insufficient balance on bond #7'),
       });
     });
   });
@@ -777,6 +1007,7 @@ describe('BondsService', () => {
       xdr.ScVal.scvVec([
         nativeToScVal(BigInt(7), { type: 'u64' }),
         Address.fromString(REPORT_HOLDER).toScVal(),
+        nativeToScVal(BigInt(42), { type: 'u64' }),
         xdr.ScVal.scvBytes(Buffer.alloc(32)),
         nativeToScVal(BigInt(1000), { type: 'u64' }),
         nativeToScVal(BigInt(2000), { type: 'u64' }),
@@ -989,11 +1220,12 @@ describe('BondsService', () => {
       const report = (svc as any).decodeReport([
         BigInt(9),
         REPORT_HOLDER,
+        BigInt(42),
         Buffer.alloc(32),
         BigInt(1000),
         BigInt(2000),
         BigInt(500),
-        [0],
+        ['Absent'],
         'VM0003',
         Buffer.alloc(32),
         1,

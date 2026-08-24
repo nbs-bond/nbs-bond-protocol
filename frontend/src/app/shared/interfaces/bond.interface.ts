@@ -35,6 +35,8 @@ export interface Order {
   pricePerToken: number;
   quoteAsset: QuoteAsset;
   status: 'Open' | 'PartiallyFilled' | 'Filled' | 'Cancelled' | 'Expired';
+  /** Unix timestamp in seconds (as returned by DEXRouter.Order on-chain). */
+  expiresAt: number;
   createdAt: string;
 }
 
@@ -94,6 +96,11 @@ export interface AccruedCreditsResponse {
 
 export interface SweepUndistributedResponse {
   bondId: number;
+  destination: string;
+  amount: number;
+  carbonAmount: number;
+  biodiversityAmount: number;
+  /** Alias of `amount` for clients that still read `swept`. */
   swept: number;
   transactionHash: string;
 }

@@ -1,13 +1,21 @@
 #![no_std]
 #![allow(deprecated)]
 use nbbs_project_registry::ProjectRegistryClient;
-use nbbs_shared::{BiodiversityMetrics, OracleError, ReportStatus};
+use nbbs_shared::{BiodiversityMetrics, OracleError, ProjectStatus, RegistryError, ReportStatus};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 pub const CHALLENGE_WINDOW_SECONDS: u64 = 259200;
 pub const SLASH_PENALTY_PPM: i128 = 100_000;
+
+/// Delay between an admin transfer being proposed and it becoming
+/// acceptable. Mirrors `CHALLENGE_WINDOW_SECONDS`'s role: it turns a single
+/// instant, silent admin change into a two-step, on-chain-visible one, so a
+/// compromised or mistaken key rotation is observable (via the
+/// `admin_transfer_proposed` event) and cancellable by the current admin
+/// before it can take effect.
+pub const ADMIN_TRANSFER_TIMELOCK_SECONDS: u64 = 172_800;
 
 // Persistent-storage TTL constants (in ledgers).
 // MIN_TTL  ≈  1 day   at 5-second ledger cadence (~17 280 ledgers).
@@ -24,7 +32,7 @@ pub enum DataKey {
     ProviderList,
     Report(u64),
     ReportCount,
-    ProjectReports(BytesN<32>),
+    ProjectReports(u64),
     Challenge(u64),
     ReportVerifiers(u64),
     VerificationCount(u64),
@@ -33,10 +41,26 @@ pub enum DataKey {
     Nonce(Address),
     ProviderReportCount(Address),
     ProjectRegistry,
+    ProjectRegistryNonce,
     ProviderChallenges(Address),
     SlashHistory(Address),
     LockedStake(Address),
     ReportLock(u64),
+    /// Compact half-open period windows [(start, end), ...] per project.
+    /// A single Vec<(u64, u64)> per project_id lets the overlap check run
+    /// without reading each full Report from storage.
+    ProjectReportPeriods(u64),
+    /// A proposed but not-yet-accepted admin transfer, if any (issue #206).
+    PendingAdmin,
+}
+
+/// A proposed admin rotation awaiting acceptance by `candidate` once
+/// `executable_at` has passed. See [`OracleConsumer::propose_admin_transfer`].
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PendingAdminChange {
+    pub candidate: Address,
+    pub executable_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,7 +78,11 @@ pub struct OracleProvider {
 pub struct Report {
     pub id: u64,
     pub provider: Address,
-    pub project_id: BytesN<32>,
+    /// Canonical project-registry `Project.id`.
+    pub project_id: u64,
+    /// Registry-authenticated metadata hash retained for compatibility with
+    /// bonds that currently reference projects by their metadata hash.
+    pub project_metadata_hash: BytesN<32>,
     pub period_start: u64,
     pub period_end: u64,
     pub carbon_sequestered: i128,
@@ -150,7 +178,11 @@ fn active_provider_count(env: &Env) -> u32 {
     let mut count: u32 = 0;
     for addr in providers.iter() {
         let key = DataKey::Provider(addr);
-        if let Some(p) = env.storage().persistent().get::<DataKey, OracleProvider>(&key) {
+        if let Some(p) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OracleProvider>(&key)
+        {
             if p.active {
                 count += 1;
             }
@@ -165,11 +197,7 @@ fn active_provider_count(env: &Env) -> u32 {
 /// threshold floors at 1 (the constructor default) when no providers remain.
 fn reconcile_signature_threshold(env: &Env) {
     let threshold_key = DataKey::SignatureThreshold;
-    let current: u32 = env
-        .storage()
-        .instance()
-        .get(&threshold_key)
-        .unwrap_or(1);
+    let current: u32 = env.storage().instance().get(&threshold_key).unwrap_or(1);
     let adjusted = current.min(active_provider_count(env).max(1));
     if adjusted != current {
         env.storage().instance().set(&threshold_key, &adjusted);
@@ -289,7 +317,7 @@ impl OracleConsumer {
     pub fn submit_report(
         env: Env,
         provider: Address,
-        project_id: BytesN<32>,
+        project_id: u64,
         period_start: u64,
         period_end: u64,
         carbon_sequestered: i128,
@@ -327,6 +355,39 @@ impl OracleConsumer {
             }
         }
 
+        let registry_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectRegistry)
+            .ok_or(OracleError::ProjectRegistryNotConfigured)?;
+        let registry_client = ProjectRegistryClient::new(&env, &registry_id);
+        let project = match registry_client.try_get_project_linkage(&project_id) {
+            Ok(Ok(project)) => project,
+            Err(Ok(RegistryError::ProjectNotFound)) => return Err(OracleError::ProjectNotFound),
+            _ => return Err(OracleError::ProjectRegistryCallFailed),
+        };
+        if project.status != ProjectStatus::Approved {
+            return Err(OracleError::ProjectNotApproved);
+        }
+
+        // Reject any report whose half-open [period_start, period_end)
+        // window overlaps an already-submitted report for the same project.
+        // Two half-open intervals [a, b) and [c, d) overlap iff a < d && c < b.
+        // We keep a compact Vec<(u64, u64)> per project so the check touches
+        // a single ledger entry rather than reading each full Report.
+        let periods_key = DataKey::ProjectReportPeriods(project_id);
+        let claimed: Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&periods_key)
+            .unwrap_or(vec![&env]);
+        for pair in claimed.iter() {
+            let (existing_start, existing_end) = pair;
+            if period_start < existing_end && existing_start < period_end {
+                return Err(OracleError::OverlappingReportPeriod);
+            }
+        }
+
         let count: u64 = env
             .storage()
             .instance()
@@ -341,7 +402,8 @@ impl OracleConsumer {
         let report = Report {
             id: report_id,
             provider: provider.clone(),
-            project_id: project_id.clone(),
+            project_id,
+            project_metadata_hash: project.metadata_ipfs_hash,
             period_start,
             period_end,
             carbon_sequestered,
@@ -359,7 +421,7 @@ impl OracleConsumer {
 
         lock_stake_for_report(&env, &provider, report_id, p.stake);
 
-        let proj_key = DataKey::ProjectReports(project_id.clone());
+        let proj_key = DataKey::ProjectReports(project_id);
         let mut project_reports: Vec<u64> = env
             .storage()
             .persistent()
@@ -368,6 +430,17 @@ impl OracleConsumer {
         project_reports.push_back(report_id);
         env.storage().persistent().set(&proj_key, &project_reports);
         bump_persistent(&env, &proj_key);
+
+        // Record the period in the compact overlap index.
+        let periods_key = DataKey::ProjectReportPeriods(project_id);
+        let mut periods: Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&periods_key)
+            .unwrap_or(vec![&env]);
+        periods.push_back((period_start, period_end));
+        env.storage().persistent().set(&periods_key, &periods);
+        bump_persistent(&env, &periods_key);
 
         let prc_key = DataKey::ProviderReportCount(provider.clone());
         let report_count: u64 = env.storage().persistent().get(&prc_key).unwrap_or(0);
@@ -576,7 +649,7 @@ impl OracleConsumer {
 
         let challenge_key = DataKey::Challenge(report_id);
         if env.storage().persistent().has(&challenge_key) {
-            return Err(OracleError::ProviderAlreadyExists);
+            return Err(OracleError::ChallengeAlreadyExists);
         }
 
         let challenge = Challenge {
@@ -677,18 +750,20 @@ impl OracleConsumer {
 
             if let Some(registry_id) = registry_id {
                 let registry_client = ProjectRegistryClient::new(&env, &registry_id);
-                let project_id = report.project_id;
-                // Try to revoke the project using the oracle function
-                // Get the numeric project ID from the IPFS hash
-                // Use get_project_by_hash to get the full project
-                // The client returns Project directly (panics on error)
-                let project = registry_client.get_project_by_hash(&project_id);
+                let registry_nonce: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ProjectRegistryNonce)
+                    .unwrap_or(0);
                 registry_client.revoke_project(
                     &env.current_contract_address(),
-                    &project.id,
+                    &report.project_id,
                     &String::from_str(&env, "Project revoked due to rejected oracle report"),
-                    &0,
+                    &registry_nonce,
                 );
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ProjectRegistryNonce, &(registry_nonce + 1));
             }
         }
 
@@ -731,7 +806,7 @@ impl OracleConsumer {
         val
     }
 
-    pub fn get_project_reports(env: Env, project_id: BytesN<32>) -> Vec<u64> {
+    pub fn get_project_reports(env: Env, project_id: u64) -> Vec<u64> {
         let key = DataKey::ProjectReports(project_id);
         let val = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
         if env.storage().persistent().has(&key) {
@@ -980,6 +1055,167 @@ impl OracleConsumer {
 
         Ok(())
     }
+
+    /// Configure the trusted project-registry contract used by
+    /// [`submit_report`](Self::submit_report). The registry's numeric `u64`
+    /// `Project.id` is the canonical report linkage. The registry-sourced
+    /// metadata hash and the caller-supplied evidence hash remain separate
+    /// report fields and are never accepted as project identity.
+    ///
+    /// This changes the stored `Report` and `ProjectReports` key schemas. A
+    /// deployment with existing reports must migrate or redeploy before using
+    /// this contract version. The repository's current testnet seed flow can
+    /// use a clean redeployment; no implicit conversion of old records occurs.
+    pub fn set_project_registry(
+        env: Env,
+        caller: Address,
+        registry_id: Address,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ProjectRegistry, &registry_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProjectRegistryNonce, &0u64);
+
+        env.events()
+            .publish((Symbol::new(&env, "registry_set"),), (caller, registry_id));
+
+        Ok(())
+    }
+
+    /// Begin rotating the admin key. Only the current admin may propose, and
+    /// the change only takes effect once `candidate` itself calls
+    /// [`Self::accept_admin_transfer`] after `ADMIN_TRANSFER_TIMELOCK_SECONDS`
+    /// has elapsed (issue #206).
+    ///
+    /// The two-step, timelocked design avoids two hazards a direct
+    /// `set_admin` would carry: the candidate must be able to sign to claim
+    /// the role, so a transfer can never land on a mistyped or unreachable
+    /// address; and the `admin_transfer_proposed` event plus the delay give
+    /// observers a window to notice and, via [`Self::cancel_admin_transfer`],
+    /// stop an unwanted rotation (e.g. one made under a compromised key)
+    /// before it can complete.
+    pub fn propose_admin_transfer(
+        env: Env,
+        caller: Address,
+        candidate: Address,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        let executable_at = env.ledger().timestamp() + ADMIN_TRANSFER_TIMELOCK_SECONDS;
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdminChange {
+                candidate: candidate.clone(),
+                executable_at,
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_transfer_proposed"),),
+            (caller, candidate, executable_at),
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending admin transfer before it is accepted. Admin-only, so
+    /// the current admin can undo a proposal it did not intend (or that was
+    /// made under a since-revoked key) any time before `accept_admin_transfer`
+    /// is called.
+    pub fn cancel_admin_transfer(env: Env, caller: Address, nonce: u64) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            return Err(OracleError::NoPendingAdminChange);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_transfer_cancelled"),), (caller,));
+
+        Ok(())
+    }
+
+    /// Complete a pending admin transfer. Must be called by the proposed
+    /// `candidate` itself, once the timelock has elapsed; this is the only
+    /// path by which `Admin` changes, which is what makes the contract
+    /// recoverable if the current admin key is lost or compromised: a fresh
+    /// admin key can be handed control without redeploying, by whoever the
+    /// existing admin (or, before compromise, its operators) designates.
+    pub fn accept_admin_transfer(env: Env, caller: Address, nonce: u64) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        let pending: PendingAdminChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(OracleError::NoPendingAdminChange)?;
+
+        if caller != pending.candidate {
+            return Err(OracleError::Unauthorized);
+        }
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(OracleError::TimelockNotElapsed);
+        }
+
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(OracleError::NotInitialized)?;
+
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_changed"),), (old_admin, caller));
+
+        Ok(())
+    }
+
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    pub fn get_pending_admin(env: Env) -> Option<PendingAdminChange> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
 }
 
 /// The amount of stake that would be forfeited if `stake` were slashed right now.
@@ -1077,50 +1313,198 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
     );
 }
 
-/// Set the project registry contract address (admin-only).
-pub fn set_project_registry(
-    env: Env,
-    caller: Address,
-    registry_id: Address,
-    nonce: u64,
-) -> Result<(), OracleError> {
-    caller.require_auth();
-
-    let expected_nonce = get_nonce(&env, &caller);
-    if nonce != expected_nonce {
-        return Err(OracleError::InvalidNonce);
-    }
-    set_nonce(&env, &caller, expected_nonce + 1);
-
-    require_admin(&env, &caller)?;
-
-    env.storage()
-        .instance()
-        .set(&DataKey::ProjectRegistry, &registry_id);
-
-    env.events()
-        .publish((Symbol::new(&env, "registry_set"),), (caller, registry_id));
-
-    Ok(())
-}
 #[cfg(test)]
 mod test {
     use super::*;
+    use nbbs_project_registry::{ProjectRegistry, ProjectRegistryClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         BytesN, Env, Symbol,
     };
 
-    fn create_project_id(env: &Env, value: u8) -> BytesN<32> {
-        let mut arr = [0u8; 32];
-        arr[31] = value;
-        BytesN::from_array(env, &arr)
+    fn create_project_id(_env: &Env, value: u8) -> u64 {
+        value as u64
     }
 
     fn make_ipfs_hash(env: &Env, value: u8) -> BytesN<32> {
         let mut arr = [0u8; 32];
         arr[0] = value;
         BytesN::from_array(env, &arr)
+    }
+
+    /// Deploy an oracle wired to a registry containing approved project 1.
+    /// Existing behavior tests use direct setup so configuring the dependency
+    /// does not consume the oracle admin nonce they are specifically testing.
+    fn register_oracle(env: &Env, admin: &Address) -> Address {
+        let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+        let registry = ProjectRegistryClient::new(env, &registry_id);
+        let owner = Address::generate(env);
+        let project_id = registry.register_project(
+            &owner,
+            &make_ipfs_hash(env, 200),
+            &Symbol::new(env, "Project"),
+            &Symbol::new(env, "VCS"),
+            &Symbol::new(env, "US"),
+            &0,
+        );
+        registry.approve_project(admin, &project_id, &0);
+
+        let oracle_id = env.register(OracleConsumer, (admin.clone(),));
+        registry.set_oracle_consumer(admin, &oracle_id, &1);
+        env.as_contract(&oracle_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::ProjectRegistry, &registry_id);
+        });
+        oracle_id
+    }
+
+    fn submit_args(
+        env: &Env,
+        client: &OracleConsumerClient,
+        provider: &Address,
+        project_id: u64,
+    ) -> Result<u64, OracleError> {
+        match client.try_submit_report(
+            provider,
+            &project_id,
+            &1000,
+            &2000,
+            &100_000,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(env, "verra_vcs"),
+            &make_ipfs_hash(env, 7),
+            &0,
+        ) {
+            Ok(Ok(report_id)) => Ok(report_id),
+            Err(Ok(error)) => Err(error),
+            _ => panic!("unexpected submit_report invocation failure"),
+        }
+    }
+
+    #[test]
+    fn test_submit_report_requires_configured_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let oracle_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &oracle_id);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        assert_eq!(
+            submit_args(&env, &client, &provider, 1),
+            Err(OracleError::ProjectRegistryNotConfigured)
+        );
+    }
+
+    #[test]
+    fn test_submit_report_rejects_unknown_project() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+
+        let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+        let oracle_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &oracle_id);
+        client.set_project_registry(&admin, &registry_id, &0);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &1);
+
+        assert_eq!(
+            submit_args(&env, &client, &provider, 999),
+            Err(OracleError::ProjectNotFound)
+        );
+    }
+
+    #[test]
+    fn test_submit_report_rejects_every_non_approved_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let provider = Address::generate(&env);
+
+        let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+        let registry = ProjectRegistryClient::new(&env, &registry_id);
+        let pending_id = registry.register_project(
+            &owner,
+            &make_ipfs_hash(&env, 1),
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        let rejected_id = registry.register_project(
+            &owner,
+            &make_ipfs_hash(&env, 2),
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &1,
+        );
+        registry.reject_project(&admin, &rejected_id, &0);
+        let inactive_id = registry.register_project(
+            &owner,
+            &make_ipfs_hash(&env, 3),
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &2,
+        );
+        registry.approve_project(&admin, &inactive_id, &1);
+        registry.suspend_project(
+            &admin,
+            &inactive_id,
+            &String::from_str(&env, "test suspension"),
+            &2,
+        );
+
+        let oracle_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &oracle_id);
+        client.set_project_registry(&admin, &registry_id, &0);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &1);
+
+        for project_id in [pending_id, rejected_id, inactive_id] {
+            assert_eq!(
+                submit_args(&env, &client, &provider, project_id),
+                Err(OracleError::ProjectNotApproved)
+            );
+        }
+    }
+
+    #[test]
+    fn test_submit_report_accepts_approved_project_and_separates_hashes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let metadata_hash = make_ipfs_hash(&env, 4);
+
+        let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+        let registry = ProjectRegistryClient::new(&env, &registry_id);
+        let project_id = registry.register_project(
+            &owner,
+            &metadata_hash,
+            &Symbol::new(&env, "Project"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        registry.approve_project(&admin, &project_id, &0);
+
+        let oracle_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &oracle_id);
+        client.set_project_registry(&admin, &registry_id, &0);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &1);
+
+        let report_id = submit_args(&env, &client, &provider, project_id).unwrap();
+        let report = client.get_report(&report_id);
+        assert_eq!(report.project_id, project_id);
+        assert_eq!(report.project_metadata_hash, metadata_hash);
+        assert_eq!(report.ipfs_evidence_hash, make_ipfs_hash(&env, 7));
+        assert_ne!(report.project_metadata_hash, report.ipfs_evidence_hash);
     }
 
     #[test]
@@ -1133,9 +1517,7 @@ mod test {
         let verifier = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -1185,9 +1567,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "uk_bng"), &0);
@@ -1220,9 +1600,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "uk_bng"), &0);
@@ -1243,6 +1621,237 @@ mod test {
     }
 
     #[test]
+    fn test_submit_rejects_identical_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+        assert_eq!(report_id, 1);
+
+        // A second report with the exact same period must be rejected.
+        let result = client.try_submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &50_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 2),
+            &1,
+        );
+        assert_eq!(result, Err(Ok(OracleError::OverlappingReportPeriod)));
+
+        // No new report was created, and the rejected call rolled back so the
+        // provider's nonce is unchanged.  A different, adjacent period still
+        // submits cleanly and is not blocked by the failed attempt.
+        assert_eq!(client.get_project_reports(&project_id).len(), 1);
+        let adjacent_id = client.submit_report(
+            &provider,
+            &project_id,
+            &2000u64,
+            &3000u64,
+            &60_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 3),
+            &1,
+        );
+        assert_eq!(adjacent_id, 2);
+    }
+
+    #[test]
+    fn test_submit_rejects_overlapping_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+        assert_eq!(report_id, 1);
+
+        // [1500, 2500) overlaps the existing [1000, 2000) window.
+        let result = client.try_submit_report(
+            &provider,
+            &project_id,
+            &1500u64,
+            &2500u64,
+            &50_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 2),
+            &1,
+        );
+        assert_eq!(result, Err(Ok(OracleError::OverlappingReportPeriod)));
+
+        // A window fully contained in the existing one is also rejected.
+        // The failed submission above rolls back, so the provider's nonce is
+        // unchanged and can be reused.
+        let result = client.try_submit_report(
+            &provider,
+            &project_id,
+            &1100u64,
+            &1200u64,
+            &50_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 3),
+            &1,
+        );
+        assert_eq!(result, Err(Ok(OracleError::OverlappingReportPeriod)));
+    }
+
+    #[test]
+    fn test_submit_allows_adjacent_periods() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        // First window [1000, 2000).
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+        assert_eq!(report_id, 1);
+
+        // Touching at the boundary [2000, 3000) does not overlap a half-open
+        // interval and must be accepted.
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &2000u64,
+            &3000u64,
+            &120_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 2),
+            &1,
+        );
+        assert_eq!(report_id, 2);
+
+        assert_eq!(client.get_project_reports(&project_id).len(), 2);
+    }
+
+    #[test]
+    fn test_submit_same_period_different_project_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_a = create_project_id(&env, 1);
+        let project_b = create_project_id(&env, 2);
+
+        let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+        let registry = ProjectRegistryClient::new(&env, &registry_id);
+        let owner = Address::generate(&env);
+        let pa = registry.register_project(
+            &owner,
+            &make_ipfs_hash(&env, 10),
+            &Symbol::new(&env, "ProjectA"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        registry.approve_project(&admin, &pa, &0);
+        let pb = registry.register_project(
+            &owner,
+            &make_ipfs_hash(&env, 11),
+            &Symbol::new(&env, "ProjectB"),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &1,
+        );
+        registry.approve_project(&admin, &pb, &1);
+
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+        client.set_project_registry(&admin, &registry_id, &0);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &1);
+
+        let report_a = client.submit_report(
+            &provider,
+            &project_a,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+        assert_eq!(report_a, 1);
+
+        // The same window is fine for a different project.
+        let report_b = client.submit_report(
+            &provider,
+            &project_b,
+            &1000u64,
+            &2000u64,
+            &80_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 2),
+            &1,
+        );
+        assert_eq!(report_b, 2);
+    }
+
+    #[test]
     fn test_submit_challenge_and_resolve() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1252,9 +1861,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1292,6 +1899,60 @@ mod test {
     }
 
     #[test]
+    fn test_challenge_already_exists_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        // A Challenge record can only ever appear in storage alongside a
+        // report status flip to `Challenged` (see `challenge_report`), so this
+        // combination — a stored Challenge with the report still `Pending` —
+        // cannot arise through the public API. It is constructed directly here
+        // to exercise the defensive duplicate-challenge guard on its own
+        // terms: `challenge_report` must still refuse to overwrite an existing
+        // `Challenge` entry with `ChallengeAlreadyExists`, not the unrelated
+        // `ProviderAlreadyExists`.
+        env.as_contract(&contract_id, || {
+            let stale_challenge = Challenge {
+                report_id,
+                challenger: challenger.clone(),
+                counter_evidence_hash: make_ipfs_hash(&env, 9),
+                submitted_at: 0,
+                resolved: false,
+                resolution: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Challenge(report_id), &stale_challenge);
+        });
+
+        let result =
+            client.try_challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        assert_eq!(result, Err(Ok(OracleError::ChallengeAlreadyExists)));
+    }
+
+    #[test]
     fn test_provider_cannot_challenge_own_report() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1300,9 +1961,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -1344,9 +2003,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -1383,9 +2040,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -1420,9 +2075,7 @@ mod test {
         let rogue = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_submit_report(
@@ -1447,9 +2100,7 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1469,9 +2120,7 @@ mod test {
         let verifier = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1506,9 +2155,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1543,9 +2190,7 @@ mod test {
         let stranger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1579,9 +2224,7 @@ mod test {
         let provider_b = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1614,9 +2257,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1646,9 +2287,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1683,9 +2322,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1720,9 +2357,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1757,9 +2392,7 @@ mod test {
 
         let admin = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_get_report(&999);
@@ -1774,9 +2407,7 @@ mod test {
         let admin = Address::generate(&env);
         let stranger = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_get_provider(&stranger);
@@ -1793,9 +2424,7 @@ mod test {
         let provider_b = Address::generate(&env);
         let provider_c = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1822,12 +2451,7 @@ mod test {
         let provider_a = Address::generate(&env);
         let provider_b = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
-        token_client.mint(&provider, &100_000);
-
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1853,7 +2477,7 @@ mod test {
         let admin = Address::generate(&env);
         let provider_a = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1877,9 +2501,7 @@ mod test {
 
         let admin = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         // With no active providers even a threshold of 1 exceeds the eligible
@@ -1898,9 +2520,7 @@ mod test {
         let provider_b = Address::generate(&env);
         let provider_c = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1934,9 +2554,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -1979,7 +2597,7 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2003,7 +2621,7 @@ mod test {
         let admin = Address::generate(&env);
         let rogue = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_add_stake(&rogue, &1_000i128, &0);
@@ -2018,7 +2636,7 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2036,7 +2654,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2077,7 +2695,7 @@ mod test {
         let verifier = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2116,7 +2734,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2160,7 +2778,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2202,7 +2820,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2242,9 +2860,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2282,9 +2898,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2322,9 +2936,7 @@ mod test {
         let challenger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2391,9 +3003,7 @@ mod test {
         let admin = Address::generate(&env);
         let provider = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2418,9 +3028,7 @@ mod test {
         let admin = Address::generate(&env);
         let stranger = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let result = client.try_get_provider_stats(&stranger);
@@ -2432,7 +3040,7 @@ mod test {
         client: &OracleConsumerClient<'static>,
         admin: &Address,
         provider: &Address,
-        project_id: &BytesN<32>,
+        project_id: &u64,
         provider_nonce: u64,
         admin_nonce: u64,
     ) -> u64 {
@@ -2466,9 +3074,7 @@ mod test {
         let provider_c = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2518,9 +3124,7 @@ mod test {
         let provider_c = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2562,9 +3166,7 @@ mod test {
         let provider_a = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let report_id =
@@ -2589,9 +3191,7 @@ mod test {
         let provider_c = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2638,7 +3238,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2676,7 +3276,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2708,7 +3308,7 @@ mod test {
         let stranger = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2740,7 +3340,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2776,7 +3376,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
@@ -2810,9 +3410,7 @@ mod test {
         let admin = Address::generate(&env);
         let project_id = create_project_id(&env, 42);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         let reports = client.get_project_reports(&project_id);
@@ -2882,9 +3480,7 @@ mod test {
                 let challenger = Address::generate(&env);
                 let project_id = create_project_id(&env, 1);
 
-                let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+                let contract_id = register_oracle(&env, &admin);
                 let client = OracleConsumerClient::new(&env, &contract_id);
 
                 client.register_provider(
@@ -2938,9 +3534,7 @@ mod test {
 
                 let admin = Address::generate(&env);
                 let provider = Address::generate(&env);
-                let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+                let contract_id = register_oracle(&env, &admin);
                 let client = OracleConsumerClient::new(&env, &contract_id);
 
                 client.register_provider(
@@ -2989,9 +3583,7 @@ mod test {
         let provider = Address::generate(&env);
         let project_id = create_project_id(&env, 1);
 
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
+        let contract_id = register_oracle(&env, &admin);
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         env.ledger().set_timestamp(1_000_000);
@@ -3032,5 +3624,156 @@ mod test {
             assert_eq!(r.id, id);
             assert_eq!(r.project_id, project_id);
         }
+    }
+
+    // ── Admin rotation / recovery (issue #206) ───────────────────────────────
+
+    #[test]
+    fn test_admin_transfer_propose_accept_rotates_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+
+        let pending = client.get_pending_admin().expect("pending admin change");
+        assert_eq!(pending.candidate, new_admin);
+        assert_eq!(
+            pending.executable_at,
+            1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS
+        );
+        // Not rotated yet.
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS);
+        client.accept_admin_transfer(&new_admin, &0);
+
+        assert_eq!(client.get_admin(), Some(new_admin.clone()));
+        assert_eq!(client.get_pending_admin(), None);
+
+        // The old admin has lost admin rights ...
+        let result = client.try_set_project_registry(&admin, &Address::generate(&env), &1);
+        assert_eq!(result, Err(Ok(OracleError::Unauthorized)));
+
+        // ... and the new admin can act immediately (nonce 1: its 0 was
+        // spent on `accept_admin_transfer`).
+        client.set_project_registry(&new_admin, &Address::generate(&env), &1);
+    }
+
+    #[test]
+    fn test_accept_admin_transfer_before_timelock_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+
+        // One second short of the timelock.
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS - 1);
+        let result = client.try_accept_admin_transfer(&new_admin, &0);
+        assert_eq!(result, Err(Ok(OracleError::TimelockNotElapsed)));
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_accept_admin_transfer_wrong_candidate_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS);
+
+        let result = client.try_accept_admin_transfer(&impostor, &0);
+        assert_eq!(result, Err(Ok(OracleError::Unauthorized)));
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_propose_admin_transfer_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let candidate = Address::generate(&env);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        let result = client.try_propose_admin_transfer(&attacker, &candidate, &0);
+        assert_eq!(result, Err(Ok(OracleError::Unauthorized)));
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_clears_pending() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+        client.cancel_admin_transfer(&admin, &1);
+        assert_eq!(client.get_pending_admin(), None);
+
+        env.ledger()
+            .set_timestamp(1_000_000 + ADMIN_TRANSFER_TIMELOCK_SECONDS);
+        let result = client.try_accept_admin_transfer(&new_admin, &0);
+        assert_eq!(result, Err(Ok(OracleError::NoPendingAdminChange)));
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.propose_admin_transfer(&admin, &new_admin, &0);
+        let result = client.try_cancel_admin_transfer(&attacker, &0);
+        assert_eq!(result, Err(Ok(OracleError::Unauthorized)));
+        assert!(client.get_pending_admin().is_some());
+    }
+
+    #[test]
+    fn test_accept_admin_transfer_without_proposal_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let candidate = Address::generate(&env);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        let result = client.try_accept_admin_transfer(&candidate, &0);
+        assert_eq!(result, Err(Ok(OracleError::NoPendingAdminChange)));
     }
 }

@@ -39,6 +39,9 @@ pub enum DataKey {
     /// multiple batches.  Cleared (removed) once the period is fully settled
     /// and `PeriodInfo.distributed` is set to `true`.
     BatchState(u64, u32),
+    /// `(total_subscribed_snapshot, processed_balance_so_far)` for a batched
+    /// distribution. Kept separate from `BatchState` to preserve its layout.
+    DistributionBalance(u64, u32),
     /// Per-holder flag set after a holder has received their credit
     /// allocation for a given period.  Consulted at the start of each batch
     /// item so a holder that already appeared in a previous batch is
@@ -275,6 +278,9 @@ impl CouponEngine {
 
         // ── Batch state: initialise on first call, resume on subsequent ──────
         let batch_key = DataKey::BatchState(bond_id, period_index);
+        let balance_key = DataKey::DistributionBalance(bond_id, period_index);
+        let total_subscribed: i128;
+        let mut processed_balance: i128;
         let mut state: BatchState = match env.storage().persistent().get(&batch_key) {
             Some(s) => {
                 // Subsequent batch: verify that the same report is being used.
@@ -282,6 +288,13 @@ impl CouponEngine {
                 if s.report_id != report_id {
                     return Err(CouponEngineError::InvalidReport);
                 }
+                let balance_state: (i128, i128) = env
+                    .storage()
+                    .persistent()
+                    .get(&balance_key)
+                    .ok_or(CouponEngineError::AccountingMismatch)?;
+                total_subscribed = balance_state.0;
+                processed_balance = balance_state.1;
                 s
             }
             None => {
@@ -301,7 +314,7 @@ impl CouponEngine {
                 if report.status != ReportStatus::Verified {
                     return Err(CouponEngineError::ReportNotVerified);
                 }
-                if report.project_id != project_id {
+                if report.project_metadata_hash != project_id {
                     return Err(CouponEngineError::BondNotFound);
                 }
 
@@ -311,7 +324,7 @@ impl CouponEngine {
                     .get(&DataKey::BondIssuerAddress)
                     .expect("bond issuer not set");
 
-                let total_subscribed: i128 = env.invoke_contract(
+                total_subscribed = env.invoke_contract(
                     &bond_issuer,
                     &Symbol::new(&env, "total_subscribed"),
                     vec![&env, bond_id.into_val(&env)],
@@ -371,6 +384,10 @@ impl CouponEngine {
                 // Store immediately so it is visible to the loop below even
                 // if the first batch is also the final batch.
                 env.storage().persistent().set(&batch_key, &s);
+                env.storage()
+                    .persistent()
+                    .set(&balance_key, &(total_subscribed, 0i128));
+                processed_balance = 0;
                 s
             }
         };
@@ -389,6 +406,13 @@ impl CouponEngine {
             }
 
             if balance > 0 {
+                processed_balance = processed_balance
+                    .checked_add(balance)
+                    .ok_or(CouponEngineError::Overflow)?;
+                if processed_balance > total_subscribed {
+                    return Err(CouponEngineError::AccountingMismatch);
+                }
+
                 match credit_type {
                     CreditType::Carbon | CreditType::BlueCarbon => {
                         let holder_credits = state.credits_per_token * balance / FIXED_POINT;
@@ -489,9 +513,16 @@ impl CouponEngine {
             .ok_or(CouponEngineError::Overflow)?;
         state.holder_count_so_far += holder_count;
         env.storage().persistent().set(&batch_key, &state);
+        env.storage()
+            .persistent()
+            .set(&balance_key, &(total_subscribed, processed_balance));
 
         // ── Finalise if this is the last batch ───────────────────────────────
         if is_final_batch {
+            if processed_balance != total_subscribed {
+                return Err(CouponEngineError::AccountingMismatch);
+            }
+
             // Re-fetch the report for timestamps (already validated above).
             let oracle_consumer: Address = env
                 .storage()
@@ -505,19 +536,22 @@ impl CouponEngine {
             );
 
             let total_distributed = state.distributed_so_far;
-            let undistributed = state.total_credits.saturating_sub(total_distributed);
+            let undistributed = state
+                .total_credits
+                .checked_sub(total_distributed)
+                .ok_or(CouponEngineError::AccountingMismatch)?;
 
             // Per-type remainders, derived from the same totals/accumulators
             // rather than re-derived from the per-token rate, so they can't
             // drift from the combined figure by a different rounding path.
             let carbon_undistributed = state
                 .carbon_total
-                .saturating_sub(state.carbon_distributed_so_far)
-                .max(0);
+                .checked_sub(state.carbon_distributed_so_far)
+                .ok_or(CouponEngineError::AccountingMismatch)?;
             let biodiversity_undistributed = state
                 .biodiversity_total
-                .saturating_sub(state.bio_distributed_so_far)
-                .max(0);
+                .checked_sub(state.bio_distributed_so_far)
+                .ok_or(CouponEngineError::AccountingMismatch)?;
 
             let period_info = PeriodInfo {
                 period_index,
@@ -573,6 +607,7 @@ impl CouponEngine {
 
             // Clean up the transient BatchState now that the period is closed.
             env.storage().persistent().remove(&batch_key);
+            env.storage().persistent().remove(&balance_key);
 
             env.events().publish(
                 (Symbol::new(&env, "coupon_distributed"),),
@@ -625,7 +660,11 @@ impl CouponEngine {
         };
         env.storage()
             .persistent()
-            .get(&DataKey::AccruedCreditsByType(bond_id, holder, storage_type))
+            .get(&DataKey::AccruedCreditsByType(
+                bond_id,
+                holder,
+                storage_type,
+            ))
             .unwrap_or(0)
     }
 
@@ -1115,6 +1154,7 @@ mod test {
         let pid = registry.register_project(
             &user,
             &hash,
+            &Symbol::new(env, "Project"),
             &Symbol::new(env, "VCS"),
             &Symbol::new(env, "US"),
             &0,
@@ -1169,6 +1209,12 @@ mod test {
         let issuer_id = env.register(nbbs_bond_issuer::BondIssuer, (issuer_admin.clone(),));
         let oracle_id = env.register(nbbs_oracle_consumer::OracleConsumer, (admin.clone(),));
         let registry_id = env.register(nbbs_project_registry::ProjectRegistry, (admin.clone(),));
+        env.as_contract(&oracle_id, || {
+            env.storage().instance().set(
+                &nbbs_oracle_consumer::DataKey::ProjectRegistry,
+                &registry_id,
+            );
+        });
         let ce_id = env.register(
             CouponEngine,
             (
@@ -1221,6 +1267,14 @@ mod test {
         bond_id
     }
 
+    /// Derive a disjoint half-open reporting window from `admin_nonce`, which
+    /// strictly increases across submissions within a test, so multiple reports
+    /// for the same project never overlap.
+    fn period_for_nonce(admin_nonce: u64) -> (u64, u64) {
+        let period_start = 1000u64 + admin_nonce * 100;
+        (period_start, period_start + 100)
+    }
+
     fn submit_verified_report(
         env: &Env,
         t: &TestEnv,
@@ -1230,18 +1284,16 @@ mod test {
         admin_nonce: u64,
     ) -> u64 {
         let oc = nbbs_oracle_consumer::OracleConsumerClient::new(env, &t.oracle_id);
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &t.registry_id);
+        let registry_project_id = registry.get_project_by_hash(project_id).id;
         let provider = Address::generate(env);
-        oc.register_provider(
-            &t.admin,
-            &provider,
-            &Symbol::new(env, "verra_vcs"),
-            &admin_nonce,
-        );
+        oc.register_provider(&t.admin, &provider, &Symbol::new(env, "verra_vcs"), &admin_nonce);
+        let (period_start, period_end) = period_for_nonce(admin_nonce);
         let report_id = oc.submit_report(
             &provider,
-            project_id,
-            &1000u64,
-            &2000u64,
+            &registry_project_id,
+            &period_start,
+            &period_end,
             &carbon,
             &biodiversity,
             &Symbol::new(env, "verra_vcs"),
@@ -1250,7 +1302,12 @@ mod test {
         );
         // Admins cannot count toward the provider threshold; verified reports
         // in tests go through the explicit auditable override path.
-        oc.admin_override_report(&t.admin, &report_id, &ReportStatus::Verified, &(admin_nonce + 1));
+        oc.admin_override_report(
+            &t.admin,
+            &report_id,
+            &ReportStatus::Verified,
+            &(admin_nonce + 1),
+        );
         report_id
     }
 
@@ -1263,18 +1320,16 @@ mod test {
         admin_nonce: u64,
     ) -> u64 {
         let oc = nbbs_oracle_consumer::OracleConsumerClient::new(env, &t.oracle_id);
+        let registry = nbbs_project_registry::ProjectRegistryClient::new(env, &t.registry_id);
+        let registry_project_id = registry.get_project_by_hash(project_id).id;
         let provider = Address::generate(env);
-        oc.register_provider(
-            &t.admin,
-            &provider,
-            &Symbol::new(env, "verra_vcs"),
-            &admin_nonce,
-        );
+        oc.register_provider(&t.admin, &provider, &Symbol::new(env, "verra_vcs"), &admin_nonce);
+        let (period_start, period_end) = period_for_nonce(admin_nonce);
         oc.submit_report(
             &provider,
-            project_id,
-            &1000u64,
-            &2000u64,
+            &registry_project_id,
+            &period_start,
+            &period_end,
             &carbon,
             &biodiversity,
             &Symbol::new(env, "verra_vcs"),
@@ -1366,6 +1421,7 @@ mod test {
         registry.register_project(
             &user,
             &project_id,
+            &Symbol::new(&t._env, "Project"),
             &Symbol::new(&t._env, "VCS"),
             &Symbol::new(&t._env, "US"),
             &0,
@@ -1545,11 +1601,9 @@ mod test {
         assert_eq!(by_type_blue, 100);
 
         // Carbon lookup resolves to the same shared bucket.
-        let by_type_carbon = t.client.accrued_credits_by_type(
-            &bond_id,
-            &holder,
-            &nbbs_shared::CreditType::Carbon,
-        );
+        let by_type_carbon =
+            t.client
+                .accrued_credits_by_type(&bond_id, &holder, &nbbs_shared::CreditType::Carbon);
         assert_eq!(by_type_carbon, 100);
     }
 
@@ -1972,14 +2026,14 @@ mod test {
 
         let result = t
             .client
-            .distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
+            .try_distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1, &true);
 
-        assert_eq!(result.total_credits, 0);
-        assert_eq!(result.holder_count, 0);
-        assert!(result.credits_per_token >= 0);
-
-        let period_info = t.client.get_period_info(&bond_id, &0);
-        assert!(period_info.distributed);
+        assert_eq!(result, Err(Ok(CouponEngineError::AccountingMismatch)));
+        assert_eq!(t.client.accrued_credits(&bond_id, &holder), 0);
+        assert_eq!(
+            t.client.try_get_period_info(&bond_id, &0),
+            Err(Ok(CouponEngineError::PeriodNotFound))
+        );
     }
 
     #[test]
@@ -2564,6 +2618,73 @@ mod test {
     }
 
     // ── Batch-distribution unit tests ────────────────────────────────────────
+
+    #[test]
+    fn test_cumulative_supplied_balance_above_total_subscribed_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let t = deploy(env, admin);
+        let project_id = setup_project(&t._env, &t, 9);
+        let holder_a = Address::generate(&t._env);
+        let holder_b = Address::generate(&t._env);
+        let bond_id = issue_and_subscribe(&t._env, &t, &project_id, &holder_a, 6_000);
+        let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
+        issuer.subscribe(&holder_b, &bond_id, &4_000, &0);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+        let report_id = submit_verified_report(
+            &t._env,
+            &t,
+            &project_id,
+            100_000,
+            BiodiversityMetrics::Absent,
+            0,
+        );
+
+        let first_batch = vec![&t._env, (holder_a.clone(), 6_000i128)];
+        t.client.distribute_coupon(
+            &t.admin,
+            &bond_id,
+            &0,
+            &first_batch,
+            &report_id,
+            &1,
+            &false,
+        );
+
+        // The second supplied balance is inflated: 6_000 + 5_000 > 10_000.
+        let inflated_final_batch = vec![&t._env, (holder_b.clone(), 5_000i128)];
+        let result = t.client.try_distribute_coupon(
+            &t.admin,
+            &bond_id,
+            &0,
+            &inflated_final_batch,
+            &report_id,
+            &2,
+            &true,
+        );
+
+        assert_eq!(result, Err(Ok(CouponEngineError::AccountingMismatch)));
+        assert_eq!(t.client.accrued_credits(&bond_id, &holder_b), 0);
+        assert_eq!(
+            t.client.try_get_period_info(&bond_id, &0),
+            Err(Ok(CouponEngineError::PeriodNotFound))
+        );
+
+        // The failed call is atomic; retrying the same nonce with the real
+        // remaining balance completes the legitimate batched distribution.
+        let valid_final_batch = vec![&t._env, (holder_b, 4_000i128)];
+        let final_result = t.client.distribute_coupon(
+            &t.admin,
+            &bond_id,
+            &0,
+            &valid_final_batch,
+            &report_id,
+            &2,
+            &true,
+        );
+        assert_eq!(final_result.total_credits, 100);
+    }
 
     #[test]
     fn test_batch_two_non_overlapping_batches_distribute_all_holders() {

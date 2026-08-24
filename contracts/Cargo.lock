@@ -1061,6 +1061,7 @@ dependencies = [
 name = "nbbs-oracle-consumer"
 version = "0.1.0"
 dependencies = [
+ "nbbs-project-registry",
  "nbbs-shared",
  "proptest",
  "soroban-sdk",

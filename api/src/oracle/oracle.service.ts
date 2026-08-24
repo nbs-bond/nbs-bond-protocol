@@ -5,6 +5,8 @@ import {
   ForbiddenException,
   HttpException,
   HttpStatus,
+  Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { toBytes32 } from '../stellar/bytes32';
@@ -37,10 +39,14 @@ const ORACLE_ERROR_CODE = {
   InvalidNonce: 3,
   ProviderNotFound: 4,
   ProviderAlreadyExists: 5,
+  // Added to replace the previous overloaded use of `ProviderAlreadyExists`
+  // (= 5) for a duplicate `challenge_report` call on the same report (#114).
+  ChallengeAlreadyExists: 20,
 };
 
 @Injectable()
-export class OracleService {
+export class OracleService implements OnModuleDestroy {
+  private readonly logger = new Logger(OracleService.name);
   private redis: RedisClientType;
   private readonly localChallengeAttempts = new Map<string, { count: number; expiresAt: number }>();
   private static readonly CHALLENGE_LIMIT = 3;
@@ -130,6 +136,27 @@ export class OracleService {
     return reports;
   }
 
+  /**
+   * Whether a non-rejected report already exists for this provider and exact
+   * period. Used by the scheduler to skip duplicate on-chain submissions so a
+   * re-run within the same period never creates a second report.
+   */
+  async hasReportForPeriod(
+    projectId: string,
+    providerAddress: string,
+    periodStart: number,
+    periodEnd: number,
+  ): Promise<boolean> {
+    const reports = await this.getProjectReports(projectId);
+    return reports.some(
+      (report) =>
+        report.providerAddress === providerAddress &&
+        report.periodStart === periodStart &&
+        report.periodEnd === periodEnd &&
+        report.status !== ReportStatus.Rejected,
+    );
+  }
+
   async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: string): Promise<ChallengeResponse> {
     if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(dto.counterEvidenceHash)) {
       throw new BadRequestException(
@@ -156,15 +183,19 @@ export class OracleService {
     await this.enforceChallengeRateLimit(challengerAddress);
     const nonce = await this.nonceService.next(ORACLE_CONSUMER(), challengerAddress);
 
-    await this.contractService.invokeContractMethod(
-      ORACLE_CONSUMER(), 'challenge_report', investorSecret,
-      [
-        Address.fromString(challengerAddress).toScVal(),
-        nativeToScVal(BigInt(reportId), { type: 'u64' }),
-        toBytes32(dto.counterEvidenceHash),
-      ],
-      nonce,
-    );
+    try {
+      await this.contractService.invokeContractMethod(
+        ORACLE_CONSUMER(), 'challenge_report', investorSecret,
+        [
+          Address.fromString(challengerAddress).toScVal(),
+          nativeToScVal(BigInt(reportId), { type: 'u64' }),
+          toBytes32(dto.counterEvidenceHash),
+        ],
+        nonce,
+      );
+    } catch (error) {
+      throw this.mapChallengeError(error, reportId);
+    }
 
     return {
       reportId,
@@ -354,20 +385,30 @@ export class OracleService {
     return undefined;
   }
 
+  /**
+   * Decodes an OracleConsumer `Report` struct. Field order matches the
+   * contract declaration: `id, provider, project_id, project_metadata_hash,
+   * period_start, period_end, carbon_sequestered, biodiversity, methodology,
+   * ipfs_evidence_hash, status, submitted_at, verified_at`. `project_id`
+   * (index 2) is the registry's numeric id and is not surfaced here;
+   * `projectId` below is the metadata hash (index 3), kept for
+   * compatibility with existing API consumers. `biodiversity` (index 7) is
+   * skipped by position when building the response.
+   */
   private decodeReport(data: any[]): ReportResponse {
     return {
       id: Number(data[0]),
       providerAddress: data[1] as string,
-      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
-      periodStart: Number(data[3]),
-      periodEnd: Number(data[4]),
-      carbonSequestered: Number(data[5]),
-      methodology: data[6] as string,
-      ipfsHash: Buffer.from(data[7] as Uint8Array).toString('hex'),
-      status: this.reportStatusFromIndex(Number(data[8])),
-      createdAt: new Date(Number(data[9]) * 1000).toISOString(),
-      verifiedAt: Number(data[10]) > 0
-        ? new Date(Number(data[10]) * 1000).toISOString()
+      projectId: Buffer.from(data[3] as Uint8Array).toString('hex'),
+      periodStart: Number(data[4]),
+      periodEnd: Number(data[5]),
+      carbonSequestered: Number(data[6]),
+      methodology: data[8] as string,
+      ipfsHash: Buffer.from(data[9] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[10])),
+      createdAt: new Date(Number(data[11]) * 1000).toISOString(),
+      verifiedAt: Number(data[12]) > 0
+        ? new Date(Number(data[12]) * 1000).toISOString()
         : undefined,
     };
   }
@@ -424,6 +465,24 @@ export class OracleService {
     return new BadRequestException('Failed to register oracle provider');
   }
 
+  private mapChallengeError(error: unknown, reportId: number): Error {
+    if (error instanceof ConflictException) {
+      return error;
+    }
+    if (error instanceof HttpException) {
+      if (this.contractErrorCode(error.message) === ORACLE_ERROR_CODE.ChallengeAlreadyExists) {
+        return new ConflictException(
+          `Report #${reportId} already has a challenge on file`,
+        );
+      }
+      return error;
+    }
+    if (error instanceof Error) {
+      return new BadRequestException(error.message);
+    }
+    return new BadRequestException('Failed to challenge report');
+  }
+
   private contractErrorCode(message: string): number | undefined {
     const match = message.match(/error code (\d+)/);
     return match ? Number(match[1]) : undefined;
@@ -462,6 +521,23 @@ export class OracleService {
       throw new HttpException(
         'Challenge limit exceeded: maximum 3 challenges per wallet per 24 hours',
         HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('OracleService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `OracleService: error closing Redis connection: ${error?.message ?? error}`,
       );
     }
   }
