@@ -803,11 +803,16 @@ mod integration {
                 &0,
             );
 
+            contracts.oc_client.deposit_challenge_bond(
+                &challenger,
+                &nbbs_oracle_consumer::CHALLENGE_BOND,
+                &0,
+            );
             contracts.oc_client.challenge_report(
                 &challenger,
                 &report_id,
                 &make_ipfs_hash(&env, 2),
-                &0,
+                &1,
             );
 
             let report = contracts.oc_client.get_report(&report_id);
@@ -944,11 +949,16 @@ mod integration {
                 &1,
             );
 
+            contracts.oc_client.deposit_challenge_bond(
+                &challenger,
+                &nbbs_oracle_consumer::CHALLENGE_BOND,
+                &0,
+            );
             contracts.oc_client.challenge_report(
                 &challenger,
                 &report_id,
                 &make_ipfs_hash(&env, 2),
-                &0,
+                &1,
             );
 
             contracts
@@ -1711,11 +1721,12 @@ mod integration {
                     &make_ipfs_hash(&env, 1),
                     &1,
                 );
+                contracts.oc_client.deposit_challenge_bond(&challenger, &nbbs_oracle_consumer::CHALLENGE_BOND, &0);
                 contracts.oc_client.challenge_report(
                     &challenger,
                     &report_id,
                     &make_ipfs_hash(&env, 2),
-                    &0,
+                    &1,
                 );
                 contracts.oc_client.resolve_challenge(
                     &admin,

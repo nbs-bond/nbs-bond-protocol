@@ -83,6 +83,18 @@ pub enum OracleError {
     /// `accept_admin_transfer` was called before the proposal's timelock
     /// elapsed.
     TimelockNotElapsed = 22,
+    /// `challenge_report` was called by an address whose deposited challenge
+    /// bond balance is below the required `CHALLENGE_BOND`. Challenges must
+    /// be economically backed so they cannot be used for costless griefing
+    /// (issue #186).
+    InsufficientChallengeBond = 23,
+    /// A verifier tried to vote on a challenged report they had already voted
+    /// on (a verifier gets exactly one vote, whichever way it was cast).
+    AlreadyVoted = 24,
+    /// `expire_stale_challenge` was called before the challenge timeout had
+    /// elapsed; challenges may only be expired once resolution has stalled
+    /// past `CHALLENGE_TIMEOUT_SECONDS`.
+    ChallengeNotStale = 25,
 }
 
 #[derive(Clone, Debug, PartialEq)]

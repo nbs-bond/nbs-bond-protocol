@@ -9,6 +9,22 @@ use soroban_sdk::{
 pub const CHALLENGE_WINDOW_SECONDS: u64 = 259200;
 pub const SLASH_PENALTY_PPM: i128 = 100_000;
 
+/// Stake a challenger must have deposited — and locks per challenge — before
+/// `challenge_report` will flip a report to `Challenged`.
+///
+/// Unbonded challenges were a costless griefing/censorship vector (issue
+/// #186): anyone could stall any report's verification indefinitely with a
+/// single signature, since only the admin could clear a challenge. A bond
+/// that is forfeited when the report stands makes attacks expensive.
+pub const CHALLENGE_BOND: i128 = 1_000_000;
+
+/// An unresolved challenge older than this may be expired by anyone via
+/// `expire_stale_challenge`, returning the report to `Pending` so ordinary
+/// verifier consensus can proceed. This bounds how long a challenger (or an
+/// absent admin) can keep a report stuck in `Challenged` — liveness must not
+/// depend on a single admin key acting in time.
+pub const CHALLENGE_TIMEOUT_SECONDS: u64 = 2_592_000;
+
 /// Delay between an admin transfer being proposed and it becoming
 /// acceptable. Mirrors `CHALLENGE_WINDOW_SECONDS`'s role: it turns a single
 /// instant, silent admin change into a two-step, on-chain-visible one, so a
@@ -45,6 +61,18 @@ pub enum DataKey {
     SlashHistory(Address),
     LockedStake(Address),
     ReportLock(u64),
+    /// A challenger's deposited, currently-unlocked bond balance
+    /// (issue #186). Challenges draw from this balance; settled bonds are
+    /// either refunded into it or burned.
+    ChallengeBondBalance(Address),
+    /// Aggregate bond a challenger has locked across their unresolved
+    /// challenges. Locked bonds cannot be withdrawn.
+    ChallengeBondLock(Address),
+    /// Active providers (other than the report's submitter) that voted to
+    /// uphold a challenged report, i.e. resolve it as `Verified`.
+    ChallengeUpholdVotes(u64),
+    /// Active providers that voted to reject a challenged report.
+    ChallengeRejectVotes(u64),
     /// Compact half-open period windows [(start, end), ...] per project.
     /// A single Vec<(u64, u64)> per project_id lets the overlap check run
     /// without reading each full Report from storage.
@@ -102,6 +130,10 @@ pub struct Challenge {
     pub submitted_at: u64,
     pub resolved: bool,
     pub resolution: u32,
+    /// Bond locked by the challenger when the challenge was filed
+    /// (issue #186). Forfeited if the report is upheld, refunded if the
+    /// report is rejected or the challenge expires unanswered.
+    pub bond: i128,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -498,8 +530,18 @@ impl OracleConsumer {
         }
 
         let challenge_key = DataKey::Challenge(report_id);
-        if env.storage().persistent().has(&challenge_key) {
-            return Err(OracleError::ReportAlreadyVerified);
+        // An open challenge blocks consensus verification. A *resolved*
+        // challenge does not: an expired-then-reopened report must still be
+        // verifiable, otherwise a single abandoned challenge would stall the
+        // report forever even after `expire_stale_challenge`.
+        if let Some(challenge) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Challenge>(&challenge_key)
+        {
+            if !challenge.resolved {
+                return Err(OracleError::ReportAlreadyVerified);
+            }
         }
 
         if caller == report.provider {
@@ -650,6 +692,12 @@ impl OracleConsumer {
             return Err(OracleError::ChallengeAlreadyExists);
         }
 
+        // Economic gate (issue #186): the challenger must have a deposited
+        // bond, which is locked here and forfeited if the report is upheld.
+        // Charged last so validation failures never trap a challenger's
+        // funds.
+        let bond = charge_challenge_bond(&env, &challenger)?;
+
         let challenge = Challenge {
             report_id,
             challenger: challenger.clone(),
@@ -657,6 +705,7 @@ impl OracleConsumer {
             submitted_at: now,
             resolved: false,
             resolution: 0,
+            bond,
         };
         env.storage().persistent().set(&challenge_key, &challenge);
         bump_persistent(&env, &challenge_key);
@@ -707,21 +756,151 @@ impl OracleConsumer {
             return Err(OracleError::InvalidResolution);
         }
 
+        finalize_challenge(&env, report_id, resolution)
+    }
+
+    /// Cast a verifier's vote on an open challenge.
+    ///
+    /// Any active provider other than the challenged report's submitter may
+    /// vote once, either to uphold the report (`uphold == true`, resolving as
+    /// `Verified`) or to reject it. Once one side accumulates a +2/3
+    /// supermajority of the active provider set, the challenge resolves
+    /// immediately — verifier consensus no longer has to wait for the admin
+    /// (issue #186).
+    pub fn resolve_challenge_by_verifier(
+        env: Env,
+        caller: Address,
+        report_id: u64,
+        uphold: bool,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        let provider_key = DataKey::Provider(caller.clone());
+        let p: OracleProvider = env
+            .storage()
+            .persistent()
+            .get(&provider_key)
+            .ok_or(OracleError::Unauthorized)?;
+        bump_persistent(&env, &provider_key);
+        if !p.active {
+            return Err(OracleError::Unauthorized);
+        }
+
+        let challenge_key = DataKey::Challenge(report_id);
+        let challenge: Challenge = env
+            .storage()
+            .persistent()
+            .get(&challenge_key)
+            .ok_or(OracleError::ReportNotFound)?;
+        if challenge.resolved {
+            return Err(OracleError::InvalidResolution);
+        }
+
+        let report: Report = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Report(report_id))
+            .ok_or(OracleError::ReportNotFound)?;
+        if report.status != ReportStatus::Challenged {
+            return Err(OracleError::ReportAlreadyVerified);
+        }
+        // A submitter must not sit in judgment of their own report.
+        if caller == report.provider {
+            return Err(OracleError::InvalidSignature);
+        }
+
+        let (yes_key, no_key) = (
+            DataKey::ChallengeUpholdVotes(report_id),
+            DataKey::ChallengeRejectVotes(report_id),
+        );
+        let mut uphold_votes: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&yes_key)
+            .unwrap_or(vec![&env]);
+        let mut reject_votes: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&no_key)
+            .unwrap_or(vec![&env]);
+
+        for voter in uphold_votes.iter() {
+            if voter == caller {
+                return Err(OracleError::AlreadyVoted);
+            }
+        }
+        for voter in reject_votes.iter() {
+            if voter == caller {
+                return Err(OracleError::AlreadyVoted);
+            }
+        }
+
+        if uphold {
+            uphold_votes.push_back(caller.clone());
+            env.storage().persistent().set(&yes_key, &uphold_votes);
+            bump_persistent(&env, &yes_key);
+        } else {
+            reject_votes.push_back(caller.clone());
+            env.storage().persistent().set(&no_key, &reject_votes);
+            bump_persistent(&env, &no_key);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "challenge_vote"),),
+            (report_id, caller, uphold),
+        );
+
+        let threshold = supermajority_threshold(active_provider_count(&env));
+        let votes = if uphold {
+            uphold_votes.len()
+        } else {
+            reject_votes.len()
+        };
+        if votes >= threshold {
+            finalize_challenge(
+                &env,
+                report_id,
+                if uphold {
+                    ReportStatus::Verified
+                } else {
+                    ReportStatus::Rejected
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Permissionlessly expire a challenge that has sat unresolved past
+    /// [`CHALLENGE_TIMEOUT_SECONDS`].
+    ///
+    /// The liveness backstop (issue #186): neither a missing challenger nor
+    /// an absent admin can keep a report stuck in `Challenged` forever. The
+    /// report returns to `Pending` so ordinary verifier consensus resumes,
+    /// and the bond is refunded — an expired challenger lost the argument by
+    /// default but committed no offence worth punishing.
+    pub fn expire_stale_challenge(env: Env, report_id: u64) -> Result<(), OracleError> {
         let challenge_key = DataKey::Challenge(report_id);
         let mut challenge: Challenge = env
             .storage()
             .persistent()
             .get(&challenge_key)
             .ok_or(OracleError::ReportNotFound)?;
-
         if challenge.resolved {
             return Ok(());
         }
 
-        challenge.resolved = true;
-        challenge.resolution = resolution as u32;
-        env.storage().persistent().set(&challenge_key, &challenge);
-        bump_persistent(&env, &challenge_key);
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(challenge.submitted_at) <= CHALLENGE_TIMEOUT_SECONDS {
+            return Err(OracleError::ChallengeNotStale);
+        }
 
         let report_key = DataKey::Report(report_id);
         let mut report: Report = env
@@ -729,46 +908,22 @@ impl OracleConsumer {
             .persistent()
             .get(&report_key)
             .ok_or(OracleError::ReportNotFound)?;
-        report.status = resolution;
-        if resolution == ReportStatus::Verified {
-            report.verified_at = env.ledger().timestamp();
+        if report.status != ReportStatus::Challenged {
+            return Err(OracleError::InvalidResolution);
         }
+
+        challenge.resolved = true;
+        env.storage().persistent().set(&challenge_key, &challenge);
+        bump_persistent(&env, &challenge_key);
+
+        report.status = ReportStatus::Pending;
         env.storage().persistent().set(&report_key, &report);
         bump_persistent(&env, &report_key);
 
-        release_report_lock(&env, &report.provider, report_id);
+        settle_challenge_bond(&env, &challenge.challenger, challenge.bond, true);
 
-        if resolution == ReportStatus::Rejected {
-            slash_provider(&env, &report.provider, report_id);
-
-            // Revoke the associated project if the report is rejected
-            // Check if project registry is configured
-            let registry_id: Option<Address> =
-                env.storage().instance().get(&DataKey::ProjectRegistry);
-
-            if let Some(registry_id) = registry_id {
-                let registry_client = ProjectRegistryClient::new(&env, &registry_id);
-                let registry_nonce: u64 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::ProjectRegistryNonce)
-                    .unwrap_or(0);
-                registry_client.revoke_project(
-                    &env.current_contract_address(),
-                    &report.project_id,
-                    &String::from_str(&env, "Project revoked due to rejected oracle report"),
-                    &registry_nonce,
-                );
-                env.storage()
-                    .instance()
-                    .set(&DataKey::ProjectRegistryNonce, &(registry_nonce + 1));
-            }
-        }
-
-        env.events().publish(
-            (Symbol::new(&env, "challenge_resolved"),),
-            (report_id, resolution as u32),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "challenge_expired"),), (report_id,));
 
         Ok(())
     }
@@ -1054,6 +1209,129 @@ impl OracleConsumer {
         Ok(())
     }
 
+    /// Deposit a challenge bond (issue #186).
+    ///
+    /// Anyone — not just providers — may fund a challenge account. Deposits
+    /// are pure bookkeeping in this contract's own ledger (no external token
+    /// exists in this workspace), exactly like provider `add_stake`. Only the
+    /// *unlocked* balance is withdrawable; bonds locked by open challenges
+    /// stay locked until their challenge is settled.
+    pub fn deposit_challenge_bond(
+        env: Env,
+        caller: Address,
+        amount: i128,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        if amount <= 0 {
+            return Err(OracleError::InsufficientChallengeBond);
+        }
+
+        let balance_key = DataKey::ChallengeBondBalance(caller.clone());
+        let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        let new_balance = balance
+            .checked_add(amount)
+            .ok_or(OracleError::InsufficientStake)?;
+        env.storage().persistent().set(&balance_key, &new_balance);
+        bump_persistent(&env, &balance_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "challenge_bond_deposited"),),
+            (caller, amount),
+        );
+
+        Ok(())
+    }
+
+    /// Withdraw previously-deposited challenge bond that is not currently
+    /// locked behind an open challenge.
+    pub fn withdraw_challenge_bond(
+        env: Env,
+        caller: Address,
+        amount: i128,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        if amount <= 0 {
+            return Err(OracleError::InsufficientChallengeBond);
+        }
+
+        let balance_key = DataKey::ChallengeBondBalance(caller.clone());
+        let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        if balance < amount {
+            return Err(OracleError::InsufficientChallengeBond);
+        }
+        env.storage()
+            .persistent()
+            .set(&balance_key, &(balance - amount));
+        bump_persistent(&env, &balance_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "challenge_bond_withdrawn"),),
+            (caller, amount),
+        );
+
+        Ok(())
+    }
+
+    /// A challenger's unlocked (deposit/withdrawable) bond balance.
+    pub fn get_challenge_bond_balance(env: Env, challenger: Address) -> i128 {
+        let key = DataKey::ChallengeBondBalance(challenger);
+        let val: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
+    }
+
+    /// A challenger's total bond locked across unresolved challenges.
+    pub fn get_locked_challenge_bond(env: Env, challenger: Address) -> i128 {
+        let key = DataKey::ChallengeBondLock(challenger);
+        let val: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            bump_persistent(&env, &key);
+        }
+        val
+    }
+
+    /// Addresses that voted to uphold (`true`) / reject (`false`) a
+    /// challenged report. Both lists are empty until verifiers start voting.
+    pub fn get_challenge_votes(env: Env, report_id: u64) -> (Vec<Address>, Vec<Address>) {
+        let yes_key = DataKey::ChallengeUpholdVotes(report_id);
+        let no_key = DataKey::ChallengeRejectVotes(report_id);
+        let uphold: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&yes_key)
+            .unwrap_or(vec![&env]);
+        let reject: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&no_key)
+            .unwrap_or(vec![&env]);
+        if env.storage().persistent().has(&yes_key) {
+            bump_persistent(&env, &yes_key);
+        }
+        if env.storage().persistent().has(&no_key) {
+            bump_persistent(&env, &no_key);
+        }
+        (uphold, reject)
+    }
+
     /// Configure the trusted project-registry contract used by
     /// [`submit_report`](Self::submit_report). The registry's numeric `u64`
     /// `Project.id` is the canonical report linkage. The registry-sourced
@@ -1270,6 +1548,168 @@ fn release_report_lock(env: &Env, provider: &Address, report_id: u64) {
     };
     env.storage().persistent().set(&locked_key, &new_locked);
     bump_persistent(env, &locked_key);
+}
+
+/// Move `CHALLENGE_BOND` from a challenger's deposited balance into their
+/// locked total, returning the bonded amount. Fails with
+/// `InsufficientChallengeBond` when the challenger has not deposited enough —
+/// the economic gate that makes challenges non-free (issue #186).
+fn charge_challenge_bond(env: &Env, challenger: &Address) -> Result<i128, OracleError> {
+    let balance_key = DataKey::ChallengeBondBalance(challenger.clone());
+    let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+    if balance < CHALLENGE_BOND {
+        return Err(OracleError::InsufficientChallengeBond);
+    }
+    env.storage()
+        .persistent()
+        .set(&balance_key, &(balance - CHALLENGE_BOND));
+    bump_persistent(env, &balance_key);
+
+    let lock_key = DataKey::ChallengeBondLock(challenger.clone());
+    let locked: i128 = env.storage().persistent().get(&lock_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&lock_key, &(locked + CHALLENGE_BOND));
+    bump_persistent(env, &lock_key);
+
+    env.events().publish(
+        (Symbol::new(env, "challenge_bond_locked"),),
+        (challenger.clone(), CHALLENGE_BOND),
+    );
+
+    Ok(CHALLENGE_BOND)
+}
+
+/// Settle a challenge's bond once the challenge leaves the open state.
+///
+/// * `refund == true`  — the challenger was vindicated (report rejected or
+///   the challenge expired unanswered): the locked amount returns to their
+///   withdrawable balance.
+/// * `refund == false` — the report was upheld against the challenger: the
+///   bond is burned. It leaves the locked ledger and is never credited back,
+///   which is what makes frivolous challenges expensive.
+fn settle_challenge_bond(env: &Env, challenger: &Address, bond: i128, refund: bool) {
+    if bond <= 0 {
+        return;
+    }
+
+    let lock_key = DataKey::ChallengeBondLock(challenger.clone());
+    let locked: i128 = env.storage().persistent().get(&lock_key).unwrap_or(0);
+    let released = bond.min(locked);
+    let new_locked = locked - released;
+    if new_locked == 0 {
+        env.storage().persistent().remove(&lock_key);
+    } else {
+        env.storage().persistent().set(&lock_key, &new_locked);
+        bump_persistent(env, &lock_key);
+    }
+
+    let symbol = if refund {
+        let balance_key = DataKey::ChallengeBondBalance(challenger.clone());
+        let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&balance_key, &(balance + released));
+        bump_persistent(env, &balance_key);
+        Symbol::new(env, "challenge_bond_refunded")
+    } else {
+        // Forfeited: burned on the spot.
+        Symbol::new(env, "challenge_bond_forfeited")
+    };
+
+    env.events()
+        .publish((symbol,), (challenger.clone(), released));
+}
+
+/// Smallest number of verifier votes that constitutes a +2/3 supermajority of
+/// `active` providers (`v * 3 >= 2 * active`, floored at 1).
+fn supermajority_threshold(active: u32) -> u32 {
+    ((2u64 * active as u64).div_ceil(3)).max(1) as u32
+}
+
+/// Settle an open challenge in favour of `resolution`. Shared by the admin
+/// path (`resolve_challenge`) and verifier consensus
+/// (`resolve_challenge_by_verifier`) so both produce identical accounting:
+/// report status flip, provider stake-lock release, slashing plus project
+/// revocation on rejection, and challenger-bond settlement (forfeit when the
+/// report is upheld, refund when it is rejected).
+fn finalize_challenge(
+    env: &Env,
+    report_id: u64,
+    resolution: ReportStatus,
+) -> Result<(), OracleError> {
+    let challenge_key = DataKey::Challenge(report_id);
+    let mut challenge: Challenge = env
+        .storage()
+        .persistent()
+        .get(&challenge_key)
+        .ok_or(OracleError::ReportNotFound)?;
+
+    if challenge.resolved {
+        return Ok(());
+    }
+
+    challenge.resolved = true;
+    challenge.resolution = resolution as u32;
+    env.storage().persistent().set(&challenge_key, &challenge);
+    bump_persistent(env, &challenge_key);
+
+    let report_key = DataKey::Report(report_id);
+    let mut report: Report = env
+        .storage()
+        .persistent()
+        .get(&report_key)
+        .ok_or(OracleError::ReportNotFound)?;
+    report.status = resolution;
+    if resolution == ReportStatus::Verified {
+        report.verified_at = env.ledger().timestamp();
+    }
+    env.storage().persistent().set(&report_key, &report);
+    bump_persistent(env, &report_key);
+
+    release_report_lock(env, &report.provider, report_id);
+
+    if resolution == ReportStatus::Rejected {
+        slash_provider(env, &report.provider, report_id);
+
+        // Revoke the associated project if the report is rejected
+        // Check if project registry is configured
+        let registry_id: Option<Address> = env.storage().instance().get(&DataKey::ProjectRegistry);
+
+        if let Some(registry_id) = registry_id {
+            let registry_client = ProjectRegistryClient::new(env, &registry_id);
+            let registry_nonce: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProjectRegistryNonce)
+                .unwrap_or(0);
+            registry_client.revoke_project(
+                &env.current_contract_address(),
+                &report.project_id,
+                &String::from_str(env, "Project revoked due to rejected oracle report"),
+                &registry_nonce,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::ProjectRegistryNonce, &(registry_nonce + 1));
+        }
+    }
+
+    // The challenger's bond follows the outcome: upheld reports forfeit it,
+    // rejected reports refund it.
+    settle_challenge_bond(
+        env,
+        &challenge.challenger,
+        challenge.bond,
+        resolution == ReportStatus::Rejected,
+    );
+
+    env.events().publish(
+        (Symbol::new(env, "challenge_resolved"),),
+        (report_id, resolution as u32),
+    );
+
+    Ok(())
 }
 
 fn slash_provider(env: &Env, provider: &Address, report_id: u64) {
@@ -1874,7 +2314,8 @@ mod test {
             &0,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         let challenged = client.get_report(&report_id);
         assert_eq!(challenged.status, ReportStatus::Challenged);
@@ -1937,6 +2378,7 @@ mod test {
                 submitted_at: 0,
                 resolved: false,
                 resolution: 0,
+                bond: 0,
             };
             env.storage()
                 .persistent()
@@ -2056,7 +2498,8 @@ mod test {
 
         env.ledger().set_timestamp(900_000);
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         let challenged = client.get_report(&report_id);
         assert_eq!(challenged.status, ReportStatus::Challenged);
@@ -2300,7 +2743,8 @@ mod test {
             &0,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
@@ -2335,7 +2779,8 @@ mod test {
             &0,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
 
@@ -2370,7 +2815,8 @@ mod test {
             &0,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         for invalid in [ReportStatus::Pending, ReportStatus::Challenged] {
             let result = client.try_resolve_challenge(&admin, &report_id, &invalid, &1);
@@ -2379,6 +2825,361 @@ mod test {
 
         let challenge = client.get_challenge(&report_id);
         assert!(!challenge.resolved);
+    }
+
+    // ── Challenge bond + resolution liveness (issue #186) ─────────────────
+
+    #[test]
+    fn test_challenge_without_posted_bond_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        // No deposit at all.
+        let result =
+            client.try_challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        assert_eq!(result, Err(Ok(OracleError::InsufficientChallengeBond)));
+
+        // An under-funded deposit does not help either.
+        client.deposit_challenge_bond(&challenger, &(CHALLENGE_BOND - 1), &0);
+        let result =
+            client.try_challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
+        assert_eq!(result, Err(Ok(OracleError::InsufficientChallengeBond)));
+
+        // The report was never disturbed: challenges are free to validate
+        // but never free to file.
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
+        assert!(matches!(
+            client.try_get_challenge(&report_id),
+            Err(Ok(OracleError::ReportNotFound))
+        ));
+    }
+
+    /// The report stands against the challenge → the challenger's bond is
+    /// burned: it leaves the locked ledger and can never be withdrawn.
+    #[test]
+    fn test_bond_forfeited_when_report_upheld() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.deposit_challenge_bond(&challenger, &(2 * CHALLENGE_BOND), &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
+
+        // Filing the challenge locked exactly one bond out of the balance.
+        assert_eq!(
+            client.get_locked_challenge_bond(&challenger),
+            CHALLENGE_BOND
+        );
+        assert_eq!(
+            client.get_challenge_bond_balance(&challenger),
+            CHALLENGE_BOND
+        );
+        // Locked bond is not withdrawable while the challenge is open.
+        assert_eq!(
+            client.try_withdraw_challenge_bond(&challenger, &(CHALLENGE_BOND * 2), &2),
+            Err(Ok(OracleError::InsufficientChallengeBond))
+        );
+
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
+
+        // Forfeited: lock emptied, balance unchanged — the bonded stake is
+        // gone even though the challenger still holds a separate balance.
+        assert_eq!(client.get_locked_challenge_bond(&challenger), 0);
+        assert_eq!(
+            client.get_challenge_bond_balance(&challenger),
+            CHALLENGE_BOND
+        );
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Verified);
+    }
+
+    /// The report is rejected → the challenger was right and their bond is
+    /// refunded to the withdrawable balance (on top of the usual provider
+    /// slash).
+    #[test]
+    fn test_bond_refunded_when_report_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.add_stake(&provider, &100_000i128, &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
+        assert_eq!(client.get_challenge_bond_balance(&challenger), 0);
+
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
+
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Rejected);
+        // Provider still slashed exactly as before this change…
+        assert_eq!(client.get_provider(&provider).stake, 90_000);
+        // …and the vindicated challenger got every wei of bond back.
+        assert_eq!(client.get_locked_challenge_bond(&challenger), 0);
+        assert_eq!(
+            client.get_challenge_bond_balance(&challenger),
+            CHALLENGE_BOND
+        );
+    }
+
+    /// Verifier consensus can settle a challenge without the admin: at a +2/3
+    /// supermajority of active providers the resolution applies with the same
+    /// accounting as the admin path.
+    #[test]
+    fn test_verifier_supermajority_resolves_challenge() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let reporter = Address::generate(&env);
+        let v1 = Address::generate(&env);
+        let v2 = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &reporter, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &v1, &Symbol::new(&env, "verra_vcs"), &1);
+        client.register_provider(&admin, &v2, &Symbol::new(&env, "verra_vcs"), &2);
+
+        let report_id = client.submit_report(
+            &reporter,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
+
+        // 3 active providers → supermajority is 2 votes. One vote alone must
+        // not resolve anything.
+        client.resolve_challenge_by_verifier(&v1, &report_id, &true, &0);
+        assert_eq!(
+            client.get_report(&report_id).status,
+            ReportStatus::Challenged
+        );
+
+        // Second vote crosses the threshold and finalises as Verified.
+        client.resolve_challenge_by_verifier(&v2, &report_id, &true, &0);
+
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Verified);
+        let (uphold, reject) = client.get_challenge_votes(&report_id);
+        assert_eq!(uphold.len(), 2);
+        assert_eq!(reject.len(), 0);
+
+        // Same accounting as the admin path: bond forfeited.
+        assert_eq!(client.get_locked_challenge_bond(&challenger), 0);
+        assert_eq!(client.get_challenge_bond_balance(&challenger), 0);
+
+        // Admin resolution afterwards is a no-op, not a status flip.
+        // (Admin nonce: 0/1/2 were consumed registering the three providers.)
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &3);
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Verified);
+    }
+
+    #[test]
+    fn test_verifier_vote_guards() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let reporter = Address::generate(&env);
+        let v1 = Address::generate(&env);
+        let v2 = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &reporter, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &v1, &Symbol::new(&env, "verra_vcs"), &1);
+        client.register_provider(&admin, &v2, &Symbol::new(&env, "verra_vcs"), &2);
+
+        let report_id = client.submit_report(
+            &reporter,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
+
+        // A submitter may not judge their own report.
+        assert_eq!(
+            client.try_resolve_challenge_by_verifier(&reporter, &report_id, &true, &1),
+            Err(Ok(OracleError::InvalidSignature))
+        );
+
+        client.resolve_challenge_by_verifier(&v1, &report_id, &true, &0);
+
+        // One vote per verifier, whichever way it was cast.
+        assert_eq!(
+            client.try_resolve_challenge_by_verifier(&v1, &report_id, &true, &1),
+            Err(Ok(OracleError::AlreadyVoted))
+        );
+        assert_eq!(
+            client.try_resolve_challenge_by_verifier(&v1, &report_id, &false, &1),
+            Err(Ok(OracleError::AlreadyVoted))
+        );
+
+        // Unregistered addresses cannot vote at all.
+        let outsider = Address::generate(&env);
+        assert_eq!(
+            client.try_resolve_challenge_by_verifier(&outsider, &report_id, &true, &0),
+            Err(Ok(OracleError::Unauthorized))
+        );
+
+        // With only one of two required votes cast the challenge stays open.
+        assert_eq!(
+            client.get_report(&report_id).status,
+            ReportStatus::Challenged
+        );
+        let (_, reject) = client.get_challenge_votes(&report_id);
+        assert_eq!(reject.len(), 0);
+    }
+
+    /// Acceptance criterion: a report cannot be kept `Challenged` forever.
+    /// Once the timeout passes anyone can expire the stale challenge — no
+    /// signature required — which reopens the report for normal verification
+    /// and refunds the abandoned bond.
+    #[test]
+    fn test_stale_challenge_expires_and_restores_liveness() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let reporter = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &reporter, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &verifier, &Symbol::new(&env, "verra_vcs"), &1);
+
+        let submitted_at = 10_000_000u64;
+        env.ledger().set_timestamp(submitted_at);
+        let report_id = client.submit_report(
+            &reporter,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
+        assert_eq!(client.get_challenge_bond_balance(&challenger), 0);
+
+        // Not stale yet — expiry is refused inside the timeout window.
+        env.ledger()
+            .set_timestamp(submitted_at + CHALLENGE_TIMEOUT_SECONDS);
+        assert_eq!(
+            client.try_expire_stale_challenge(&report_id),
+            Err(Ok(OracleError::ChallengeNotStale))
+        );
+
+        env.ledger()
+            .set_timestamp(submitted_at + CHALLENGE_TIMEOUT_SECONDS + 1);
+        // Permissionless: no auth, no nonce, any party can unstick the report.
+        client.expire_stale_challenge(&report_id);
+
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Pending);
+        let challenge = client.get_challenge(&report_id);
+        assert!(challenge.resolved);
+
+        // Abandoned challenger gets their bond back.
+        assert_eq!(client.get_locked_challenge_bond(&challenger), 0);
+        assert_eq!(
+            client.get_challenge_bond_balance(&challenger),
+            CHALLENGE_BOND
+        );
+
+        // Liveness restored: consensus verification proceeds and succeeds.
+        client.verify_report(&verifier, &report_id, &0);
+        assert_eq!(client.get_report(&report_id).status, ReportStatus::Verified);
     }
 
     #[test]
@@ -2575,7 +3376,8 @@ mod test {
             &1,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &3);
 
         // provider_a is slashed to zero stake and deactivated; only one
@@ -2749,7 +3551,8 @@ mod test {
             &1,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         let result = client.try_withdraw_stake(&provider, &100_000i128, &2);
         assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
@@ -2796,7 +3599,8 @@ mod test {
         let result = client.try_withdraw_stake(&provider, &1_000i128, &2);
         assert_eq!(result, Err(Ok(OracleError::StakeLocked)));
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
         let slashed = client.get_provider(&provider);
@@ -2835,7 +3639,8 @@ mod test {
             &1,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
@@ -2875,7 +3680,8 @@ mod test {
             &1,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
@@ -2912,7 +3718,8 @@ mod test {
             &1,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
 
@@ -2960,7 +3767,8 @@ mod test {
             &2,
         );
 
-        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
+        client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
+        client.challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &1);
 
         client.resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
@@ -3496,11 +4304,12 @@ mod test {
                     &make_ipfs_hash(&env, 1),
                     &1,
                 );
+                client.deposit_challenge_bond(&challenger, &CHALLENGE_BOND, &0);
                 client.challenge_report(
                     &challenger,
                     &report_id,
                     &make_ipfs_hash(&env, 2),
-                    &0,
+                    &1,
                 );
                 client.resolve_challenge(
                     &admin,
