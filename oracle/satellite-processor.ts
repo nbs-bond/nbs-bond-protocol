@@ -4,16 +4,17 @@ import { buildOracleReport } from './report';
 import {
   SatelliteSceneSchema,
   SatelliteSceneListSchema,
-  SatelliteProjectConfigSchema,
   SatelliteProjectConfig,
+  SatelliteProjectConfigSchema,
   SatelliteScene,
   METHODOLOGY,
 } from './schemas';
 
+
 export {
   SatelliteProjectConfig,
   METHODOLOGY,
-  SatelliteProjectConfigSchema,
+
 } from './schemas';
 
 const DEFAULT_SATELLITE_URL = process.env.SATELLITE_API_URL || 'https://api.satellite-processor.io/v1';
@@ -106,12 +107,21 @@ const TONNES_C_TO_KG_CO2E = (44 / 12) * 1000;
  * Estimate carbon sequestration in kg CO2e.
  *
  * Simplified IPCC Tier 1: `area_ha * ndvi_change * biomass_factor`, where
- * `biomass_factor` is tonnes of carbon per hectare per unit NDVI change
- * (default 3.67 tC/ha, tune per methodology), converted to kg CO2e.
+ * `biomassFactorTPerHa` is tonnes of carbon per hectare per unit NDVI
+ * change. This is a per-project scalar simplification of Tier 1 biomass
+ * expansion factors, which properly vary by forest type, ecozone, and
+ * canopy cover fraction (see IPCC 2006 Guidelines for National Greenhouse
+ * Gas Inventories, Vol. 4 (AFOLU), Ch. 4, Table 4.7). It must come from
+ * `SatelliteProjectConfig.ndvi_carbon_factor_t_per_ha` — see that field's
+ * doc comment for why there is no built-in default. Tier 2/3 methodology
+ * is out of scope here.
  */
-export function estimateCarbonSequestration(areaHa: number, ndviChange: number): number {
-  const defaultBiomassFactor = 3.67;
-  return areaHa * ndviChange * defaultBiomassFactor * TONNES_C_TO_KG_CO2E;
+export function estimateCarbonSequestration(
+  areaHa: number,
+  ndviChange: number,
+  biomassFactorTPerHa: number,
+): number {
+  return areaHa * ndviChange * biomassFactorTPerHa * TONNES_C_TO_KG_CO2E;
 }
 
 function withinPeriod(scene: SatelliteScene, periodStart: string, periodEnd: string): boolean {
@@ -146,10 +156,14 @@ export async function ingestSatelliteMeasurement(
     throw new SatelliteNoUsableScenesError(periodStart, periodEnd, maxCloudCover);
   }
 
-  const meanNdvi =
-    usable.reduce((sum, scene) => sum + scene.ndvi_mean, 0) / usable.length;
-  const ndviChange = calculateBiomassChange(validatedProject.baseline_ndvi, meanNdvi);
-  const carbonSequestered = estimateCarbonSequestration(validatedProject.area_ha, ndviChange);
+    const meanNdvi =
+      usable.reduce((sum, scene) => sum + scene.ndvi_mean, 0) / usable.length;
+        const ndviChange = calculateBiomassChange(validatedProject.baseline_ndvi, meanNdvi);
+        const carbonSequestered = estimateCarbonSequestration(
+        validatedProject.area_ha,
+        ndviChange,
+        validatedProject.ndvi_carbon_factor_t_per_ha,
+  );
 
   return buildOracleReport({
     project_id: validatedProject.project_id,
@@ -174,3 +188,5 @@ function meanOfDefined(values: Array<number | undefined>): number | undefined {
   if (defined.length === 0) return undefined;
   return defined.reduce((sum, value) => sum + value, 0) / defined.length;
 }
+
+export {SatelliteProjectConfigSchema};
