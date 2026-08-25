@@ -103,3 +103,11 @@ pub enum VoteChoice {
     Approve,
     Veto,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum GovernanceAction {
+    AddSigner(Address),
+    RemoveSigner(Address),
+    UpdateThreshold(u32),
+}
