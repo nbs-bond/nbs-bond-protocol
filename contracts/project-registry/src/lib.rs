@@ -681,6 +681,27 @@ mod test {
     }
 
     #[test]
+    fn test_project_name_is_returned_by_get_and_list() {
+        let (env, client, _admin, user) = setup();
+        let name = Symbol::new(&env, "Mangrove_Reserve_A");
+
+        let id = client.register_project(
+            &user,
+            &create_hash(&env, 1),
+            &name,
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+
+        assert_eq!(client.get_project(&id).name, name);
+
+        let projects = client.list_projects(&0, &1);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects.get(0).unwrap().name, name);
+    }
+
+    #[test]
     fn test_register_project_invalid_nonce() {
         let (env, client, _admin, user) = setup();
         let hash = create_hash(&env, 1);
