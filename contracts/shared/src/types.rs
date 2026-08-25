@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[contracttype]
@@ -13,6 +13,61 @@ pub enum CreditType {
 pub mod methodology {
     /// Blue carbon (mangrove, seagrass, saltmarsh) monitoring.
     pub const BLUE_CARBON: &str = "BLUE-CARBON";
+}
+
+/// Independence class of a data source, used to enforce methodology
+/// diversity in oracle consensus.
+///
+/// Raw methodology `Symbol`s are arbitrary strings (`verra_vcs` vs
+/// `verra-vcs-v2` would read as distinct while describing the same kind of
+/// evidence), so diversity is enforced at the category level: every
+/// registered methodology maps to exactly one category, and verifiers whose
+/// categories collide are treated as correlated sources.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[contracttype]
+pub enum ProviderCategory {
+    /// Ground-truth instrumentation operated at the project site (IoT
+    /// sensors, field surveys).
+    InSitu,
+    /// Satellite / aerial observation of the project area (NDVI, imagery
+    /// analysis).
+    RemoteSensing,
+    /// Registry-backed audit standards issued by an independent third party
+    /// (Verra VCS, UK BNG, Gold Standard).
+    ThirdPartyAudit,
+}
+
+/// Map a canonical methodology symbol to its independence class.
+///
+/// Registration rejects methodologies outside this closed taxonomy so the
+/// provider set stays auditable; see
+/// `OracleError::InvalidMethodology`.
+pub fn categorize_methodology(env: &Env, methodology: &Symbol) -> Option<ProviderCategory> {
+    let third_party_audit = [
+        Symbol::new(env, "verra_vcs"),
+        Symbol::new(env, "uk_bng"),
+        Symbol::new(env, "gold_standard"),
+        Symbol::new(env, "blue_carbon"),
+    ];
+    let remote_sensing = [
+        Symbol::new(env, "satellite"),
+        Symbol::new(env, "remote_sensing"),
+        Symbol::new(env, "ndvi"),
+    ];
+    let in_situ = [
+        Symbol::new(env, "iot"),
+        Symbol::new(env, "iot_sensors"),
+        Symbol::new(env, "field_survey"),
+    ];
+    if third_party_audit.contains(methodology) {
+        Some(ProviderCategory::ThirdPartyAudit)
+    } else if remote_sensing.contains(methodology) {
+        Some(ProviderCategory::RemoteSensing)
+    } else if in_situ.contains(methodology) {
+        Some(ProviderCategory::InSitu)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

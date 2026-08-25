@@ -1,7 +1,10 @@
 #![no_std]
 #![allow(deprecated)]
 use nbbs_project_registry::ProjectRegistryClient;
-use nbbs_shared::{BiodiversityMetrics, OracleError, ProjectStatus, RegistryError, ReportStatus};
+use nbbs_shared::{
+    categorize_methodology, BiodiversityMetrics, OracleError, ProjectStatus, ProviderCategory,
+    RegistryError, ReportStatus,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Symbol, Vec,
 };
@@ -79,6 +82,11 @@ pub enum DataKey {
     ProjectReportPeriods(u64),
     /// A proposed but not-yet-accepted admin transfer, if any (issue #206).
     PendingAdmin,
+    /// Admin override disabling the methodology-diversity requirement in
+    /// `verify_report`. Off by default; exists only so verification cannot
+    /// deadlock when fewer than `threshold` distinct provider categories are
+    /// registered.
+    BypassDiversity,
 }
 
 /// A proposed admin rotation awaiting acceptance by `candidate` once
@@ -95,6 +103,10 @@ pub struct PendingAdminChange {
 pub struct OracleProvider {
     pub address: Address,
     pub methodology: Symbol,
+    /// Independence class derived from `methodology` at registration time.
+    /// Two providers sharing a category are correlated sources and may not
+    /// co-verify the same report.
+    pub category: ProviderCategory,
     pub stake: i128,
     pub active: bool,
     pub registered_at: u64,
@@ -277,9 +289,16 @@ impl OracleConsumer {
             return Err(OracleError::ProviderAlreadyExists);
         }
 
+        // The independence class is fixed at registration from the closed
+        // taxonomy so arbitrary symbol spellings can never masquerade as
+        // distinct sources later.
+        let category =
+            categorize_methodology(&env, &methodology).ok_or(OracleError::InvalidMethodology)?;
+
         let oracle_provider = OracleProvider {
             address: provider.clone(),
             methodology,
+            category,
             stake: 0,
             active: true,
             registered_at: env.ledger().timestamp(),
@@ -564,6 +583,41 @@ impl OracleConsumer {
         }
 
         if !already_verified {
+            // Methodology diversity gate: a verifier's independence category
+            // must be new to this report. The set of already-represented
+            // categories is seeded with the report's own methodology, so a
+            // provider can never corroborate evidence produced under its own
+            // source class — two VERRA-VCS providers cannot co-verify each
+            // other's reports even as the first and second verifiers. This
+            // constrains *who* may verify; the threshold check below still
+            // governs *how many*.
+            let bypass: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::BypassDiversity)
+                .unwrap_or(false);
+            if !bypass {
+                let mut seen_categories: Vec<ProviderCategory> = vec![&env];
+                if let Some(category) = categorize_methodology(&env, &report.methodology) {
+                    seen_categories.push_back(category);
+                }
+                for verifier in verifiers.iter() {
+                    let verifier_key = DataKey::Provider(verifier.clone());
+                    if let Some(vp) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, OracleProvider>(&verifier_key)
+                    {
+                        if !seen_categories.contains(&vp.category) {
+                            seen_categories.push_back(vp.category);
+                        }
+                    }
+                }
+                if seen_categories.contains(&p.category) {
+                    return Err(OracleError::InsufficientMethodologyDiversity);
+                }
+            }
+
             verifiers.push_back(caller.clone());
             env.storage().persistent().set(&verifiers_key, &verifiers);
             bump_persistent(&env, &verifiers_key);
@@ -1124,6 +1178,47 @@ impl OracleConsumer {
             .instance()
             .get(&DataKey::SignatureThreshold)
             .unwrap_or(1)
+    }
+
+    /// Admin switch disabling the methodology-diversity requirement in
+    /// `verify_report`. Off by default. This is the liveness escape hatch:
+    /// if fewer than `threshold` providers with distinct categories are
+    /// registered (or some have been removed), verification would otherwise
+    /// deadlock permanently. The flag is explicit and event-emitting so its
+    /// use is observable on-chain.
+    pub fn set_diversity_bypass(
+        env: Env,
+        caller: Address,
+        enabled: bool,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        require_admin(&env, &caller)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::BypassDiversity, &enabled);
+
+        env.events().publish(
+            (Symbol::new(&env, "diversity_bypass_set"),),
+            (enabled,),
+        );
+
+        Ok(())
+    }
+
+    pub fn get_diversity_bypass(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::BypassDiversity)
+            .unwrap_or(false)
     }
 
     pub fn add_stake(
@@ -3133,7 +3228,9 @@ mod test {
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &reporter, &Symbol::new(&env, "verra_vcs"), &0);
-        client.register_provider(&admin, &verifier, &Symbol::new(&env, "verra_vcs"), &1);
+        // Verifier uses a different methodology category so the diversity
+        // gate in verify_report does not block verification.
+        client.register_provider(&admin, &verifier, &Symbol::new(&env, "satellite"), &1);
 
         let submitted_at = 10_000_000u64;
         env.ledger().set_timestamp(submitted_at);
@@ -4217,6 +4314,154 @@ mod test {
 
         let reports = client.get_project_reports(&project_id);
         assert_eq!(reports.len(), 0);
+    }
+
+    // ── Methodology diversity enforcement (issue #104) ──────────────────────
+
+    /// Two providers registered under the same methodology category
+    /// cannot co-verify the same report — the second verifier is rejected
+    /// with `InsufficientMethodologyDiversity`.
+    #[test]
+    fn test_same_category_providers_cannot_cross_verify() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        // Both registered under the same methodology (verra_vcs → ThirdPartyAudit).
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "verra_vcs"), &1);
+
+        let report_id = client.submit_report(
+            &provider_a,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        // provider_b is ThirdPartyAudit — same category as the report's own
+        // methodology. The diversity gate must reject the verification.
+        let result = client.try_verify_report(&provider_b, &report_id, &0);
+        assert_eq!(result, Err(Ok(OracleError::InsufficientMethodologyDiversity)));
+
+        // The report stays Pending — the rejected verifier is not counted.
+        let report = client.get_report(&report_id);
+        assert_eq!(report.status, ReportStatus::Pending);
+        assert_eq!(client.get_verification_count(&report_id), 0);
+    }
+
+    /// A ThirdPartyAudit + RemoteSensing pair satisfies the threshold-2
+    /// requirement — genuinely independent providers can co-verify.
+    #[test]
+    fn test_distinct_category_pair_satisfies_threshold_2() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        // Different categories: verra_vcs (ThirdPartyAudit) and satellite (RemoteSensing).
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "satellite"), &1);
+
+        let report_id = client.submit_report(
+            &provider_a,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.verify_report(&provider_b, &report_id, &0);
+        let report = client.get_report(&report_id);
+        assert_eq!(report.status, ReportStatus::Verified);
+        assert_eq!(client.get_verification_count(&report_id), 1);
+    }
+
+    /// The diversity bypass flag lets the admin disable the category gate
+    /// when fewer than `threshold` distinct categories are available.
+    #[test]
+    fn test_diversity_bypass_allows_same_category_verification() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider_a, &Symbol::new(&env, "verra_vcs"), &0);
+        client.register_provider(&admin, &provider_b, &Symbol::new(&env, "verra_vcs"), &1);
+
+        let report_id = client.submit_report(
+            &provider_a,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        // Without bypass: same category is rejected.
+        let result = client.try_verify_report(&provider_b, &report_id, &0);
+        assert_eq!(result, Err(Ok(OracleError::InsufficientMethodologyDiversity)));
+
+        // Enable bypass.
+        client.set_diversity_bypass(&admin, &true, &2);
+        assert!(client.get_diversity_bypass());
+
+        // With bypass: same category is accepted.
+        client.verify_report(&provider_b, &report_id, &0);
+        let report = client.get_report(&report_id);
+        assert_eq!(report.status, ReportStatus::Verified);
+    }
+
+    /// Registering a provider with a methodology outside the canonical
+    /// taxonomy is rejected.
+    #[test]
+    fn test_invalid_methodology_rejected_at_registration() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        let result = client.try_register_provider(
+            &admin,
+            &provider,
+            &Symbol::new(&env, "made_up_methodology"),
+            &0,
+        );
+        assert_eq!(result, Err(Ok(OracleError::InvalidMethodology)));
     }
 
     mod property {
