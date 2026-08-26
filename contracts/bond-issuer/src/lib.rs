@@ -289,14 +289,34 @@ impl BondIssuer {
         Ok(())
     }
 
+    pub fn get_nonce(env: Env, addr: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Nonce(addr))
+            .unwrap_or(0)
+    }
+
     pub fn transfer(
         env: Env,
         from: Address,
         to: Address,
         bond_id: u64,
         amount: i128,
+        nonce: u64,
     ) -> Result<(), BondError> {
         from.require_auth();
+
+        let expected_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Nonce(from.clone()))
+            .unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(BondError::InvalidNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(from.clone()), &(expected_nonce + 1));
 
         if to == from {
             return Err(BondError::Unauthorized);
@@ -801,7 +821,7 @@ mod test {
         client.subscribe(&user, &bond_id, &1000, &0);
         env.ledger().set_timestamp(config.maturity_date);
 
-        let result = client.try_transfer(&user, &user2, &bond_id, &100);
+        let result = client.try_transfer(&user, &user2, &bond_id, &100, &1);
         assert_eq!(result, Err(Ok(BondError::BondAlreadyMatured)));
     }
 
@@ -906,7 +926,7 @@ mod test {
         let bond_id = client.issue_bond(&admin, &config, &0);
 
         client.subscribe(&user, &bond_id, &1000, &0);
-        client.transfer(&user, &user2, &bond_id, &600);
+        client.transfer(&user, &user2, &bond_id, &600, &1);
 
         assert_eq!(client.get_holder_balance(&bond_id, &user), 400);
         assert_eq!(client.get_holder_balance(&bond_id, &user2), 600);
@@ -924,7 +944,7 @@ mod test {
 
         client.subscribe(&user, &bond_id, &1000, &0);
         client.subscribe(&user2, &bond_id, &500, &0);
-        client.transfer(&user, &user2, &bond_id, &250);
+        client.transfer(&user, &user2, &bond_id, &250, &1);
 
         assert_eq!(client.get_holder_balance(&bond_id, &user), 750);
         assert_eq!(client.get_holder_balance(&bond_id, &user2), 750);
@@ -939,7 +959,7 @@ mod test {
 
         client.subscribe(&user, &bond_id, &500, &0);
 
-        let result = client.try_transfer(&user, &user2, &bond_id, &600);
+        let result = client.try_transfer(&user, &user2, &bond_id, &600, &1);
         assert_eq!(result, Err(Ok(BondError::InsufficientBalance)));
     }
 
@@ -950,7 +970,7 @@ mod test {
         let config = make_config(&env);
         let bond_id = client.issue_bond(&admin, &config, &0);
 
-        let result = client.try_transfer(&user2, &Address::generate(&env), &bond_id, &100);
+        let result = client.try_transfer(&user2, &Address::generate(&env), &bond_id, &100, &0);
         assert_eq!(result, Err(Ok(BondError::InsufficientBalance)));
     }
 
@@ -962,7 +982,7 @@ mod test {
 
         client.subscribe(&user, &bond_id, &500, &0);
 
-        let result = client.try_transfer(&user, &user, &bond_id, &100);
+        let result = client.try_transfer(&user, &user, &bond_id, &100, &1);
         assert_eq!(result, Err(Ok(BondError::Unauthorized)));
     }
 
@@ -975,7 +995,7 @@ mod test {
 
         client.subscribe(&user, &bond_id, &500, &0);
 
-        let result = client.try_transfer(&user, &user2, &bond_id, &0);
+        let result = client.try_transfer(&user, &user2, &bond_id, &0, &1);
         assert_eq!(result, Err(Ok(BondError::ZeroAmount)));
     }
 
@@ -983,7 +1003,7 @@ mod test {
     fn test_transfer_nonexistent_bond() {
         let (_env, client, _admin, user) = setup();
         let user2 = Address::generate(&_env);
-        let result = client.try_transfer(&user, &user2, &999, &100);
+        let result = client.try_transfer(&user, &user2, &999, &100, &0);
         assert_eq!(result, Err(Ok(BondError::BondNotFound)));
     }
 
@@ -998,7 +1018,7 @@ mod test {
         env.ledger().set_timestamp(config.maturity_date);
         client.mature_bond(&admin, &bond_id, &1);
 
-        let result = client.try_transfer(&user, &user2, &bond_id, &100);
+        let result = client.try_transfer(&user, &user2, &bond_id, &100, &1);
         assert_eq!(result, Err(Ok(BondError::BondAlreadyMatured)));
     }
 
@@ -1011,7 +1031,7 @@ mod test {
 
         client.subscribe(&user, &bond_id, &1000, &0);
         client.subscribe(&user2, &bond_id, &300, &0);
-        client.transfer(&user, &user2, &bond_id, &700);
+        client.transfer(&user, &user2, &bond_id, &700, &1);
 
         assert_eq!(client.get_holder_balance(&bond_id, &user), 300);
         assert_eq!(client.get_holder_balance(&bond_id, &user2), 1000);
@@ -1082,7 +1102,7 @@ mod test {
         let bond_id = client.issue_bond(&admin, &config, &0);
 
         client.subscribe(&user, &bond_id, &1000, &0);
-        client.transfer(&user, &user2, &bond_id, &600);
+        client.transfer(&user, &user2, &bond_id, &600, &1);
 
         assert_eq!(client.get_holder_count(&bond_id), 2);
         assert_eq!(
@@ -1101,7 +1121,7 @@ mod test {
         let bond_id = client.issue_bond(&admin, &config, &0);
 
         client.subscribe(&user, &bond_id, &1000, &0);
-        client.transfer(&user, &user2, &bond_id, &1000);
+        client.transfer(&user, &user2, &bond_id, &1000, &1);
 
         // The source keeps a zero balance and remains in the list; the API
         // filters zero-balance addresses out at distribution time.
@@ -1373,7 +1393,7 @@ mod test {
         let holder_count_key = DataKey::HolderCount(bond_id);
 
         env.ledger().set_sequence_number(100);
-        client.transfer(&user, &user2, &bond_id, &500);
+        client.transfer(&user, &user2, &bond_id, &500, &1);
         let (ttl_config, ttl_state, ttl_holder_list, ttl_holder_count) =
             env.as_contract(&contract_addr, || {
                 (
@@ -1551,12 +1571,13 @@ mod test {
                     let from = i % 3;
                     let to = (i + 1) % 3;
                     if amount <= balances[from] {
-                        client.transfer(&users[from], &users[to], &bond_id, &amount);
+                        client.transfer(&users[from], &users[to], &bond_id, &amount, &nonces[from]);
+                        nonces[from] += 1;
                         balances[from] -= amount;
                         balances[to] += amount;
                     } else {
                         let res =
-                            client.try_transfer(&users[from], &users[to], &bond_id, &amount);
+                            client.try_transfer(&users[from], &users[to], &bond_id, &amount, &nonces[from]);
                         prop_assert_eq!(res, Err(Ok(BondError::InsufficientBalance)));
                     }
                     let sum: i128 = balances.iter().sum();
@@ -1609,11 +1630,12 @@ mod test {
                     } else {
                         let to = if a == b { (b + 1) % 3 } else { b };
                         if amount <= balances[a] {
-                            client.transfer(&users[a], &users[to], &bond_id, &amount);
+                            client.transfer(&users[a], &users[to], &bond_id, &amount, &nonces[a]);
+                            nonces[a] += 1;
                             balances[a] -= amount;
                             balances[to] += amount;
                         } else {
-                            let res = client.try_transfer(&users[a], &users[to], &bond_id, &amount);
+                            let res = client.try_transfer(&users[a], &users[to], &bond_id, &amount, &nonces[a]);
                             prop_assert_eq!(res, Err(Ok(BondError::InsufficientBalance)));
                         }
                     }
@@ -1684,7 +1706,7 @@ mod test {
 
                 let res = client.try_subscribe(&users[1], &bond_id, &1, &nonces[1]);
                 prop_assert_eq!(res, Err(Ok(BondError::BondAlreadyMatured)));
-                let res = client.try_transfer(&users[0], &users[1], &bond_id, &1);
+                let res = client.try_transfer(&users[0], &users[1], &bond_id, &1, &nonces[0]);
                 prop_assert_eq!(res, Err(Ok(BondError::BondAlreadyMatured)));
                 let res = client.try_mature_bond(&admin, &bond_id, &2);
                 prop_assert_eq!(res, Err(Ok(BondError::BondAlreadyMatured)));

@@ -2145,7 +2145,8 @@ mod integration {
             );
 
             // 6. Both holders redeem in full; total_subscribed returns to 0.
-            contracts.bi_client.redeem(&alice, &bond_id, &4_000, &1);
+            // alice's nonce: subscribe(0) → transfer via DEXRouter(1) → redeem uses 2
+            contracts.bi_client.redeem(&alice, &bond_id, &4_000, &2);
             contracts.bi_client.redeem(&bob, &bond_id, &1_000, &0);
             assert_eq!(contracts.bi_client.get_holder_balance(&bond_id, &alice), 0);
             assert_eq!(contracts.bi_client.get_holder_balance(&bond_id, &bob), 0);

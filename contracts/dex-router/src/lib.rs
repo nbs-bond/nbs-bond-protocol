@@ -367,7 +367,19 @@ impl DEXRouter {
             .get(&DataKey::BondIssuerAddress)
             .ok_or(DEXError::NotInitialized)?;
 
-        env.invoke_contract::<()>(
+        // Fetch the seller's current transfer nonce from BondIssuer so it can
+        // be passed as the nonce argument to `transfer`.  This extra read is
+        // necessary because nonces live in BondIssuer's storage, not here.
+        let seller_nonce: u64 = env.invoke_contract(
+            &bond_issuer,
+            &Symbol::new(&env, "get_nonce"),
+            vec![
+                &env,
+                order.seller.clone().into_val(&env),
+            ],
+        );
+
+        match env.try_invoke_contract::<(), nbbs_shared::BondError>(
             &bond_issuer,
             &Symbol::new(&env, "transfer"),
             vec![
@@ -376,8 +388,15 @@ impl DEXRouter {
                 buyer.clone().into_val(&env),
                 order.bond_id.into_val(&env),
                 amount.into_val(&env),
+                seller_nonce.into_val(&env),
             ],
-        );
+        ) {
+            Ok(Ok(())) => {}
+            Err(Ok(nbbs_shared::BondError::InvalidNonce)) => {
+                return Err(DEXError::InvalidNonce);
+            }
+            _ => return Err(DEXError::InsufficientBalance),
+        }
 
         if amount == order.amount {
             order.status = OrderStatus::Filled;
@@ -993,7 +1012,7 @@ mod test {
             &0,
         );
 
-        issuer_client.transfer(&seller, &third_party, &bond_id, &1_000);
+        issuer_client.transfer(&seller, &third_party, &bond_id, &1_000, &1);
 
         client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &100_000i128, &0);
 
@@ -1055,7 +1074,7 @@ mod test {
 
         // Sell enough to deplete below the listed amount before the buyer
         // attempts the purchase.
-        issuer_client.transfer(&seller, &third_party, &bond_id, &1_500);
+        issuer_client.transfer(&seller, &third_party, &bond_id, &1_500, &1);
         assert_eq!(issuer_client.get_holder_balance(&bond_id, &seller), 500);
 
         client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &100_000i128, &0);
@@ -1065,7 +1084,7 @@ mod test {
 
         // The seller replenishes their holdings before the buyer retries with
         // the same (rolled-back) nonce.
-        issuer_client.transfer(&third_party, &seller, &bond_id, &500);
+        issuer_client.transfer(&third_party, &seller, &bond_id, &500, &0);
 
         client.execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &1);
 
