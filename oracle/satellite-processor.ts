@@ -131,7 +131,7 @@ function withinPeriod(scene: SatelliteScene, periodStart: string, periodEnd: str
 /**
  * Ingest NDVI imagery for a project's bounding box, compute the mean NDVI
  * over the period, compare against the project baseline, and produce an
- * `OracleReport` with methodology `REMOTE-SENSING`.
+ * `OracleReport` with a methodology `REMOTE-SENSING`.
  */
 export async function ingestSatelliteMeasurement(
   project: SatelliteProjectConfig,
@@ -163,24 +163,24 @@ export async function ingestSatelliteMeasurement(
         validatedProject.area_ha,
         ndviChange,
         validatedProject.ndvi_carbon_factor_t_per_ha,
-  );
+    );
 
-  return buildOracleReport({
-    project_id: validatedProject.project_id,
-    provider: 'SatelliteProcessor',
-    methodology: METHODOLOGY.REMOTE_SENSING,
-    period_start: periodStart,
-    period_end: periodEnd,
-    carbon_sequestered: carbonSequestered,
-    confidence: 0.85,
-    evidence: {
-      satellite_scene_count: usable.length,
-      mean_ndvi: meanNdvi,
-      ndvi_change: ndviChange,
-      mean_ndwi: meanOfDefined(usable.map((scene) => scene.ndwi_mean)),
-      sources: [...new Set(usable.map((scene) => scene.source))],
-    },
-  });
+    return buildOracleReport({
+      project_id: validatedProject.project_id,
+      provider: 'SatelliteProcessor',
+      methodology: METHODOLOGY.REMOTE_SENSING,
+      period_start: periodStart,
+      period_end: periodEnd,
+      carbon_sequestered: carbonSequestered,
+      confidence: 0.85,
+      evidence: {
+        satellite_scene_count: usable.length,
+        mean_ndvi: meanNdvi,
+        ndvi_change: ndviChange,
+        mean_ndwi: meanOfDefined(usable.map((scene) => scene.ndwi_mean)),
+        sources: [...new Set(usable.map((scene) => scene.source))],
+      },
+    });
 }
 
 function meanOfDefined(values: Array<number | undefined>): number | undefined {
