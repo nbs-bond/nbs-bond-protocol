@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import {z} from 'zod';
 
 /**
  * Shared schemas for the oracle adapters.
@@ -65,12 +65,37 @@ export const SatelliteSceneListSchema = z.object({
   scenes: z.array(SatelliteSceneSchema),
 });
 
+// ─────────────────────────────────── Project Config ───────────────────────────────────
+
 export const SatelliteProjectConfigSchema = z.object({
   project_id: z.string().min(1),
   bbox: z.tuple([z.number(), z.number(), z.number(), z.number()]),
   area_ha: z.number().positive(),
   baseline_ndvi: z.number().min(-1).max(1),
+  /**
+   * Biomass/carbon conversion factor (tonnes of carbon per hectare per unit
+   * NDVI change) used to translate an observed NDVI change into carbon
+   * sequestered.
+   *
+   * This is a simplified IPCC Tier 1 scalar standing in for a full Tier 1
+   * lookup by forest type / ecozone / canopy-cover fraction — see IPCC 2006
+   * Guidelines for National Greenhouse Gas Inventories, Vol. 4 (AFOLU),
+   * Ch. 4, Table 4.7 "Biomass conversion and expansion factors" and the
+   * associated continental/ecozone default tables. Biomass density varies
+   * enormously by biome (tropical moist forest vs boreal vs savanna), so
+   * this value MUST be chosen per project from the appropriate IPCC table
+   * (or a project-specific allometric study) by the project developer or
+   * verifier.
+   *
+   * Deliberately has NO default, mirroring `bulk_density_t_per_m3` on
+   * `IotProjectConfigSchema` below: silently defaulting a global factor
+   * would risk materially mis-stating sequestered carbon for a financial
+   * instrument. Omitting it must fail schema validation, not fall back to
+   * a guess.
+   */
+  ndvi_carbon_factor_t_per_ha: z.number().positive(),
 });
+
 export type SatelliteProjectConfig = z.infer<typeof SatelliteProjectConfigSchema>;
 
 // ─────────────────────────────────── IoT sensors ───────────────────────────────────
