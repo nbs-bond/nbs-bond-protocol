@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, UnauthorizedException, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, BadRequestException, UnauthorizedException,  ConflictException, Logger, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { createClient, RedisClientType } from '@redis/client';
 import { Keypair } from '@stellar/stellar-sdk';
@@ -24,7 +24,7 @@ export class AuthService implements OnModuleDestroy {
     this.redis.connect().catch(() => {});
   }
 
-  async generateChallenge(address: string): Promise<ChallengeResponse> {
+   async generateChallenge(address: string): Promise<ChallengeResponse> {
     if (!this.stellarService.isValidPublicKey(address)) {
       throw new BadRequestException("Invalid Stellar address");
     }
@@ -32,13 +32,27 @@ export class AuthService implements OnModuleDestroy {
     const nonce = crypto.randomBytes(32).toString("hex");
     const challenge = `NbS Bond Protocol sign-in\nAddress: ${address}\nNonce: ${nonce}\nTimestamp: ${Date.now()}`;
 
-    await this.redis.set(`challenge:${address}`, challenge, { EX: 300 });
+    // NX ensures we never clobber an existing, unused challenge for this address.
+    const stored = await this.redis.set(`challenge:${address}`, challenge, {
+      EX: 300,
+      NX: true,
+    });
+
+    if (stored === null) {
+      throw new ConflictException(
+        "A challenge is already pending for this address",
+      );
+    }
 
     return { challenge, nonce };
   }
 
-  async verifySignature(dto: VerifySignatureDto): Promise<AuthTokenResponse> {
-    const storedChallenge = await this.redis.get(`challenge:${dto.address}`);
+  
+    async verifySignature(dto: VerifySignatureDto): Promise<AuthTokenResponse> {
+    // GETDEL is atomic: read + delete happen as one Redis operation, so a
+    // concurrent request racing for the same challenge can never both read
+    // a non-null value. Whoever loses the race gets null and 401s.
+    const storedChallenge = await this.redis.getDel(`challenge:${dto.address}`);
     if (!storedChallenge || storedChallenge !== dto.originalChallenge) {
       throw new UnauthorizedException("Challenge not found or expired");
     }
@@ -52,8 +66,6 @@ export class AuthService implements OnModuleDestroy {
     if (!isValid) {
       throw new UnauthorizedException("Invalid signature");
     }
-
-    await this.redis.del(`challenge:${dto.address}`);
 
     const payload = { sub: dto.address };
     const accessToken = this.jwtService.sign(payload);
