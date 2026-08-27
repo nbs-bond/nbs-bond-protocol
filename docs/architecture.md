@@ -160,6 +160,8 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | POST | /bonds/:id/claim | Claim accrued credits (JWT; claims for the session wallet only) |
 | GET | /bonds/:id/undistributed | Get undistributed coupon dust total |
 | GET | /bonds/:id/periods | Coupon period history (paginated, optional `?include_report=true`) |
+| POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust (admin only) |
+| POST | /bonds/:id/transfer | Peer-to-peer transfer of bond tokens (JWT; sends from the session wallet only) |
 | POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust to `destination` (defaults to admin) |
 | POST | /bonds/:id/transfer | Transfer bond tokens to another address |
 | POST | /projects | Register project |
