@@ -10,7 +10,7 @@ import { SatelliteProvider } from './providers/satellite.provider';
 import { BlueCarbonProvider } from './providers/blue-carbon.provider';
 import { OracleProviderAdapter, MeasurementData } from './providers/provider.interface';
 
-type FailureKind = 'transient' | 'permanent';
+type FailureKind = 'transient' | 'permanent' | 'contract';
 
 interface DeadLetterEntry {
   provider: string;
@@ -31,10 +31,48 @@ function envPositiveInt(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-/** Distinguish transient (retry next cycle) from permanent (review) failures. */
+/**
+ * Known OracleConsumer contract error codes — see contracts/shared/src/errors.rs.
+ * Contract errors are deterministic logic/state failures, so any detected code
+ * is treated as a distinct non-retryable failure.
+ */
+export const ORACLE_CONTRACT_ERROR_CODES: Record<number, string> = {
+  1: 'NotInitialized',
+  2: 'Unauthorized',
+  3: 'InvalidNonce',
+  4: 'ProviderNotFound',
+  5: 'ProviderAlreadyExists',
+  6: 'ReportNotFound',
+  7: 'ReportAlreadyVerified',
+  8: 'ChallengeWindowExpired',
+  9: 'InsufficientStake',
+  10: 'InvalidSignature',
+  11: 'InvalidResolution',
+  12: 'SelfChallenge',
+};
+
+/** Extract a Soroban contract error code from an error message, if present. */
+function contractErrorCode(error: unknown): number | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(
+    /contract error code\s*(\d+)|Error\(Contract,\s*#\s*(\d+)/i,
+  );
+  const raw = match?.[1] ?? match?.[2];
+  return raw !== undefined ? Number(raw) : undefined;
+}
+
+/**
+ * Distinguish transient (retry next cycle) from permanent (review) failures.
+ * On-chain contract errors are classified distinctly as 'contract' because
+ * retrying them every cycle only churns nonces and RPC calls and masks real
+ * logic bugs — they must never be silently retried.
+ */
 export function classifyProviderFailure(error: unknown): FailureKind {
   const message = error instanceof Error ? error.message : String(error);
-  if (/schema|validation|error code \d|status 4\d\d/i.test(message)) {
+  if (contractErrorCode(error) !== undefined) {
+    return 'contract';
+  }
+  if (/schema|validation|status 4\d\d/i.test(message)) {
     return 'permanent';
   }
   if (/timeout|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENOTFOUND|ENETUNREACH|socket hang up|status 5\d\d/i.test(message)) {
@@ -109,12 +147,15 @@ export class OracleScheduler implements OnModuleDestroy {
     const transient = failures.filter((result) =>
       classifyProviderFailure(result.reason) === 'transient',
     ).length;
-    const permanent = failures.length - transient;
+    const contract = failures.filter((result) =>
+      classifyProviderFailure(result.reason) === 'contract',
+    ).length;
+    const permanent = failures.length - transient - contract;
 
     if (failures.length > 0) {
       this.logger.warn(
         `Oracle poll cycle completed with ${failures.length} failed run(s) ` +
-          `(${transient} transient, ${permanent} permanent); ` +
+          `(${transient} transient, ${contract} contract, ${permanent} permanent); ` +
           `failures were isolated and recorded to ${DEAD_LETTER_KEY}.`,
       );
     } else {
@@ -172,11 +213,19 @@ export class OracleScheduler implements OnModuleDestroy {
         error: message,
         failedAt: new Date().toISOString(),
       });
-      // Transient failures retry on the next scheduled cycle; permanent ones
-      // need human review — both are logged differently.
+      // Transient failures retry on the next scheduled cycle; permanent and
+      // contract failures need human review — each is logged distinctly.
       if (kind === 'transient') {
         this.logger.warn(
           `Oracle poll: ${provider.name} failed transiently for project ${project.id}: ${message}`,
+        );
+      } else if (kind === 'contract') {
+        const code = contractErrorCode(error);
+        const codeName =
+          code !== undefined ? ORACLE_CONTRACT_ERROR_CODES[code] : undefined;
+        this.logger.error(
+          `Oracle poll: ${provider.name} was rejected by the oracle contract ` +
+            `(code ${code ?? '?'}${codeName ? ` ${codeName}` : ''}) for project ${project.id}: ${message}`,
         );
       } else {
         this.logger.error(
@@ -192,16 +241,37 @@ export class OracleScheduler implements OnModuleDestroy {
     projectId: string,
     measurement: MeasurementData,
   ): Promise<void> {
+    const providerAddress = process.env.DEFAULT_PROVIDER_ADDRESS || '';
+    const periodStart = Math.floor(measurement.periodStart.getTime() / 1000);
+    const periodEnd = Math.floor(measurement.periodEnd.getTime() / 1000);
+
+    // Idempotency: skip pairs that already have an active report covering this
+    // exact period, so a re-run within the same period never writes a duplicate
+    // on-chain report (and never churns a nonce).
+    const alreadyReported = await this.oracleService.hasReportForPeriod(
+      projectId,
+      providerAddress,
+      periodStart,
+      periodEnd,
+    );
+    if (alreadyReported) {
+      this.logger.log(
+        `Oracle poll: ${provider.name} already has a report for project ${projectId} ` +
+          `covering this period; skipping duplicate submission`,
+      );
+      return;
+    }
+
     await this.oracleService.submitReport(
       {
         projectId,
-        periodStart: Math.floor(measurement.periodStart.getTime() / 1000),
-        periodEnd: Math.floor(measurement.periodEnd.getTime() / 1000),
+        periodStart,
+        periodEnd,
         carbonSequestered: measurement.carbonSequesteredKg,
         methodology: provider.methodology,
         evidenceHash: measurement.evidenceHashes?.[0],
       },
-      process.env.DEFAULT_PROVIDER_ADDRESS || '',
+      providerAddress,
     );
   }
 
@@ -269,13 +339,9 @@ export class OracleScheduler implements OnModuleDestroy {
 
     // Close the Redis connection gracefully.
     try {
-      if (this.redis.isReady) {
+      if (this.redis.isOpen) {
         await this.redis.quit();
         this.logger.log('OracleScheduler: Redis connection closed gracefully');
-      } else if (this.redis.isOpen) {
-        // The connection never reached the ready state (e.g. Redis was
-        // unavailable on startup); quit() would hang waiting for a reply.
-        this.redis.disconnect();
       }
     } catch (error) {
       this.logger.warn(

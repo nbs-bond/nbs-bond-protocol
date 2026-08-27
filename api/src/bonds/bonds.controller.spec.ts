@@ -41,6 +41,28 @@ describe('BondsController guards', () => {
     expect(path).toBe(':id/sweep-undistributed');
   });
 
+  it('delegates sweep-undistributed to the service with the optional destination', async () => {
+    const swept = {
+      bondId: 3,
+      destination: 'GTREASURY',
+      amount: 42,
+      carbonAmount: 30,
+      biodiversityAmount: 12,
+      swept: 42,
+      transactionHash: '0xabc',
+    };
+    const service = { sweepUndistributed: jest.fn().mockResolvedValue(swept) };
+    const controller = new BondsController(service as any);
+
+    await expect(
+      controller.sweepUndistributed(3, { destination: 'GTREASURY' }),
+    ).resolves.toBe(swept);
+    expect(service.sweepUndistributed).toHaveBeenCalledWith(3, 'GTREASURY');
+
+    await controller.sweepUndistributed(3, {});
+    expect(service.sweepUndistributed).toHaveBeenCalledWith(3, undefined);
+  });
+
   it('exposes GET /:id/accrued as a read-only public endpoint', () => {
     const guards: unknown[] | undefined = Reflect.getMetadata(
       GUARDS_METADATA,

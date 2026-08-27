@@ -1,3 +1,4 @@
+import { SchedulerRegistry } from '@nestjs/schedule';
 import { OracleScheduler, classifyProviderFailure } from './oracle.scheduler';
 import { OracleService } from './oracle.service';
 import { OracleMonitoringService } from './oracle.monitoring.service';
@@ -6,7 +7,6 @@ import { OracleProviderAdapter, MeasurementData } from './providers/provider.int
 import { VerraProvider } from './providers/verra.provider';
 import { SatelliteProvider } from './providers/satellite.provider';
 import { BlueCarbonProvider } from './providers/blue-carbon.provider';
-import { SchedulerRegistry } from '@nestjs/schedule';
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -54,16 +54,19 @@ function buildScheduler(overrides: {
     provider('Satellite'),
     provider('BlueCarbon'),
   ];
+  // By default no on-chain reports exist, so dedup never triggers.
+  const oracleService = {
+    hasReportForPeriod: jest.fn().mockResolvedValue(false),
+    ...(overrides.oracleService ?? {}),
+  } as OracleService;
   const scheduler = new OracleScheduler(
-    (overrides.oracleService ?? {}) as OracleService,
+    oracleService,
     {} as OracleMonitoringService,
     (overrides.projectsService ?? {}) as ProjectsService,
     verra as unknown as VerraProvider,
     satellite as unknown as SatelliteProvider,
     blueCarbon as unknown as BlueCarbonProvider,
-    {
-      deleteCronJob: jest.fn(),
-    } as unknown as SchedulerRegistry,
+    {} as SchedulerRegistry,
   );
   return { scheduler, verra, satellite, blueCarbon };
 }
@@ -93,10 +96,15 @@ describe('OracleScheduler', () => {
   });
 
   describe('classifyProviderFailure', () => {
-    it('classifies schema/contract errors as permanent', () => {
+    it('classifies schema/validation errors and 4xx as permanent', () => {
       expect(classifyProviderFailure(new Error('schema validation failed'))).toBe('permanent');
-      expect(classifyProviderFailure(new Error('Contract error code 4'))).toBe('permanent');
       expect(classifyProviderFailure(new Error('upstream status 401'))).toBe('permanent');
+    });
+
+    it('maps on-chain contract errors to a distinct non-retryable kind', () => {
+      expect(classifyProviderFailure(new Error('Contract simulation failed: Error(Contract, #4) (contract error code 4)'))).toBe('contract');
+      expect(classifyProviderFailure(new Error('contract error code 5'))).toBe('contract');
+      expect(classifyProviderFailure(new Error('Transaction failed: Error(Contract, #10)'))).toBe('contract');
     });
 
     it('classifies network and 5xx errors as transient', () => {
@@ -175,6 +183,69 @@ describe('OracleScheduler', () => {
       expect(lPush).toHaveBeenCalledTimes(1);
       const entry = JSON.parse(lPush.mock.calls[0][1] as string);
       expect(entry.kind).toBe('permanent');
+    });
+
+    it('records on-chain contract rejections distinctly and never retries them', async () => {
+      const submitReport = jest.fn().mockResolvedValue(undefined);
+      const { lPush } = redisMock();
+      const { scheduler } = buildScheduler({
+        oracleService: { submitReport },
+        projectsService: {
+          findAll: jest.fn().mockResolvedValue({ data: [{ id: 1 }] }),
+        },
+        providers: [
+          provider('Verra', new Error('Contract simulation failed: Error(Contract, #4) (contract error code 4)')),
+          provider('Satellite'),
+          provider('BlueCarbon'),
+        ],
+      });
+
+      await scheduler.pollOracleData();
+
+      expect(lPush).toHaveBeenCalledTimes(1);
+      const entry = JSON.parse(lPush.mock.calls[0][1] as string);
+      expect(entry.kind).toBe('contract');
+    });
+
+    it('skips pairs that already have a report covering the same period', async () => {
+      const submitReport = jest.fn().mockResolvedValue(undefined);
+      const { scheduler } = buildScheduler({
+        oracleService: {
+          submitReport,
+          hasReportForPeriod: jest.fn().mockResolvedValue(true),
+        },
+        projectsService: {
+          findAll: jest.fn().mockResolvedValue({ data: [{ id: 1 }, { id: 2 }] }),
+        },
+      });
+
+      await scheduler.pollOracleData();
+
+      // 3 providers × 2 projects, but every pair already has a report.
+      expect(submitReport).not.toHaveBeenCalled();
+    });
+
+    it('deduplicates a period that has a report while submitting a new one', async () => {
+      const submitReport = jest.fn().mockResolvedValue(undefined);
+      const { scheduler } = buildScheduler({
+        oracleService: {
+          submitReport,
+          // Project 2 already has a report this period; project 1 does not.
+          hasReportForPeriod: jest.fn((projectId: string) =>
+            Promise.resolve(projectId === '2'),
+          ),
+        },
+        projectsService: {
+          findAll: jest.fn().mockResolvedValue({ data: [{ id: 1 }, { id: 2 }] }),
+        },
+        providers: [provider('Verra')],
+      });
+
+      await scheduler.pollOracleData();
+
+      // 1 provider × 2 projects: project 1 submitted, project 2 deduplicated.
+      expect(submitReport).toHaveBeenCalledTimes(1);
+      expect(submitReport.mock.calls[0][0].projectId).toBe('1');
     });
 
     it('does not crash and does not poll when projects cannot be loaded', async () => {

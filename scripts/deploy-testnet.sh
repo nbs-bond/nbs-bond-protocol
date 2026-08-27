@@ -128,6 +128,28 @@ for contract in "${CONTRACTS[@]}"; do
   echo ""
 done
 
+# Wire the oracle and registry together before either contract consumes an
+# admin nonce. Oracle submissions trust only this configured registry, while
+# rejected report challenges may call back through the configured oracle id.
+PROJECT_REGISTRY_ADDRESS="$(get_env_value PROJECT_REGISTRY_ADDRESS)"
+ORACLE_CONSUMER_ADDRESS="$(get_env_value ORACLE_CONSUMER_ADDRESS)"
+
+soroban contract invoke \
+  --id "$ORACLE_CONSUMER_ADDRESS" \
+  --fn set_project_registry \
+  --arg "$ADMIN_ADDRESS" \
+  --arg "$PROJECT_REGISTRY_ADDRESS" \
+  --arg 0 \
+  --network "$NETWORK"
+
+soroban contract invoke \
+  --id "$PROJECT_REGISTRY_ADDRESS" \
+  --fn set_oracle_consumer \
+  --arg "$ADMIN_ADDRESS" \
+  --arg "$ORACLE_CONSUMER_ADDRESS" \
+  --arg 0 \
+  --network "$NETWORK"
+
 # ── Summary ─────────────────────────────────────────────────────
 echo "══════════════════════════════════════════════════════════════"
 echo "  All contracts deployed to ${NETWORK}"

@@ -24,6 +24,20 @@ pub enum BondError {
     /// variant is returned only when the *entire* batch consists of already-
     /// paid addresses, so callers can detect a fully-redundant call.
     AlreadyProcessed = 13,
+    /// `mature_bond` was called before `config.maturity_date` has elapsed.
+    /// Replaces the previous overloaded use of `Overflow` (= 9) for this
+    /// guard so callers can distinguish "not mature yet" from a real
+    /// arithmetic overflow.
+    NotYetMature = 14,
+    /// `issue_bond` was called with a `maturity_date` that is already in the
+    /// past (at or before the current ledger timestamp). Replaces the
+    /// previous overloaded use of `Overflow` (= 9) for this guard.
+    MaturityDateInPast = 15,
+    /// A holder's own token balance was too small to cover a `transfer` or
+    /// `redeem` request. Replaces the previous overloaded use of
+    /// `InsufficientSupply` (= 6) for this check, which is reserved for the
+    /// bond's total-supply cap in `subscribe`.
+    InsufficientBalance = 16,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +60,41 @@ pub enum OracleError {
     /// signature trivially sufficient, and a value above the active provider
     /// count could never be reached, permanently deadlocking verification.
     InvalidThreshold = 14,
+    /// No trusted project-registry contract has been configured.
+    ProjectRegistryNotConfigured = 15,
+    /// The supplied numeric project id does not exist in project-registry.
+    ProjectNotFound = 16,
+    /// The project exists, but its current registry status is not Approved.
+    ProjectNotApproved = 17,
+    /// The configured registry could not return a decodable linkage record.
+    ProjectRegistryCallFailed = 18,
+    /// The submitted report's half-open [period_start, period_end) window
+    /// overlaps an already-submitted report for the same project, which
+    /// would double-count carbon sequestered if both were verified.
+    OverlappingReportPeriod = 19,
+    /// `challenge_report` was called for a report that already has a
+    /// `Challenge` recorded. Replaces the previous overloaded use of
+    /// `ProviderAlreadyExists` (= 5), which is reserved for
+    /// `register_provider`'s duplicate-provider check.
+    ChallengeAlreadyExists = 20,
+    /// `accept_admin_transfer` or `cancel_admin_transfer` was called with no
+    /// admin transfer currently proposed.
+    NoPendingAdminChange = 21,
+    /// `accept_admin_transfer` was called before the proposal's timelock
+    /// elapsed.
+    TimelockNotElapsed = 22,
+    /// `challenge_report` was called by an address whose deposited challenge
+    /// bond balance is below the required `CHALLENGE_BOND`. Challenges must
+    /// be economically backed so they cannot be used for costless griefing
+    /// (issue #186).
+    InsufficientChallengeBond = 23,
+    /// A verifier tried to vote on a challenged report they had already voted
+    /// on (a verifier gets exactly one vote, whichever way it was cast).
+    AlreadyVoted = 24,
+    /// `expire_stale_challenge` was called before the challenge timeout had
+    /// elapsed; challenges may only be expired once resolution has stalled
+    /// past `CHALLENGE_TIMEOUT_SECONDS`.
+    ChallengeNotStale = 25,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +124,16 @@ pub enum RegistryError {
     ProjectAlreadyExists = 4,
     InvalidStatusTransition = 5,
     InvalidNonce = 6,
+    OracleConsumerNotSet = 7,
+    ProjectNotApproved = 8,
+    ProjectInactive = 9,
+    CannotSuspend = 10,
+    /// `accept_admin_transfer` or `cancel_admin_transfer` was called with no
+    /// admin transfer currently proposed.
+    NoPendingAdminChange = 11,
+    /// `accept_admin_transfer` was called before the proposal's timelock
+    /// elapsed.
+    TimelockNotElapsed = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +150,17 @@ pub enum CreditError {
     ProjectMismatch = 9,
     PeriodNotFound = 10,
     PeriodNotDistributed = 11,
+    InsufficientCreditsByType = 12,
+    /// A retirement id lookup (`get_retirement_record`,
+    /// `get_retirement_certificate`, `extend_retirement_ttl`) missed.
+    /// Replaces the previous overloaded use of `InsufficientCredits` (= 3)
+    /// for these "not found" lookups, which is reserved for genuine
+    /// insufficient-balance checks in `retire_credits`.
+    RetirementNotFound = 13,
+    /// A `checked_add` guard on retired-credit totals overflowed. Replaces
+    /// the previous overloaded use of `InsufficientCredits` (= 3) for this
+    /// arithmetic guard.
+    Overflow = 14,
 }
 
 #[derive(Clone, Debug, PartialEq)]

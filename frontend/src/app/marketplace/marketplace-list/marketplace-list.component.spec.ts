@@ -16,6 +16,10 @@ const ORDER: Order = {
   pricePerToken: 10,
   quoteAsset: 'USDC',
   status: 'Open',
+  // Fixed, far-future timestamp (2099-01-01) rather than Date.now() + N,
+  // so this fixture is never accidentally expired and tests stay
+  // deterministic regardless of when/how slowly CI runs them.
+  expiresAt: 4070908800,
   createdAt: new Date().toISOString(),
 };
 
@@ -36,7 +40,7 @@ describe('MarketplaceListComponent', () => {
   beforeEach(async () => {
     apiService = {
       getBonds: jasmine.createSpy('getBonds').and.returnValue(of({ data: [], meta: { page: 1, limit: 100, total: 0, totalPages: 1 } })),
-      getOrders: jasmine.createSpy('getOrders').and.returnValue(of({ data: [ORDER], meta: { page: 1, limit: 20, total: 1, totalPages: 1 } })),
+      getOrders: jasmine.createSpy('getOrders').and.returnValue(of({ data: [ORDER], meta:{ page: 1, limit: 20, total: 1, totalPages: 1 } })),
       buyBondTokens: jasmine.createSpy('buyBondTokens').and.returnValue(of(undefined)),
       getQuoteBalance: jasmine
         .createSpy('getQuoteBalance')

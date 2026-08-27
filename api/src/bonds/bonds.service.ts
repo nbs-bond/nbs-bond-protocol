@@ -6,6 +6,7 @@ import {
   InternalServerErrorException,
   UnauthorizedException,
   Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
@@ -55,6 +56,12 @@ const BOND_ERROR_CODE = {
   ProjectNotApproved: 8,
   Overflow: 9,
   ReportNotVerified: 10,
+  // Added to replace the previous overloaded use of `Overflow` (= 9) for
+  // "not yet mature" / "maturity date in the past", and of
+  // `InsufficientSupply` (= 6) for a holder's own balance, on-chain (#114).
+  NotYetMature: 14,
+  MaturityDateInPast: 15,
+  InsufficientBalance: 16,
 };
 
 const COUPON_ERROR_CODE = {
@@ -66,7 +73,7 @@ const COUPON_ERROR_CODE = {
 };
 
 @Injectable()
-export class BondsService {
+export class BondsService implements OnModuleDestroy {
   private readonly logger = new Logger(BondsService.name);
   private redis: RedisClientType;
 
@@ -87,11 +94,16 @@ export class BondsService {
 
     const configScVal = this.encodeBondConfig(dto);
 
-    const { result } = await this.contractService.invokeContractMethod(
-      BOND_ISSUER(), 'issue_bond', adminSecret,
-      [Address.fromString(adminAddress).toScVal(), configScVal],
-      nonce,
-    );
+    let result: xdr.ScVal;
+    try {
+      ({ result } = await this.contractService.invokeContractMethod(
+        BOND_ISSUER(), 'issue_bond', adminSecret,
+        [Address.fromString(adminAddress).toScVal(), configScVal],
+        nonce,
+      ));
+    } catch (error) {
+      throw this.mapBondError(error);
+    }
 
     const bondId = Number(scValToNative(result));
     const bond = await this.buildBondResponse(bondId);
@@ -511,16 +523,21 @@ export class BondsService {
     const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
 
-    const { transactionHash } = await this.contractService.invokeContractMethod(
-      BOND_ISSUER(), 'transfer', investorSecret,
-      [
-        Address.fromString(dto.fromAddress).toScVal(),
-        Address.fromString(dto.toAddress).toScVal(),
-        nativeToScVal(BigInt(id), { type: 'u64' }),
-        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
-      ],
-      nonce,
-    );
+    let transactionHash: string | undefined;
+    try {
+      ({ transactionHash } = await this.contractService.invokeContractMethod(
+        BOND_ISSUER(), 'transfer', investorSecret,
+        [
+          Address.fromString(dto.fromAddress).toScVal(),
+          Address.fromString(dto.toAddress).toScVal(),
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+          nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+        ],
+        nonce,
+      ));
+    } catch (error) {
+      throw this.mapBondError(error, id);
+    }
 
     if (dto.toAddress === fromAddress) {
       throw new BadRequestException(
@@ -697,8 +714,8 @@ export class BondsService {
   /**
    * Accrued (unclaimed) coupon credits for a holder, per CreditType.
    * Reads CouponEngine.accrued_credits (total) plus accrued_credits_by_type
-   * for every credit type; Soroban enums encode as a vec of a single u32
-   * variant index, matching contracts/shared CreditType ordering.
+   * for every credit type. contracts/shared CreditType is a unit enum that
+   * encodes as a Symbol, so each variant is passed as its symbol string.
    */
   async getAccruedCredits(id: number, holder: string): Promise<AccruedCreditsResponse> {
     if (!/^G[A-Z2-7]{55}$/.test(holder)) {
@@ -721,14 +738,14 @@ export class BondsService {
     ];
 
     const perCreditType: AccruedCreditsByType[] = [];
-    for (let variant = 0; variant < creditTypeOrder.length; variant++) {
+    for (const creditType of creditTypeOrder) {
       const typeScVal = await this.contractService.simulateCall({
         contractAddress: COUPON_ENGINE(), method: 'accrued_credits_by_type',
-        args: [bondIdScVal, holderScVal, xdr.ScVal.scvVec([xdr.ScVal.scvU32(variant)])],
+        args: [bondIdScVal, holderScVal, nativeToScVal(creditType, { type: 'symbol' })],
       });
       const amount = Number(scValToNative(typeScVal));
       if (amount > 0) {
-        perCreditType.push({ creditType: creditTypeOrder[variant], amount });
+        perCreditType.push({ creditType, amount });
       }
     }
 
@@ -827,22 +844,27 @@ export class BondsService {
 
   /**
    * Decodes an OracleConsumer `Report` struct. Field order matches the
-   * contract declaration; note the `biodiversity` field is skipped by
-   * position (index 6) when building the summary.
+   * contract declaration: `id, provider, project_id, project_metadata_hash,
+   * period_start, period_end, carbon_sequestered, biodiversity, methodology,
+   * ipfs_evidence_hash, status, submitted_at, verified_at`. `project_id`
+   * (index 2) is the registry's numeric id and is not surfaced here;
+   * `projectId` below is the metadata hash (index 3), kept for
+   * compatibility with existing API consumers. `biodiversity` (index 7) is
+   * skipped by position when building the summary.
    */
   private decodeReport(data: any[]): PeriodReportResponse {
     return {
       id: Number(data[0]),
       providerAddress: data[1] as string,
-      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
-      periodStart: Number(data[3]),
-      periodEnd: Number(data[4]),
-      carbonSequestered: Number(data[5]),
-      methodology: data[7] as string,
-      ipfsHash: Buffer.from(data[8] as Uint8Array).toString('hex'),
-      status: this.reportStatusFromIndex(Number(data[9])),
-      submittedAt: Number(data[10]),
-      verifiedAt: Number(data[11]),
+      projectId: Buffer.from(data[3] as Uint8Array).toString('hex'),
+      periodStart: Number(data[4]),
+      periodEnd: Number(data[5]),
+      carbonSequestered: Number(data[6]),
+      methodology: data[8] as string,
+      ipfsHash: Buffer.from(data[9] as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(data[10])),
+      submittedAt: Number(data[11]),
+      verifiedAt: Number(data[12]),
     };
   }
 
@@ -854,9 +876,19 @@ export class BondsService {
     ) ?? 'Pending';
   }
 
-  async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
+  /**
+   * Credits undistributed coupon dust to `destination` via CouponEngine
+   * `sweep_undistributed`. The caller is always the protocol admin; `destination`
+   * defaults to that same admin wallet when omitted so a dedicated treasury
+   * is opt-in (`POST /bonds/:id/sweep-undistributed` `{ "destination": "G..." }`).
+   */
+  async sweepUndistributed(
+    id: number,
+    destination?: string,
+  ): Promise<SweepUndistributedResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+    const creditTo = destination || adminAddress;
     const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
 
     const { result, transactionHash } = await this.contractService.invokeContractMethod(
@@ -864,14 +896,50 @@ export class BondsService {
       [
         Address.fromString(adminAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
+        Address.fromString(creditTo).toScVal(),
       ],
       nonce,
     );
 
+    const receipt = this.decodeSweepReceipt(result);
     return {
-      bondId: id,
-      swept: Number(scValToNative(result)),
+      bondId: receipt.bondId || id,
+      destination: receipt.destination || creditTo,
+      amount: receipt.amount,
+      carbonAmount: receipt.carbonAmount,
+      biodiversityAmount: receipt.biodiversityAmount,
+      swept: receipt.amount,
       transactionHash: transactionHash || '',
+    };
+  }
+
+  /**
+   * Decodes CouponEngine `SweepReceipt` (`bond_id`, `destination`, `amount`,
+   * `carbon_amount`, `biodiversity_amount`) from either a 5-field tuple or a
+   * named struct/map, matching how `scValToNative` surfaces Soroban values.
+   */
+  private decodeSweepReceipt(result: xdr.ScVal): {
+    bondId: number;
+    destination: string;
+    amount: number;
+    carbonAmount: number;
+    biodiversityAmount: number;
+  } {
+    const native = scValToNative(result) as unknown;
+    const read = (key: string, index: number): unknown => {
+      if (Array.isArray(native)) return native[index];
+      if (native instanceof Map) return native.get(key);
+      if (native && typeof native === 'object') {
+        return (native as Record<string, unknown>)[key];
+      }
+      return undefined;
+    };
+    return {
+      bondId: Number(read('bond_id', 0) ?? 0),
+      destination: String(read('destination', 1) ?? ''),
+      amount: Number(read('amount', 2) ?? 0),
+      carbonAmount: Number(read('carbon_amount', 3) ?? 0),
+      biodiversityAmount: Number(read('biodiversity_amount', 4) ?? 0),
     };
   }
 
@@ -941,16 +1009,30 @@ export class BondsService {
     };
   }
 
-  private mapBondError(error: unknown, bondId: number): Error {
+  private mapBondError(error: unknown, bondId?: number): Error {
     if (error instanceof BadRequestException) {
       const message = error.message;
       const match = message.match(/error code (\d+)/);
       const code = match ? Number(match[1]) : undefined;
 
-      if (code === BOND_ERROR_CODE.Overflow) {
+      if (code === BOND_ERROR_CODE.NotYetMature) {
         return new BadRequestException(
           `Bond #${bondId} cannot be matured before its maturity date. ` +
           'Maturation is only allowed once the maturity date has been reached.',
+        );
+      }
+
+      if (code === BOND_ERROR_CODE.MaturityDateInPast) {
+        return new BadRequestException(
+          'Bond maturity date must be in the future.',
+        );
+      }
+
+      if (code === BOND_ERROR_CODE.InsufficientBalance) {
+        return new BadRequestException(
+          bondId !== undefined
+            ? `Insufficient balance on bond #${bondId} to complete this transfer.`
+            : 'Insufficient balance to complete this transfer.',
         );
       }
 
@@ -959,10 +1041,27 @@ export class BondsService {
     if (error instanceof Error) {
       return new BadRequestException(error.message);
     }
-    return new BadRequestException('Failed to mature bond');
+    return new BadRequestException('Bond operation failed');
   }
 
   private getAdminSecret(): string {
     return process.env.ADMIN_SECRET_KEY || '';
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('BondsService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `BondsService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

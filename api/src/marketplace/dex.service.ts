@@ -3,6 +3,8 @@ import {
   BadRequestException,
   HttpException,
   HttpStatus,
+  Logger,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
@@ -41,7 +43,8 @@ const DEX_ERROR_CODE = {
 } as const;
 
 @Injectable()
-export class DexService {
+export class DexService implements OnModuleDestroy {
+  private readonly logger = new Logger(DexService.name);
   private redis: RedisClientType;
 
   constructor(
@@ -58,49 +61,77 @@ export class DexService {
     status?: string,
     page = 1,
     limit = 20,
-  ): Promise<PaginatedResponse<OrderResponse>> {
+  ): Promise<PaginatedResponse<OrderResponse> & { meta: { hasMore?: boolean } }> {
     const cacheKey = `orders:${bondId || 'all'}:${status || 'all'}:${page}:${limit}`;
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);
 
+    // Skip the first (page-1)*limit matching orders, then collect `limit` more.
+    const skipCount = (page - 1) * limit;
+    let skipped = 0;
     const orders: OrderResponse[] = [];
     let index = 1;
 
-    while (true) {
+    while (orders.length < limit) {
+      let order: OrderResponse;
       try {
         const orderScVal = await this.contractService.simulateCall({
           contractAddress: DEX_ROUTER(),
           method: 'get_order',
           args: [nativeToScVal(BigInt(index), { type: 'u64' })],
         });
-        const order = this.decodeOrder(scValToNative(orderScVal) as any[]);
-
-        if (bondId && order.bondId !== bondId) {
-          index++;
-          continue;
+        order = this.decodeOrder(scValToNative(orderScVal) as any[]);
+      } catch (err) {
+        // OrderNotFound (code 4) is the legitimate end-of-list signal.
+        // Any other error is a real fault — surface it instead of silently
+        // truncating the listing.
+        if (this.isOrderNotFound(err)) {
+          break;
         }
-        if (status && order.status !== status) {
-          index++;
-          continue;
-        }
-
-        orders.push(order);
-        index++;
-      } catch {
-        break;
+        throw err;
       }
+
+      index++;
+
+      // Apply filters — unmatched orders don't count against the page quota.
+      if (bondId !== undefined && order.bondId !== bondId) continue;
+      if (status !== undefined && order.status !== status) continue;
+
+      // Skip orders belonging to earlier pages.
+      if (skipped < skipCount) {
+        skipped++;
+        continue;
+      }
+
+      orders.push(order);
     }
 
-    const start = (page - 1) * limit;
-    const paged = orders.slice(start, start + limit);
+    // hasMore is true when we filled the page and there may be more orders
+    // beyond index-1. We cannot know the exact total without get_order_count
+    // (#119), so we surface hasMore rather than a potentially-wrong total.
+    const hasMore = orders.length === limit;
 
     const result = {
-      data: paged,
-      meta: { page, limit, total: orders.length, totalPages: Math.ceil(orders.length / limit) || 1 },
+      data: orders,
+      meta: {
+        page,
+        limit,
+        total: orders.length,
+        totalPages: 1,
+        hasMore,
+      },
     };
 
     await this.redis.setEx(cacheKey, 30, JSON.stringify(result));
     return result;
+  }
+
+  /** Returns true when the thrown error is an on-chain OrderNotFound (code 4). */
+  private isOrderNotFound(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+    const match = message.match(/#(\d+)/) ?? message.match(/Error\(-(\d+)/);
+    const code = match ? Number(match[1]) : undefined;
+    return code === DEX_ERROR_CODE.OrderNotFound;
   }
 
   async listBondTokens(dto: ListBondDto, sellerAddress: string): Promise<OrderResponse> {
@@ -122,7 +153,7 @@ export class DexService {
     );
 
     const orderId = Number(scValToNative(result));
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
     return this.getOrder(orderId);
   }
 
@@ -143,6 +174,8 @@ export class DexService {
     const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
     try {
+      // Contract signature (contracts/dex-router/src/lib.rs execute_purchase):
+      // (buyer, order_id, max_price: i128, amount: i128, nonce) — max_price comes BEFORE amount.
       await this.contractService.invokeContractMethod(
         DEX_ROUTER(), 'execute_purchase', adminSecret,
         [
@@ -163,7 +196,7 @@ export class DexService {
       throw this.mapDexError(error);
     }
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(dto.orderId);
     return this.getOrder(dto.orderId);
   }
 
@@ -181,7 +214,7 @@ export class DexService {
       nonce,
     );
 
-    await this.redis.del(`orders:*`);
+    await this.invalidateOrderCaches(orderId);
   }
 
   async getOrder(orderId: number): Promise<OrderResponse> {
@@ -198,6 +231,17 @@ export class DexService {
 
     await this.redis.setEx(cacheKey, 60, JSON.stringify(order));
     return order;
+  }
+
+  // `del('orders:*')` does not glob-match; SCAN for the real keys and UNLINK them.
+  private async invalidateOrderCaches(orderId: number): Promise<void> {
+    const keys = [`order:${orderId}`];
+
+    for await (const key of this.redis.scanIterator({ MATCH: 'orders:*', COUNT: 100 })) {
+      keys.push(key as unknown as string);
+    }
+
+    await this.redis.unlink(keys);
   }
 
   async getBestPrice(
@@ -250,6 +294,8 @@ export class DexService {
     const adminPublicKey = this.getAdminPublicKey();
     const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
+    // Contract signature (contracts/dex-router/src/lib.rs deposit_quote):
+    // (caller, quote_asset: Symbol, amount: i128, nonce).
     const { transactionHash } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'deposit_quote', adminSecret,
       [
@@ -273,6 +319,8 @@ export class DexService {
     const adminPublicKey = this.getAdminPublicKey();
     const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
 
+    // Contract signature (contracts/dex-router/src/lib.rs withdraw_quote):
+    // (caller, quote_asset: Symbol, amount: i128, nonce).
     const { transactionHash } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'withdraw_quote', adminSecret,
       [
@@ -355,5 +403,22 @@ export class DexService {
     }
 
     return new BadRequestException(message);
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      if (this.redis.isReady) {
+        await this.redis.quit();
+        this.logger.log('DexService: Redis connection closed gracefully');
+      } else if (this.redis.isOpen) {
+        // The connection never reached the ready state (e.g. Redis was
+        // unavailable on startup); quit() would hang waiting for a reply.
+        this.redis.disconnect();
+      }
+    } catch (error) {
+      this.logger.warn(
+        `DexService: error closing Redis connection: ${error?.message ?? error}`,
+      );
+    }
   }
 }

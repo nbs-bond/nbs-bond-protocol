@@ -1,4 +1,4 @@
-import { Injectable, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { Injectable, HttpException, HttpStatus, Logger, OnModuleDestroy } from '@nestjs/common';
 import {
   Horizon,
   Keypair,
@@ -25,7 +25,7 @@ const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
 
 @Injectable()
-export class StellarService {
+export class StellarService implements OnModuleDestroy {
   private readonly logger = new Logger(StellarService.name);
   private horizon: Horizon.Server;
   private networkPassphrase: string;
@@ -206,5 +206,14 @@ export class StellarService {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Close any open Horizon payment SSE stream when the module is torn down.
+   * Called automatically by NestJS when app.enableShutdownHooks() is active
+   * and the process receives SIGTERM/SIGINT.
+   */
+  onModuleDestroy(): void {
+    this.closePaymentStream();
   }
 }

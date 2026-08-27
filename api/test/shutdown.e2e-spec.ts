@@ -52,9 +52,7 @@ import { ContractService, ContractCallOptions } from '../src/stellar/contract.se
 
 /**
  * Creates a mock Redis client whose methods can be individually spied on.
- * `isOpen`/`isReady` start as true so onModuleDestroy() will call quit() on
- * it.  When the client is not ready, onModuleDestroy() falls back to
- * disconnect() instead of quit() (quit() would hang waiting for a reply).
+ * `isOpen` starts as true so onModuleDestroy() will call quit() on it.
  */
 function makeRedisMock() {
   let open = true;
@@ -62,15 +60,11 @@ function makeRedisMock() {
     get isOpen() {
       return open;
     },
-    get isReady() {
-      return open;
-    },
     connect: jest.fn().mockResolvedValue(undefined),
     quit: jest.fn().mockImplementation(() => {
       open = false;
       return Promise.resolve();
     }),
-    disconnect: jest.fn(),
     set: jest.fn().mockResolvedValue('OK'),
     get: jest.fn().mockResolvedValue(null),
     del: jest.fn().mockResolvedValue(1),
@@ -112,12 +106,8 @@ describe('AuthService — graceful shutdown (e2e)', () => {
   });
 
   it('does not call redis.quit() when Redis is already closed', async () => {
-    // Simulate a closed connection: neither open nor ready.
+    // Simulate a closed connection.
     Object.defineProperty(redisMock, 'isOpen', {
-      get: () => false,
-      configurable: true,
-    });
-    Object.defineProperty(redisMock, 'isReady', {
       get: () => false,
       configurable: true,
     });
@@ -125,7 +115,6 @@ describe('AuthService — graceful shutdown (e2e)', () => {
     await service.onModuleDestroy();
 
     expect(redisMock.quit).not.toHaveBeenCalled();
-    expect(redisMock.disconnect).not.toHaveBeenCalled();
   });
 
   it('does not throw if redis.quit() rejects', async () => {

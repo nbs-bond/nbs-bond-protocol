@@ -90,13 +90,34 @@ export function aggregateSensorReadings(readings: IoTSensorReading[]): SensorAgg
   };
 }
 
-// Calibration constants for the soil-carbon proxy (documented in README).
-const SOIL_BULK_DENSITY_KG_M3 = 1.4 * 1e3; // typical mineral soil bulk density
-const SOIL_SAMPLE_DEPTH_M = 0.3; // IPCC default sampling depth
+/**
+ * Suggested starting values only — NOT applied as a schema default (see
+ * `IotProjectConfigSchema.bulk_density_t_per_m3` / `.sampling_depth_m`).
+ * Bulk density in particular varies enormously by soil type (peat can be
+ * as low as 0.1 t/m3 vs ~1.4 t/m3 for typical mineral soil — using the
+ * wrong one over/under-states carbon by an order of magnitude), so a UI
+ * may pre-fill a form with these, but the project developer must
+ * explicitly confirm or override the measured value before submission
+ * rather than silently inheriting a default.
+ */
+export const DEFAULT_BULK_DENSITY_T_PER_M3 = 1.4; // typical mineral soil
+export const DEFAULT_SAMPLING_DEPTH_M = 0.3; // IPCC default sampling depth
+
 const KG_C_TO_KG_CO2E = 44 / 12;
-/** kg CO2e per hectare per ppm of soil organic carbon (0.3 m depth). */
-export const KG_CO2E_PER_HA_PER_PPM =
-  1e-6 * SOIL_BULK_DENSITY_KG_M3 * SOIL_SAMPLE_DEPTH_M * 1e4 * KG_C_TO_KG_CO2E;
+
+/**
+ * kg CO2e per hectare per ppm of soil organic carbon change, derived from
+ * a project's measured bulk density and sampling depth (previously a
+ * hardcoded constant — see #59).
+ *
+ * Derivation: a ppm of soil organic carbon is a mass fraction of 1e-6
+ * (mg C / kg soil). Soil mass per hectare = bulkDensityTPerM3 * 1000
+ * (kg/t) * samplingDepthM (m, i.e. soil volume per unit area) * 1e4
+ * (m2/ha). Multiplying by 44/12 converts kg C to kg CO2e.
+ */
+export function kgCo2ePerHaPerPpm(bulkDensityTPerM3: number, samplingDepthM: number): number {
+  return 1e-6 * (bulkDensityTPerM3 * 1000) * samplingDepthM * 1e4 * KG_C_TO_KG_CO2E;
+}
 
 /**
  * Mean change in soil organic carbon (ppm) per device between the first and
@@ -131,8 +152,10 @@ export function meanSoilCarbonDeltaPpm(readings: IoTSensorReading[]): number | n
  * `IOT-SENSORS`.
  *
  * Carbon sequestration is the per-device mean change in soil organic carbon
- * (ppm) over the period, converted with `KG_CO2E_PER_HA_PER_PPM`. Devices
- * without both a period-start and period-end reading contribute no delta.
+ * (ppm) over the period, converted using the project's measured
+ * `bulk_density_t_per_m3` and `sampling_depth_m` via `kgCo2ePerHaPerPpm`.
+ * Devices without both a period-start and period-end reading contribute no
+ * delta.
  */
 export async function aggregateIotProject(
   project: IotProjectConfig,
@@ -177,7 +200,9 @@ export async function aggregateIotProject(
 
   const aggregate = aggregateSensorReadings(validReadings);
   const carbonSequestered =
-    soilCarbonDeltaPpm * validatedProject.area_ha * KG_CO2E_PER_HA_PER_PPM;
+    soilCarbonDeltaPpm *
+    validatedProject.area_ha *
+    kgCo2ePerHaPerPpm(validatedProject.bulk_density_t_per_m3, validatedProject.sampling_depth_m);
 
   return buildOracleReport({
     project_id: validatedProject.project_id,
@@ -193,6 +218,8 @@ export async function aggregateIotProject(
       soil_carbon_delta_ppm: soilCarbonDeltaPpm,
       avg_soil_carbon_ppm: aggregate.avgSoilCarbonPpm,
       avg_water_table_cm: aggregate.avgWaterTableCm,
+      bulk_density_t_per_m3: validatedProject.bulk_density_t_per_m3,
+      sampling_depth_m: validatedProject.sampling_depth_m,
     },
   });
 }
