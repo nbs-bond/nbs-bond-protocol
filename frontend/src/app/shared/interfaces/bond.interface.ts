@@ -42,7 +42,7 @@ export interface Order {
 
 export interface PaginatedResponse<T> {
   data: T[];
-  meta: { page: number; limit: number; total: number; totalPages: number };
+  meta: { page: number; limit: number; total: number; totalPages: number; hasMore?: boolean };
 }
 
 export interface SubscriptionResponse {

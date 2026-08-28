@@ -76,8 +76,71 @@ describe('MarketplaceListComponent', () => {
   });
 
   it('loads orders and bonds on init', () => {
-    expect(apiService.getOrders).toHaveBeenCalled();
+    expect(apiService.getOrders).toHaveBeenCalledWith({
+      bondId: undefined,
+      page: 1,
+      limit: 20,
+    });
     expect(apiService.getBonds).toHaveBeenCalled();
+  });
+
+  it('navigates between order pages', () => {
+    apiService.getOrders.and.returnValues(
+      of({ data: [ORDER], meta: { page: 2, limit: 20, total: 45, totalPages: 3 } }),
+      of({ data: [ORDER], meta: { page: 1, limit: 20, total: 45, totalPages: 3 } }),
+    );
+    component.totalPages.set(3);
+
+    component.nextPage();
+
+    expect(apiService.getOrders).toHaveBeenCalledWith({ bondId: undefined, page: 2, limit: 20 });
+    expect(component.currentPage()).toBe(2);
+
+    component.previousPage();
+
+    expect(apiService.getOrders).toHaveBeenCalledWith({ bondId: undefined, page: 1, limit: 20 });
+    expect(component.currentPage()).toBe(1);
+  });
+
+  it('does not navigate past the available page range', () => {
+    apiService.getOrders.calls.reset();
+
+    component.previousPage();
+    expect(apiService.getOrders).not.toHaveBeenCalled();
+
+    component.currentPage.set(3);
+    component.totalPages.set(3);
+    component.nextPage();
+    expect(apiService.getOrders).not.toHaveBeenCalled();
+  });
+
+  it('shows pagination controls when more than one page is available', () => {
+    component.totalPages.set(3);
+    fixture.detectChanges();
+
+    const pagination: HTMLElement | null = fixture.nativeElement.querySelector('.pagination');
+    expect(pagination?.textContent).toContain('Previous');
+    expect(pagination?.textContent).toContain('Page 1 of 3');
+    expect(pagination?.textContent).toContain('Next');
+  });
+
+  it('uses hasMore when the API cannot provide an exact page count', () => {
+    apiService.getOrders.and.returnValue(
+      of({ data: [ORDER], meta: { page: 1, limit: 20, total: 20, totalPages: 1, hasMore: true } }),
+    );
+
+    component.onFilterChange(null);
+
+    expect(component.totalPages()).toBe(2);
+  });
+
+  it('resets pagination and preserves the bond filter when it changes', () => {
+    component.currentPage.set(2);
+
+    component.onFilterChange(3);
+
+    expect(apiService.getOrders).toHaveBeenCalledWith({ bondId: 3, page: 1, limit: 20 });
+    expect(component.currentPage()).toBe(1);
   });
 
   it('loads the escrowed quote balance when connected', () => {

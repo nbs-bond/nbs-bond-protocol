@@ -243,13 +243,16 @@ const EXPIRY_WARNING_THRESHOLD_S = 60;
     .pagination { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 16px; }
     .page-indicator { font-size: 0.8125rem; color: #6b7280; }
     .mono { font-family: monospace; font-size: 0.8125rem; }
+    .pagination { display: flex; justify-content: center; align-items: center; gap: 16px; margin-top: 24px; }
+    .page-info { font-size: 0.875rem; color: #6b7280; }
     .btn { padding: 8px 16px; border-radius: 8px; font-size: 0.875rem; font-weight: 500; cursor: pointer; border: none; text-decoration: none; display: inline-block; }
     .btn-sm { padding: 6px 12px; font-size: 0.8125rem; }
     .btn-primary { background: #1a1a2e; color: #fff; }
     .btn-primary:hover:not(:disabled) { background: #2a2a4e; }
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-outline { background: #fff; color: #1a1a2e; border: 1px solid #d1d5db; }
-    .btn-outline:hover { background: #f0f2f5; }
+    .btn-outline:hover:not(:disabled) { background: #f0f2f5; }
+    .btn-outline:disabled { opacity: 0.5; cursor: not-allowed; }
     .buy-form { display: flex; flex-direction: column; gap: 6px; min-width: 180px; }
     .buy-input { padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.8125rem; outline: none; width: 100%; }
     .buy-input:focus { border-color: #3b82f6; }
@@ -381,9 +384,10 @@ export class MarketplaceListComponent implements OnInit {
 
   onFilterChange(bondId: number | null): void {
     this.filterBondId.set(bondId);
+    this.currentPage.set(1);
     this.router.navigate([], {
       relativeTo: this.route,
-      queryParams: bondId ? { bondId } : {},
+      queryParams: { bondId },
       queryParamsHandling: 'merge',
     });
     this.currentPage.set(1);
