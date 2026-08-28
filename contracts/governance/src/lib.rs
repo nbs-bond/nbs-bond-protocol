@@ -25,6 +25,8 @@ const STORAGE_VERSION_PERSISTENT: u32 = 1;
 /// each) while keeping the scan trivially cheap.
 pub const MAX_ALLOWED_CALLS: u32 = 64;
 
+pub const MAX_SIGNERS: u32 = 20;
+
 /// The only method on the governance contract itself that a proposal may
 /// target. Soroban forbids contract re-entry, so a self-targeted proposal can
 /// never be routed through `env.invoke_contract`; `execute` dispatches it
@@ -221,6 +223,9 @@ fn check_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), GovernanceEr
 }
 
 fn require_signer(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+    env.storage()
+        .instance()
+        .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
     let signers: Vec<Address> = env
         .storage()
         .instance()
@@ -477,6 +482,7 @@ impl Governance {
             threshold > 0 && threshold <= signers.len(),
             "threshold must be between 1 and signer count"
         );
+        assert!(signers.len() <= MAX_SIGNERS, "too many signers");
         for i in 0..signers.len() {
             for j in (i + 1)..signers.len() {
                 assert!(
@@ -817,6 +823,9 @@ impl Governance {
 
     /// The current execution allowlist, for dashboards and proposal review.
     pub fn get_allowed_calls(env: Env) -> Vec<AllowedCall> {
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
         read_allowed_calls(&env)
     }
 
@@ -824,6 +833,9 @@ impl Governance {
     /// `contract`. Lets a proposer check a call before spending a vote cycle on
     /// a proposal that would be rejected at execution.
     pub fn is_call_allowed(env: Env, contract: Address, function: Symbol) -> bool {
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
         contains_call(&read_allowed_calls(&env), &contract, &function)
     }
 
@@ -887,6 +899,9 @@ impl Governance {
     }
 
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
         read_proposal(&env, proposal_id).ok_or(GovernanceError::ProposalNotFound)
     }
 
@@ -902,14 +917,23 @@ impl Governance {
     /// `bool`. Any off-chain consumer reading `get_vote` must be updated to
     /// handle `Option<VoteChoice>` instead of `bool`.
     pub fn get_vote(env: Env, proposal_id: u64, signer: Address) -> Option<VoteChoice> {
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
         read_vote(&env, proposal_id, &signer)
     }
 
     pub fn proposal_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
         read_proposal_count(&env)
     }
 
     pub fn get_signers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get(&DataKey::Signers)
@@ -919,6 +943,9 @@ impl Governance {
     pub fn get_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
             .get(&DataKey::Threshold)
             .unwrap_or(1)
     }
@@ -926,11 +953,17 @@ impl Governance {
     pub fn get_timelock(env: Env) -> u64 {
         env.storage()
             .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
             .get(&DataKey::TimelockSeconds)
             .unwrap_or(DEFAULT_TIMELOCK_SECONDS)
     }
 
     pub fn is_signer(env: Env, address: Address) -> bool {
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
         env.storage()
             .instance()
             .get::<_, Vec<Address>>(&DataKey::Signers)
@@ -943,7 +976,9 @@ impl Governance {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::storage::Persistent as _, testutils::Address as _, testutils::Ledger as _,
+        testutils::storage::{Instance as _, Persistent as _},
+        testutils::Address as _,
+        testutils::Ledger as _,
         BytesN, IntoVal,
     };
 
@@ -2611,5 +2646,46 @@ mod test {
             &0,
         );
         assert_eq!(proposal_id, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "too many signers")]
+    fn test_constructor_rejects_oversized_signers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let mut signers: Vec<Address> = vec![&env];
+        for _ in 0..(MAX_SIGNERS + 1) {
+            signers.push_back(Address::generate(&env));
+        }
+        let threshold: u32 = 2;
+        let empty: Vec<AllowedCall> = vec![&env];
+        env.register(
+            Governance,
+            (&signers, &threshold, &DEFAULT_TIMELOCK_SECONDS, &empty),
+        );
+    }
+
+    #[test]
+    fn test_is_signer_extends_instance_ttl_when_near_expiry() {
+        let (env, client, signers) = setup();
+        let contract_addr = client.address.clone();
+
+        let initial_ttl = env.as_contract(&contract_addr, || {
+            env.storage().instance().get_ttl()
+        });
+        assert!(initial_ttl > 0);
+
+        env.ledger().set_sequence_number(1 + initial_ttl - 5);
+        let ttl_before = env.as_contract(&contract_addr, || {
+            env.storage().instance().get_ttl()
+        });
+        assert!(ttl_before <= 10);
+
+        assert!(client.is_signer(&signers.get(0).unwrap()));
+
+        let ttl_after = env.as_contract(&contract_addr, || {
+            env.storage().instance().get_ttl()
+        });
+        assert!(ttl_after > ttl_before);
     }
 }

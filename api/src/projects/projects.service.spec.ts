@@ -6,7 +6,7 @@ import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { IpfsService } from './ipfs.service';
 import { NonceService } from '../common/services/nonce.service';
-import { ProjectStatusEnum } from './interfaces/project.interface';
+import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse, ProjectSummaryResponse } from './interfaces/project.interface';
 
 const mockRedis = {
   connect: jest.fn().mockResolvedValue(undefined),
@@ -38,6 +38,15 @@ describe('ProjectsService', () => {
       nativeToScVal(status, { type: 'symbol' }),
       nativeToScVal('VM0003', { type: 'symbol' }),
       nativeToScVal('BRA', { type: 'symbol' }),
+    ]);
+  }
+
+  function mockProjectSummaryScVal(id = 1, name = 'Project', status = ProjectStatusEnum.Pending, country = 'US') {
+    return xdr.ScVal.scvVec([
+      nativeToScVal(BigInt(id), { type: 'u64' }),
+      nativeToScVal(name, { type: 'symbol' }),
+      nativeToScVal(status, { type: 'symbol' }),
+      nativeToScVal(country, { type: 'symbol' }),
     ]);
   }
 
@@ -181,17 +190,45 @@ describe('ProjectsService', () => {
       expect(contractService.simulateCall).not.toHaveBeenCalled();
     });
 
-    it('fetches projects count and details from contract if not cached', async () => {
+    it('fetches project count and list from contract in exactly 2 simulate calls', async () => {
       mockRedis.get.mockResolvedValue(null);
       contractService.simulateCall
-        .mockResolvedValueOnce(nativeToScVal(BigInt(1), { type: 'u64' }))
-        .mockResolvedValueOnce(mockProjectScVal(1));
+        .mockResolvedValueOnce(nativeToScVal(BigInt(3), { type: 'u64' }))
+        .mockResolvedValueOnce(xdr.ScVal.scvVec([
+          mockProjectSummaryScVal(1, 'ProjectA', ProjectStatusEnum.Pending, 'US'),
+          mockProjectSummaryScVal(2, 'ProjectB', ProjectStatusEnum.Approved, 'BR'),
+          mockProjectSummaryScVal(3, 'ProjectC', ProjectStatusEnum.Pending, 'KE'),
+        ]));
 
       const result = await service.findAll(1, 20);
 
-      expect(result.data.length).toBe(1);
-      expect(result.meta.total).toBe(1);
+      expect(contractService.simulateCall).toHaveBeenCalledTimes(2);
+      expect(result.data.length).toBe(3);
+      expect(result.data[0]).toEqual<ProjectSummaryResponse>({
+        id: 1,
+        name: 'ProjectA',
+        status: ProjectStatusEnum.Pending,
+        country: 'US',
+      });
+      expect(result.meta.total).toBe(3);
       expect(mockRedis.setEx).toHaveBeenCalledWith('projects:1:20', 60, expect.any(String));
+    });
+
+    it('converts 1-based page to 0-based contract page', async () => {
+      mockRedis.get.mockResolvedValue(null);
+      contractService.simulateCall
+        .mockResolvedValueOnce(nativeToScVal(BigInt(5), { type: 'u64' }))
+        .mockResolvedValueOnce(xdr.ScVal.scvVec([
+          mockProjectSummaryScVal(3, 'ProjectC', ProjectStatusEnum.Pending, 'KE'),
+          mockProjectSummaryScVal(4, 'ProjectD', ProjectStatusEnum.Approved, 'BR'),
+        ]));
+
+      const result = await service.findAll(3, 2);
+
+      expect(result.data.length).toBe(2);
+      expect(result.data[0].id).toBe(3);
+      expect(result.data[1].id).toBe(4);
+      expect(result.meta.page).toBe(3);
     });
   });
 
