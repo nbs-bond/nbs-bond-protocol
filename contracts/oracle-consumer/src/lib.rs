@@ -4426,8 +4426,51 @@ mod test {
 
     // ── TTL / persistent-storage stress tests ────────────────────────────────
 
+    #[test]
+    fn test_backdated_overlap_with_evicted_period_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        for i in 0..=MAX_PERIOD_HISTORY {
+            let period_start = 1_000 + (i as u64) * 100;
+            client.submit_report(
+                &provider,
+                &project_id,
+                &period_start,
+                &(period_start + 50),
+                &100_000i128,
+                &BiodiversityMetrics::Absent,
+                &Symbol::new(&env, "verra_vcs"),
+                &make_ipfs_hash(&env, (i % 256) as u8),
+                &(i as u64),
+            );
+        }
+
+        // The first window has been evicted from the bounded overlap index,
+        // but chronological enforcement must still reject this overlap.
+        let result = client.try_submit_report(
+            &provider,
+            &project_id,
+            &1_000u64,
+            &1_050u64,
+            &50_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 255),
+            &((MAX_PERIOD_HISTORY + 1) as u64),
+        );
+        assert_eq!(result, Err(Ok(OracleError::BackdatedReportPeriod)));
+    }
+
     /// Submit 500 reports for a single project and verify `get_project_reports`
-    /// returns the correct count without panicking.  This exercises the
+    /// returns the correct count without panicking. This exercises the
     /// persistent `ProjectReports` index across many appends and confirms that
     /// the contract does not hit an instance-storage size cap.
     #[test]
