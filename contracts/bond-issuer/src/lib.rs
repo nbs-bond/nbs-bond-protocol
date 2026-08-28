@@ -49,12 +49,24 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
 fn append_holder(env: &Env, bond_id: u64, maturity_date: u64, holder: Address) {
     let key = DataKey::HolderList(bond_id);
     let mut list: Vec<Address> = env.storage().persistent().get(&key).unwrap_or(vec![&env]);
-    list.push_back(holder);
-    env.storage().persistent().set(&key, &list);
 
-    env.storage()
-        .persistent()
-        .set(&DataKey::HolderCount(bond_id), &(list.len() as u64));
+    // Check if holder already exists to prevent duplicates (Issue #119)
+    let mut exists = false;
+    for addr in list.iter() {
+        if addr == holder {
+            exists = true;
+            break;
+        }
+    }
+
+    if !exists {
+        list.push_back(holder.clone());
+        env.storage().persistent().set(&key, &list);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HolderCount(bond_id), &(list.len() as u64));
+    }
+
     extend_bond_ttl(env, bond_id, maturity_date);
 }
 
@@ -674,6 +686,37 @@ mod test {
         let contract_id = env.register(BondIssuer, (&admin,));
         let client = BondIssuerClient::new(&env, &contract_id);
         (env, client, admin, user)
+
+#[test]
+fn test_holder_list_no_duplicate_on_full_transfer_out_and_re_subscribe() {
+    let (env, client, admin, user) = setup();
+    let user2 = Address::generate(&env);
+    let config = make_config(&env);
+    let bond_id = client.issue_bond(&admin, &config, &0);
+
+    // 1. User subscribes
+    client.subscribe(&user, &bond_id, &1000, &0);
+    assert_eq!(client.get_holder_count(&bond_id), 1);
+
+    // 2. User transfers ALL tokens out (balance becomes 0)
+    client.transfer(&user, &user2, &bond_id, &1000);
+    assert_eq!(client.get_holder_balance(&bond_id, &user), 0);
+    // Holder count should be 2 (user with zero balance, user2)
+    assert_eq!(client.get_holder_count(&bond_id), 2);
+
+    // 3. User re-subscribes
+    client.subscribe(&user, &bond_id, &500, &1);
+    assert_eq!(client.get_holder_balance(&bond_id, &user), 500);
+
+    // 4. Verify NO duplicate entry - holder count should still be 2
+    assert_eq!(client.get_holder_count(&bond_id), 2);
+    let list = client.get_holder_list(&bond_id);
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap(), user);
+    assert_eq!(list.get(1).unwrap(), user2);
+}
+
+
     }
 
     #[test]
