@@ -155,6 +155,14 @@ const EXPIRY_WARNING_THRESHOLD_S = 60;
               </table>
             </div>
           }
+
+          @if (totalPages() > 1) {
+            <div class="pagination">
+              <button class="btn btn-outline" [disabled]="currentPage() <= 1" (click)="previousPage()">Previous</button>
+              <span class="page-info">Page {{ currentPage() }} of {{ totalPages() }}</span>
+              <button class="btn btn-outline" [disabled]="currentPage() >= totalPages()" (click)="nextPage()">Next</button>
+            </div>
+          }
         </div>
 
         @if (walletService.isConnected() && myOrders().length > 0) {
@@ -225,13 +233,16 @@ const EXPIRY_WARNING_THRESHOLD_S = 60;
     .orders-table td { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; }
     .orders-table tr:last-child td { border-bottom: none; }
     .mono { font-family: monospace; font-size: 0.8125rem; }
+    .pagination { display: flex; justify-content: center; align-items: center; gap: 16px; margin-top: 24px; }
+    .page-info { font-size: 0.875rem; color: #6b7280; }
     .btn { padding: 8px 16px; border-radius: 8px; font-size: 0.875rem; font-weight: 500; cursor: pointer; border: none; text-decoration: none; display: inline-block; }
     .btn-sm { padding: 6px 12px; font-size: 0.8125rem; }
     .btn-primary { background: #1a1a2e; color: #fff; }
     .btn-primary:hover:not(:disabled) { background: #2a2a4e; }
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-outline { background: #fff; color: #1a1a2e; border: 1px solid #d1d5db; }
-    .btn-outline:hover { background: #f0f2f5; }
+    .btn-outline:hover:not(:disabled) { background: #f0f2f5; }
+    .btn-outline:disabled { opacity: 0.5; cursor: not-allowed; }
     .buy-form { display: flex; flex-direction: column; gap: 6px; min-width: 180px; }
     .buy-input { padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.8125rem; outline: none; width: 100%; }
     .buy-input:focus { border-color: #3b82f6; }
@@ -258,6 +269,9 @@ export class MarketplaceListComponent implements OnInit {
   readonly loading = signal(true);
   readonly error = signal('');
   readonly filterBondId = signal<number | null>(null);
+  readonly currentPage = signal(1);
+  readonly totalPages = signal(1);
+  private readonly pageLimit = 20;
 
   readonly buyOrderId = signal<number | null>(null);
   readonly buySubmitting = signal(false);
@@ -330,12 +344,21 @@ export class MarketplaceListComponent implements OnInit {
     });
   }
 
-  private loadOrders(): void {
+  private loadOrders(page = this.currentPage()): void {
     this.loading.set(true);
     this.error.set('');
-    this.apiService.getOrders(this.filterBondId() ?? undefined).subscribe({
+    this.apiService.getOrders({
+      bondId: this.filterBondId() ?? undefined,
+      page,
+      limit: this.pageLimit,
+    }).subscribe({
       next: (res) => {
         this.orders.set(res.data);
+        this.currentPage.set(res.meta.page);
+        this.totalPages.set(Math.max(
+          res.meta.totalPages,
+          res.meta.hasMore ? res.meta.page + 1 : res.meta.page,
+        ));
         this.loading.set(false);
       },
       error: () => {
@@ -347,12 +370,25 @@ export class MarketplaceListComponent implements OnInit {
 
   onFilterChange(bondId: number | null): void {
     this.filterBondId.set(bondId);
+    this.currentPage.set(1);
     this.router.navigate([], {
       relativeTo: this.route,
-      queryParams: bondId ? { bondId } : {},
+      queryParams: { bondId },
       queryParamsHandling: 'merge',
     });
-    this.loadOrders();
+    this.loadOrders(1);
+  }
+
+  previousPage(): void {
+    if (this.currentPage() > 1) {
+      this.loadOrders(this.currentPage() - 1);
+    }
+  }
+
+  nextPage(): void {
+    if (this.currentPage() < this.totalPages()) {
+      this.loadOrders(this.currentPage() + 1);
+    }
   }
 
   openBuy(order: Order): void {
