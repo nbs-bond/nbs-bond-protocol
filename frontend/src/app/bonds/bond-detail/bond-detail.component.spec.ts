@@ -39,7 +39,7 @@ describe('BondDetailComponent', () => {
   beforeEach(async () => {
     apiService = jasmine.createSpyObj('ApiService', [
       'getBond', 'subscribeToBond', 'claimCredits', 'transferBond',
-      'getUndistributedTotal', 'sweepUndistributed', 'getAccruedCredits',
+      'getUndistributedTotal', 'sweepUndistributed', 'getAccruedCredits', 'getBondPeriods',
     ]);
     apiService.getBond.and.returnValue(of(bond));
     apiService.getUndistributedTotal.and.returnValue(
@@ -56,6 +56,9 @@ describe('BondDetailComponent', () => {
         transactionHash: '0xabc',
       }),
     );
+    apiService.getBondPeriods.and.returnValue(of({
+      data: [], meta: { page: 1, limit: 10, total: 0, totalPages: 1 },
+    }));
     apiService.getAccruedCredits.and.returnValue(
       of({
         bondId: 1,
@@ -209,6 +212,60 @@ describe('BondDetailComponent', () => {
     expect(component.formatCountdown(5 * 1000)).toBe('5s');
     expect(component.formatCountdown(0)).toBe('');
   });
+
+  it('renders distributed period history and pagination metadata', fakeAsync(() => {
+    apiService.getBondPeriods.and.returnValue(of({
+      data: [{
+        periodIndex: 0,
+        startTime: 1000000,
+        endTime: 2000000,
+        totalCreditsEarned: 125,
+        distributed: true,
+        reportId: 4,
+        undistributed: 0,
+      }],
+      meta: { page: 1, limit: 10, total: 11, totalPages: 2 },
+    }));
+    createFixture();
+
+    const section = fixture.nativeElement.querySelector('.coupon-section');
+    expect(section?.textContent).toContain('Period 1');
+    expect(section?.textContent).toContain('125 credits');
+    expect(section?.textContent).toContain('Page 1 of 2');
+    expect(apiService.getBondPeriods).toHaveBeenCalledWith(1, 1, 10, false);
+    discardPeriodicTasks();
+  }));
+
+  it('loads an oracle report when a period is expanded', fakeAsync(() => {
+    const period = {
+      periodIndex: 0,
+      startTime: 1000000,
+      endTime: 2000000,
+      totalCreditsEarned: 125,
+      distributed: true,
+      reportId: 4,
+      undistributed: 0,
+    };
+    apiService.getBondPeriods.and.returnValues(
+      of({ data: [period], meta: { page: 1, limit: 10, total: 1, totalPages: 1 } }),
+      of({
+        data: [{ ...period, report: {
+          id: 4, projectId: 'p', periodStart: 1, periodEnd: 2,
+          carbonSequestered: 99, methodology: 'M', ipfsHash: 'hash',
+          providerAddress: 'G', status: 'Verified', submittedAt: 1, verifiedAt: 2,
+        } }],
+        meta: { page: 1, limit: 10, total: 1, totalPages: 1 },
+      }),
+    );
+    createFixture();
+    (fixture.nativeElement.querySelector('.period-toggle') as HTMLButtonElement).click();
+    tick();
+    fixture.detectChanges();
+
+    expect(apiService.getBondPeriods).toHaveBeenCalledWith(1, 1, 10, true);
+    expect(fixture.nativeElement.textContent).toContain('Carbon sequestered: 99');
+    discardPeriodicTasks();
+  }));
 
   it('loads accrued credits for the connected wallet and renders the claimable amount', fakeAsync(() => {
     const holder = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
