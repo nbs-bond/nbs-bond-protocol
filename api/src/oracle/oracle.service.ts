@@ -6,6 +6,7 @@ import {
   HttpException,
   HttpStatus,
   Logger,
+  NotFoundException,
   OnModuleDestroy,
 } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
@@ -31,6 +32,7 @@ import { createClient, RedisClientType } from '@redis/client';
 import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { StellarService } from '../stellar/stellar.service';
 
+const PROJECT_REGISTRY = () => process.env.PROJECT_REGISTRY_ADDRESS || '';
 const ORACLE_CONSUMER = () => process.env.ORACLE_CONSUMER_ADDRESS || '';
 
 const ORACLE_ERROR_CODE = {
@@ -62,7 +64,54 @@ export class OracleService implements OnModuleDestroy {
     this.redis.connect().catch(() => {});
   }
 
+  private async resolveProjectId(projectId: string): Promise<number> {
+    const normalized = projectId.trim();
+    if (!normalized) {
+      throw new BadRequestException('projectId is required');
+    }
+
+    if (/^\d+$/.test(normalized)) {
+      const parsed = Number(normalized);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new BadRequestException(`Invalid numeric project ID: ${projectId}`);
+      }
+      return parsed;
+    }
+
+    const registryAddress = PROJECT_REGISTRY();
+    if (!registryAddress) {
+      throw new BadRequestException('PROJECT_REGISTRY_ADDRESS is not configured');
+    }
+
+    try {
+      const projectScVal = await this.contractService.simulateCall({
+        contractAddress: registryAddress,
+        method: 'get_project_by_hash',
+        args: [toBytes32(normalized)],
+      });
+      const project = scValToNative(projectScVal) as Record<string, unknown> | unknown[];
+      const numericId = Number(Array.isArray(project) ? project[0] : project?.id ?? NaN);
+      if (!Number.isSafeInteger(numericId) || numericId <= 0) {
+        throw new NotFoundException(`Project "${projectId}" was not found in the registry`);
+      }
+      return numericId;
+    } catch (error) {
+      if (error instanceof NotFoundException || error instanceof BadRequestException) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (/ProjectNotFound|not found|project.*registry/i.test(message)) {
+        throw new NotFoundException(`Project "${projectId}" was not found in the registry`);
+      }
+      throw new BadRequestException(
+        `Unable to resolve registry project id for "${projectId}": ${message}`,
+      );
+    }
+  }
+
   async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<ReportResponse> {
+    const registryProjectId = await this.resolveProjectId(dto.projectId);
+
     const ipfsResult = await this.ipfsService.uploadJson({
       projectId: dto.projectId,
       periodStart: dto.periodStart,
@@ -82,7 +131,7 @@ export class OracleService implements OnModuleDestroy {
       ORACLE_CONSUMER(), 'submit_report', adminSecret,
       [
         Address.fromString(providerAddress).toScVal(),
-        toBytes32(dto.projectId),
+        nativeToScVal(BigInt(registryProjectId), { type: 'u64' }),
         nativeToScVal(BigInt(dto.periodStart), { type: 'u64' }),
         nativeToScVal(BigInt(dto.periodEnd), { type: 'u64' }),
         nativeToScVal(BigInt(dto.carbonSequestered), { type: 'i128' }),
@@ -109,6 +158,7 @@ export class OracleService implements OnModuleDestroy {
   }
 
   async getProjectReports(projectId: string): Promise<ReportResponse[]> {
+    const registryProjectId = await this.resolveProjectId(projectId);
     const cacheKey = `reports:${projectId}`;
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);
@@ -116,7 +166,7 @@ export class OracleService implements OnModuleDestroy {
     const idsScVal = await this.contractService.simulateCall({
       contractAddress: ORACLE_CONSUMER(),
       method: 'get_project_reports',
-      args: [toBytes32(projectId)],
+      args: [nativeToScVal(BigInt(registryProjectId), { type: 'u64' })],
     });
     const ids = scValToNative(idsScVal) as number[];
 

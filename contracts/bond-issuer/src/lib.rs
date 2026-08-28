@@ -478,10 +478,21 @@ impl BondIssuer {
 
     /// Full on-chain holder list for `bond_id`, in insertion order.
     pub fn get_holder_list(env: Env, bond_id: u64) -> Vec<Address> {
-        env.storage()
+        let config: Option<BondConfig> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondConfig(bond_id));
+        let holder_list = env
+            .storage()
             .persistent()
             .get(&DataKey::HolderList(bond_id))
-            .unwrap_or(vec![&env])
+            .unwrap_or(vec![&env]);
+
+        if let Some(config) = config {
+            extend_bond_ttl(&env, bond_id, config.maturity_date);
+        }
+
+        holder_list
     }
 
     /// Number of distinct holders ever recorded for `bond_id`.
@@ -494,12 +505,20 @@ impl BondIssuer {
     /// Mirrors `get_bond_ids_range` so the API can page through the holder
     /// list without materialising it in a single call.
     pub fn get_holder_list_range(env: Env, bond_id: u64, start: u32, count: u32) -> Vec<Address> {
+        let config: Option<BondConfig> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BondConfig(bond_id));
         let holder_list: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::HolderList(bond_id))
             .unwrap_or(vec![&env]);
         let mut result: Vec<Address> = vec![&env];
+
+        if let Some(config) = config {
+            extend_bond_ttl(&env, bond_id, config.maturity_date);
+        }
 
         let len = holder_list.len();
         if count == 0 || start >= len {
@@ -1507,6 +1526,53 @@ mod test {
             env.storage().persistent().get_ttl(&config_key)
         });
         assert!(ttl_after > ttl_before);
+    }
+
+    #[test]
+    fn test_holder_list_reads_survive_near_ttl_expiry() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+        client.subscribe(&user, &bond_id, &1000, &0);
+
+        let contract_addr = client.address.clone();
+        let holder_list_key = DataKey::HolderList(bond_id);
+        let initial_ttl = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&holder_list_key)
+        });
+        assert!(initial_ttl > 5);
+
+        let near_expiry_sequence = 1 + initial_ttl - 5;
+        env.ledger().set_sequence_number(near_expiry_sequence);
+        let ttl_before = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&holder_list_key)
+        });
+        assert!(ttl_before <= 10);
+
+        assert_eq!(
+            client.get_holder_list(&bond_id),
+            vec![&env, user.clone()]
+        );
+        let ttl_after_full_read = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&holder_list_key)
+        });
+        assert!(ttl_after_full_read > ttl_before);
+
+        let near_expiry_sequence = near_expiry_sequence + ttl_after_full_read - 5;
+        env.ledger().set_sequence_number(near_expiry_sequence);
+        let ttl_before_range_read = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&holder_list_key)
+        });
+        assert!(ttl_before_range_read <= 10);
+
+        assert_eq!(
+            client.get_holder_list_range(&bond_id, &0, &1),
+            vec![&env, user]
+        );
+        let ttl_after_range_read = env.as_contract(&contract_addr, || {
+            env.storage().persistent().get_ttl(&holder_list_key)
+        });
+        assert!(ttl_after_range_read > ttl_before_range_read);
     }
 
     mod property {
