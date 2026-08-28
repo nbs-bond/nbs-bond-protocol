@@ -116,9 +116,8 @@ export class ApiService {
     return this.http.post<Project>('/api/projects', data, { headers: this.headers() });
   }
 
-  getOrders(options: { bondId?: number; page?: number; limit?: number } = {}): Observable<PaginatedResponse<Order>> {
-    const { bondId, page = 1, limit = 20 } = options;
-    const params: { bondId?: number; page: number; limit: number } = { page, limit };
+  getOrders(bondId?: number, page = 1, limit = 20): Observable<PaginatedResponse<Order>> {
+    const params: any = { page, limit };
     if (bondId) params.bondId = bondId;
     return this.http.get<PaginatedResponse<Order>>('/api/marketplace/orders', {
       params, headers: this.headers(),

@@ -158,9 +158,17 @@ const EXPIRY_WARNING_THRESHOLD_S = 60;
 
           @if (totalPages() > 1) {
             <div class="pagination">
-              <button class="btn btn-outline" [disabled]="currentPage() <= 1" (click)="previousPage()">Previous</button>
-              <span class="page-info">Page {{ currentPage() }} of {{ totalPages() }}</span>
-              <button class="btn btn-outline" [disabled]="currentPage() >= totalPages()" (click)="nextPage()">Next</button>
+              <button
+                class="btn btn-sm btn-outline prev-page"
+                (click)="previousPage()"
+                [disabled]="currentPage() <= 1"
+              >Previous</button>
+              <span class="page-indicator">Page {{ currentPage() }} of {{ totalPages() }}</span>
+              <button
+                class="btn btn-sm btn-outline next-page"
+                (click)="nextPage()"
+                [disabled]="currentPage() >= totalPages()"
+              >Next</button>
             </div>
           }
         </div>
@@ -232,6 +240,8 @@ const EXPIRY_WARNING_THRESHOLD_S = 60;
     .orders-table th { text-align: left; padding: 12px 16px; font-weight: 600; color: #6b7280; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; border-bottom:1px solid #e5e7eb; background: #f9fafb; }
     .orders-table td { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; }
     .orders-table tr:last-child td { border-bottom: none; }
+    .pagination { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 16px; }
+    .page-indicator { font-size: 0.8125rem; color: #6b7280; }
     .mono { font-family: monospace; font-size: 0.8125rem; }
     .pagination { display: flex; justify-content: center; align-items: center; gap: 16px; margin-top: 24px; }
     .page-info { font-size: 0.875rem; color: #6b7280; }
@@ -271,7 +281,6 @@ export class MarketplaceListComponent implements OnInit {
   readonly filterBondId = signal<number | null>(null);
   readonly currentPage = signal(1);
   readonly totalPages = signal(1);
-  private readonly pageLimit = 20;
 
   readonly buyOrderId = signal<number | null>(null);
   readonly buySubmitting = signal(false);
@@ -344,21 +353,14 @@ export class MarketplaceListComponent implements OnInit {
     });
   }
 
-  private loadOrders(page = this.currentPage()): void {
+  private loadOrders(page: number = this.currentPage()): void {
     this.loading.set(true);
     this.error.set('');
-    this.apiService.getOrders({
-      bondId: this.filterBondId() ?? undefined,
-      page,
-      limit: this.pageLimit,
-    }).subscribe({
+    this.apiService.getOrders(this.filterBondId() ?? undefined, page, 20).subscribe({
       next: (res) => {
         this.orders.set(res.data);
         this.currentPage.set(res.meta.page);
-        this.totalPages.set(Math.max(
-          res.meta.totalPages,
-          res.meta.hasMore ? res.meta.page + 1 : res.meta.page,
-        ));
+        this.totalPages.set(res.meta.totalPages || 1);
         this.loading.set(false);
       },
       error: () => {
@@ -366,6 +368,18 @@ export class MarketplaceListComponent implements OnInit {
         this.loading.set(false);
       },
     });
+  }
+
+  previousPage(): void {
+    const page = this.currentPage() - 1;
+    if (page < 1) return;
+    this.loadOrders(page);
+  }
+
+  nextPage(): void {
+    const page = this.currentPage() + 1;
+    if (page > this.totalPages()) return;
+    this.loadOrders(page);
   }
 
   onFilterChange(bondId: number | null): void {
@@ -376,19 +390,8 @@ export class MarketplaceListComponent implements OnInit {
       queryParams: { bondId },
       queryParamsHandling: 'merge',
     });
+    this.currentPage.set(1);
     this.loadOrders(1);
-  }
-
-  previousPage(): void {
-    if (this.currentPage() > 1) {
-      this.loadOrders(this.currentPage() - 1);
-    }
-  }
-
-  nextPage(): void {
-    if (this.currentPage() < this.totalPages()) {
-      this.loadOrders(this.currentPage() + 1);
-    }
   }
 
   openBuy(order: Order): void {
