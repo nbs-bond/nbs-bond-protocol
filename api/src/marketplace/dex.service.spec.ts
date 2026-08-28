@@ -530,7 +530,7 @@ describe('DexService', () => {
       await service.buyBondTokens(dto, SELLER).catch(() => undefined);
       expect(nonceSyncMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
     });
 
@@ -668,7 +668,7 @@ describe('DexService', () => {
       jest.clearAllMocks();
     });
 
-    it('listBondTokens allocates nonce for admin signer, not seller', async () => {
+    it('listBondTokens allocates nonce for seller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({
         result: nativeToScVal(BigInt(1), { type: 'u64' }),
         transactionHash: 'txhash',
@@ -687,15 +687,15 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('buyBondTokens allocates nonce for admin signer, not buyer', async () => {
+    it('buyBondTokens allocates nonce for buyer, not admin signer', async () => {
       jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
       jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
         address: SELLER,
@@ -713,30 +713,30 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('cancelOrder allocates nonce for admin signer, not caller', async () => {
+    it('cancelOrder allocates nonce for caller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({ transactionHash: 'txhash' });
 
       await service.cancelOrder(1, SELLER);
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('depositQuote allocates nonce for admin signer, not caller', async () => {
+    it('depositQuote allocates nonce for caller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({
         transactionHash: 'abc123',
         successful: true,
@@ -747,15 +747,15 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('withdrawQuote allocates nonce for admin signer, not caller', async () => {
+    it('withdrawQuote allocates nonce for caller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({
         transactionHash: 'def456',
         successful: true,
@@ -766,15 +766,15 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('buyBondTokens re-syncs nonce for admin signer on failure', async () => {
+    it('buyBondTokens re-syncs nonce for buyer on failure', async () => {
       jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
       jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
         address: SELLER,
@@ -790,7 +790,7 @@ describe('DexService', () => {
 
       expect(nonceSyncMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
     });
   });
