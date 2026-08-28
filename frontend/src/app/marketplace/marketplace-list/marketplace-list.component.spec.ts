@@ -123,4 +123,76 @@ describe('MarketplaceListComponent', () => {
       maxPrice: 10,
     });
   });
+
+  it('passes page and limit query params when fetching orders', () => {
+    expect(apiService.getOrders).toHaveBeenCalledWith(undefined, 1, 20);
+  });
+
+  it('hides pagination controls when there is only a single page', () => {
+    const el: HTMLElement = fixture.nativeElement;
+    expect(el.querySelector('.pagination')).toBeNull();
+    expect(el.textContent).not.toContain('Page 1 of');
+  });
+
+  it('shows pagination controls and navigates between pages', () => {
+    apiService.getOrders.and.returnValues(
+      of({ data: [ORDER], meta: { page: 1, limit: 20, total: 45, totalPages: 3 } }),
+      of({ data: [{ ...ORDER, id: 2 }], meta: { page: 2, limit: 20, total: 45, totalPages: 3 } }),
+      of({ data: [ORDER], meta: { page: 1, limit: 20, total: 45, totalPages: 3 } }),
+    );
+    fixture = TestBed.createComponent(MarketplaceListComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+
+    const el: HTMLElement = fixture.nativeElement;
+    expect(apiService.getOrders).toHaveBeenCalledWith(undefined, 1, 20);
+    expect(el.textContent).toContain('Page 1 of 3');
+
+    const prev = el.querySelector<HTMLButtonElement>('.prev-page');
+    const next = el.querySelector<HTMLButtonElement>('.next-page');
+    expect(prev?.disabled).toBe(true);
+    expect(next?.disabled).toBe(false);
+
+    next!.click();
+    fixture.detectChanges();
+
+    expect(apiService.getOrders).toHaveBeenCalledWith(undefined, 2, 20);
+    expect(component.currentPage()).toBe(2);
+    expect(component.totalPages()).toBe(3);
+    expect(el.textContent).toContain('Page 2 of 3');
+    expect(el.querySelector<HTMLButtonElement>('.prev-page')?.disabled).toBe(false);
+
+    el.querySelector<HTMLButtonElement>('.prev-page')!.click();
+    fixture.detectChanges();
+
+    expect(apiService.getOrders).toHaveBeenCalledWith(undefined, 1, 20);
+    expect(component.currentPage()).toBe(1);
+    expect(el.textContent).toContain('Page 1 of 3');
+  });
+
+  it('disables next on the last page', () => {
+    apiService.getOrders.and.returnValue(of({ data: [ORDER], meta: { page: 3, limit: 20, total: 45, totalPages: 3 } }));
+    fixture = TestBed.createComponent(MarketplaceListComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+
+    const el: HTMLElement = fixture.nativeElement;
+    expect(el.querySelector<HTMLButtonElement>('.next-page')?.disabled).toBe(true);
+  });
+
+  it('resets to the first page when the bond filter changes', () => {
+    apiService.getOrders.and.returnValues(
+      of({ data: [ORDER], meta: { page: 1, limit: 20, total: 1, totalPages: 1 } }),
+      of({ data: [ORDER], meta: { page: 1, limit: 20, total: 1, totalPages: 1 } }),
+    );
+    fixture = TestBed.createComponent(MarketplaceListComponent);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+
+    component.onFilterChange(3);
+    fixture.detectChanges();
+
+    expect(apiService.getOrders).toHaveBeenCalledWith(3, 1, 20);
+    expect(component.currentPage()).toBe(1);
+  });
 });

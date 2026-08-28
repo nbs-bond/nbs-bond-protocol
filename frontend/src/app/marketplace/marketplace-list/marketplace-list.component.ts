@@ -155,6 +155,22 @@ const EXPIRY_WARNING_THRESHOLD_S = 60;
               </table>
             </div>
           }
+
+          @if (totalPages() > 1) {
+            <div class="pagination">
+              <button
+                class="btn btn-sm btn-outline prev-page"
+                (click)="previousPage()"
+                [disabled]="currentPage() <= 1"
+              >Previous</button>
+              <span class="page-indicator">Page {{ currentPage() }} of {{ totalPages() }}</span>
+              <button
+                class="btn btn-sm btn-outline next-page"
+                (click)="nextPage()"
+                [disabled]="currentPage() >= totalPages()"
+              >Next</button>
+            </div>
+          }
         </div>
 
         @if (walletService.isConnected() && myOrders().length > 0) {
@@ -224,6 +240,8 @@ const EXPIRY_WARNING_THRESHOLD_S = 60;
     .orders-table th { text-align: left; padding: 12px 16px; font-weight: 600; color: #6b7280; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; border-bottom:1px solid #e5e7eb; background: #f9fafb; }
     .orders-table td { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; }
     .orders-table tr:last-child td { border-bottom: none; }
+    .pagination { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 16px; }
+    .page-indicator { font-size: 0.8125rem; color: #6b7280; }
     .mono { font-family: monospace; font-size: 0.8125rem; }
     .btn { padding: 8px 16px; border-radius: 8px; font-size: 0.875rem; font-weight: 500; cursor: pointer; border: none; text-decoration: none; display: inline-block; }
     .btn-sm { padding: 6px 12px; font-size: 0.8125rem; }
@@ -258,6 +276,8 @@ export class MarketplaceListComponent implements OnInit {
   readonly loading = signal(true);
   readonly error = signal('');
   readonly filterBondId = signal<number | null>(null);
+  readonly currentPage = signal(1);
+  readonly totalPages = signal(1);
 
   readonly buyOrderId = signal<number | null>(null);
   readonly buySubmitting = signal(false);
@@ -330,12 +350,14 @@ export class MarketplaceListComponent implements OnInit {
     });
   }
 
-  private loadOrders(): void {
+  private loadOrders(page: number = this.currentPage()): void {
     this.loading.set(true);
     this.error.set('');
-    this.apiService.getOrders(this.filterBondId() ?? undefined).subscribe({
+    this.apiService.getOrders(this.filterBondId() ?? undefined, page, 20).subscribe({
       next: (res) => {
         this.orders.set(res.data);
+        this.currentPage.set(res.meta.page);
+        this.totalPages.set(res.meta.totalPages || 1);
         this.loading.set(false);
       },
       error: () => {
@@ -345,6 +367,18 @@ export class MarketplaceListComponent implements OnInit {
     });
   }
 
+  previousPage(): void {
+    const page = this.currentPage() - 1;
+    if (page < 1) return;
+    this.loadOrders(page);
+  }
+
+  nextPage(): void {
+    const page = this.currentPage() + 1;
+    if (page > this.totalPages()) return;
+    this.loadOrders(page);
+  }
+
   onFilterChange(bondId: number | null): void {
     this.filterBondId.set(bondId);
     this.router.navigate([], {
@@ -352,7 +386,8 @@ export class MarketplaceListComponent implements OnInit {
       queryParams: bondId ? { bondId } : {},
       queryParamsHandling: 'merge',
     });
-    this.loadOrders();
+    this.currentPage.set(1);
+    this.loadOrders(1);
   }
 
   openBuy(order: Order): void {
