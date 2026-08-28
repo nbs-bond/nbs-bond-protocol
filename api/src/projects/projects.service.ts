@@ -7,7 +7,7 @@ import { toBytes32 } from '../stellar/bytes32';
 import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { createClient, RedisClientType } from '@redis/client';
 import { CreateProjectDto } from './dto/create-project.dto';
-import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse } from './interfaces/project.interface';
+import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse, ProjectSummaryResponse } from './interfaces/project.interface';
 
 const PROJECT_REGISTRY = () => process.env.PROJECT_REGISTRY_ADDRESS || '';
 
@@ -88,25 +88,28 @@ export class ProjectsService implements OnModuleDestroy {
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);
 
-    let total = 0;
-    try {
-      const countScVal = await this.contractService.simulateCall({
+    const contractPage = Math.max(0, page - 1);
+
+    const [countScVal, listScVal] = await Promise.all([
+      this.contractService.simulateCall({
         contractAddress: PROJECT_REGISTRY(), method: 'project_count', args: [],
-      });
-      total = Number(scValToNative(countScVal));
-    } catch {}
+      }),
+      this.contractService.simulateCall({
+        contractAddress: PROJECT_REGISTRY(), method: 'list_projects', args: [
+          nativeToScVal(BigInt(contractPage), { type: 'u64' }),
+          nativeToScVal(BigInt(limit), { type: 'u64' }),
+        ],
+      }),
+    ]);
 
-    const projects: ProjectResponse[] = [];
-    const start = (page - 1) * limit;
-    const end = Math.min(start + limit, total);
-
-    for (let id = 1; id <= total; id++) {
-      if (id > start && id <= end) {
-        try {
-          projects.push(await this.buildProjectResponse(id));
-        } catch {}
-      }
-    }
+    const total = Number(scValToNative(countScVal));
+    const rawProjects = scValToNative(listScVal) as any[][];
+    const projects: ProjectSummaryResponse[] = rawProjects.map((p) => ({
+      id: Number(p[0]),
+      name: String(p[1]),
+      status: p[2] as ProjectStatusEnum,
+      country: String(p[3]),
+    }));
 
     const result = {
       data: projects,

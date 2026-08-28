@@ -18,6 +18,13 @@ export interface ProjectResponse {
   createdAt: string;
 }
 
+export interface ProjectSummaryResponse {
+  id: number;
+  name: string;
+  status: ProjectStatusEnum;
+  country: string;
+}
+
 export interface DocumentUploadResponse {
   projectId: number;
   documentHashes: string[];
