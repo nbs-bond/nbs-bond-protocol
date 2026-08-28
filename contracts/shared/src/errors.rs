@@ -95,6 +95,10 @@ pub enum OracleError {
     /// elapsed; challenges may only be expired once resolution has stalled
     /// past `CHALLENGE_TIMEOUT_SECONDS`.
     ChallengeNotStale = 25,
+    /// A report period starts before the end of the most recently submitted
+    /// period for the same project. Reports must be chronological so the
+    /// bounded overlap index cannot permit overlaps with evicted history.
+    BackdatedReportPeriod = 26,
 }
 
 #[derive(Clone, Debug, PartialEq)]
