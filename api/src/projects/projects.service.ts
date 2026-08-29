@@ -103,7 +103,7 @@ export class ProjectsService implements OnModuleDestroy {
     for (let id = 1; id <= total; id++) {
       if (id > start && id <= end) {
         try {
-          projects.push(await this.buildProjectResponse(id));
+          projects.push(await this.buildProjectResponse(id, false));
         } catch {}
       }
     }
@@ -173,7 +173,7 @@ export class ProjectsService implements OnModuleDestroy {
     return { projectId: id, documentHashes, gatewayUrls };
   }
 
-  private async buildProjectResponse(id: number): Promise<ProjectResponse> {
+  private async buildProjectResponse(id: number, fetchIpfs = true): Promise<ProjectResponse> {
     const projectScVal = await this.contractService.simulateCall({
       contractAddress: PROJECT_REGISTRY(), method: 'get_project',
       args: [nativeToScVal(BigInt(id), { type: 'u64' })],
@@ -182,17 +182,25 @@ export class ProjectsService implements OnModuleDestroy {
     const project = scValToNative(projectScVal) as any[];
 
     const metadataIpfsHash = Buffer.from(project[2] as Uint8Array).toString('hex');
+
+    // On-chain Project field order:
+    // [0] id, [1] owner, [2] metadata_ipfs_hash, [3] name, [4] status,
+    // [5] methodology, [6] country. `name` is a Symbol decoded to a string.
     let metadata: any = {};
-    try {
-      metadata = await this.ipfsService.getContent(metadataIpfsHash);
-    } catch {}
+    if (fetchIpfs) {
+      try {
+        metadata = await this.ipfsService.getContent(metadataIpfsHash);
+      } catch {}
+    }
+
+    const name = (project[3] as string) || '';
 
     return {
       id: Number(project[0]),
-      name: metadata.name || `Project #${id}`,
-      status: project[3] as ProjectStatusEnum,
-      methodology: project[4] as string,
-      country: project[5] as string,
+      name: name.length ? name : `Project #${id}`,
+      status: project[4] as ProjectStatusEnum,
+      methodology: project[5] as string,
+      country: project[6] as string,
       metadataIpfsHash,
       ownerAddress: (project[1] as any).toString?.() || '',
       totalAreaHa: metadata.totalAreaHa || 0,
