@@ -116,7 +116,6 @@ jobs:
       - name: Test
         run: npm run test -- --watch=false --browsers=ChromeHeadless
         working-directory: frontend
-        continue-on-error: true
       - name: Build
         run: npm run build
         working-directory: frontend
