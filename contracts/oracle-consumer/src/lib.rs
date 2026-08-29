@@ -674,6 +674,22 @@ impl OracleConsumer {
         }
         set_nonce(&env, &challenger, expected_nonce + 1);
 
+        // Defense-in-depth against a duplicate challenge for the same report.
+        // A challenge submitted on a later ledger (or any sequential invocation)
+        // is rejected here before any work is done. Two `challenge_report` calls
+        // for the same report that land in a *single* ledger cannot both commit:
+        // this function writes `DataKey::Challenge(report_id)` and flips
+        // `DataKey::Report(report_id)` to `Challenged`, so the host's per-ledger
+        // read/write footprint conflict rejects the loser before `challenge_report`
+        // even executes. A silent last-writer overwrite is therefore impossible.
+        // We deliberately do NOT take a placeholder-claim write up front: an early
+        // claim abandoned by a later-failing validation would permanently block
+        // the report from ever being challenged.
+        let challenge_key = DataKey::Challenge(report_id);
+        if env.storage().persistent().has(&challenge_key) {
+            return Err(OracleError::ChallengeAlreadyExists);
+        }
+
         let report_key = DataKey::Report(report_id);
         let report: Report = env
             .storage()
@@ -698,11 +714,6 @@ impl OracleConsumer {
             .unwrap_or(CHALLENGE_WINDOW_SECONDS);
         if now.saturating_sub(report.submitted_at) > window {
             return Err(OracleError::ChallengeWindowExpired);
-        }
-
-        let challenge_key = DataKey::Challenge(report_id);
-        if env.storage().persistent().has(&challenge_key) {
-            return Err(OracleError::ChallengeAlreadyExists);
         }
 
         // Economic gate (issue #186): the challenger must have a deposited
@@ -2443,6 +2454,78 @@ mod test {
         let result =
             client.try_challenge_report(&challenger, &report_id, &make_ipfs_hash(&env, 2), &0);
         assert_eq!(result, Err(Ok(OracleError::ChallengeAlreadyExists)));
+    }
+
+    #[test]
+    fn test_concurrent_challenge_report_only_one_survives() {
+        // Models two independent `challenge_report` transactions for the same
+        // report. The Soroban test host applies invocations sequentially within a
+        // single ledger, so the second call observes the first's committed
+        // `DataKey::Challenge(report_id)` and is rejected with
+        // `ChallengeAlreadyExists` rather than overwriting it. On a live network
+        // the same-ledger race is additionally stopped by the host's read/write
+        // footprint conflict on that key (see `challenge_report`): only one
+        // transaction can commit its write, so no silent last-writer overwrite
+        // is possible. This test pins the observable outcome — exactly one
+        // challenge, owned by the first accepted transaction.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let challenger_a = Address::generate(&env);
+        let challenger_b = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = register_oracle(&env, &admin);
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        // Both challengers fund a bond so the economic gate passes for the first
+        // attempt; the second never reaches the gate because the early
+        // `ChallengeAlreadyExists` guard rejects it.
+        client.deposit_challenge_bond(&challenger_a, &CHALLENGE_BOND, &0);
+        client.deposit_challenge_bond(&challenger_b, &CHALLENGE_BOND, &0);
+
+        let evidence_a = make_ipfs_hash(&env, 11);
+        let evidence_b = make_ipfs_hash(&env, 22);
+
+        let first = client.try_challenge_report(&challenger_a, &report_id, &evidence_a, &1);
+        let second = client.try_challenge_report(&challenger_b, &report_id, &evidence_b, &1);
+
+        assert_eq!(first, Ok(Ok(())));
+        assert_eq!(second, Err(Ok(OracleError::ChallengeAlreadyExists)));
+
+        // Exactly one challenge is stored, and it is challenger A's evidence.
+        let challenge = client.get_challenge(&report_id);
+        assert_eq!(challenge.challenger, challenger_a);
+        assert_eq!(challenge.counter_evidence_hash, evidence_a);
+
+        // The report was flipped to `Challenged` exactly once.
+        assert_eq!(
+            client.get_report(&report_id).status,
+            ReportStatus::Challenged
+        );
+
+        // Challenger B's bond was never charged, confirming their challenge did
+        // not commit.
+        assert_eq!(
+            client.get_challenge_bond_balance(&challenger_b),
+            CHALLENGE_BOND
+        );
     }
 
     #[test]
