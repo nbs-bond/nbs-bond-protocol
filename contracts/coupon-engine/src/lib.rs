@@ -269,6 +269,16 @@ impl CouponEngine {
             }
         }
 
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodCount(bond_id))
+            .unwrap_or(0);
+
+        if period_index != current_count {
+            return Err(CouponEngineError::InvalidPeriodIndex);
+        }
+
         let project_id: BytesN<32> = env
             .storage()
             .instance()
