@@ -210,6 +210,29 @@ describe('BondDetailComponent', () => {
     expect(component.formatCountdown(0)).toBe('');
   });
 
+  it('renders coupon schedule dates from unix seconds without showing 1970', fakeAsync(() => {
+    const seconds = 1700000000; // ~Nov 2023 (unix seconds)
+    apiService.getBond.and.returnValue(
+      of({ ...bond, couponSchedule: [seconds] }),
+    );
+    createFixture();
+
+    const couponDates = Array.from(
+      fixture.nativeElement.querySelectorAll('.coupon-date'),
+    ) as HTMLElement[];
+
+    expect(couponDates.length).toBe(1);
+    const rendered = couponDates[0]?.textContent?.trim() ?? '';
+    // Seconds passed directly to the date pipe would render as Jan 1970
+    // (the value would be interpreted as milliseconds).
+    expect(rendered).not.toMatch(/1970/);
+    // The value is now treated as milliseconds, so the correct calendar
+    // year (2023 for 1700000000s) must appear regardless of the local
+    // timezone used by the date pipe.
+    expect(rendered).toMatch(/202[3-4]/);
+    discardPeriodicTasks();
+  }));
+
   it('loads accrued credits for the connected wallet and renders the claimable amount', fakeAsync(() => {
     const holder = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
     walletService.address.set(holder);
