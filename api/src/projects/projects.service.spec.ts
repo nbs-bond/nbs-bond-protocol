@@ -35,9 +35,11 @@ describe('ProjectsService', () => {
       nativeToScVal(BigInt(id), { type: 'u64' }),
       Address.fromString(mockOwnerAddress).toScVal(),
       xdr.ScVal.scvBytes(Buffer.from('QmYwAPJzv5CZsnAzt8auVZRnGi2C8Qp9G2YB3hM9oWZpDa')),
-      nativeToScVal(status, { type: 'symbol' }),
-      nativeToScVal('VM0003', { type: 'symbol' }),
-      nativeToScVal('BRA', { type: 'symbol' }),
+      // name (index 3) — a Symbol, slugged to the Soroban charset.
+      nativeToScVal('Amazon_Reforestation', { type: 'symbol' }),
+      nativeToScVal(status, { type: 'symbol' }), // status (index 4)
+      nativeToScVal('VM0003', { type: 'symbol' }), // methodology (index 5)
+      nativeToScVal('BRA', { type: 'symbol' }), // country (index 6)
     ]);
   }
 
@@ -130,7 +132,9 @@ describe('ProjectsService', () => {
         expect.any(String),
       );
       expect(result.id).toBe(1);
-      expect(result.name).toBe('Amazon Reforestation');
+      // The displayed name is decoded from the on-chain Symbol (slugged form),
+      // not from IPFS metadata (see buildProjectResponse field-index fix #275).
+      expect(result.name).toBe('Amazon_Reforestation');
     });
 
     it('sends all 5 contract args in signature order, including the name Symbol (issue #235)', async () => {
@@ -193,6 +197,24 @@ describe('ProjectsService', () => {
       expect(result.meta.total).toBe(1);
       expect(mockRedis.setEx).toHaveBeenCalledWith('projects:1:20', 60, expect.any(String));
     });
+
+    it('decodes on-chain fields in the correct index order and skips IPFS', async () => {
+      mockRedis.get.mockResolvedValue(null);
+      contractService.simulateCall
+        .mockResolvedValueOnce(nativeToScVal(BigInt(1), { type: 'u64' }))
+        .mockResolvedValueOnce(mockProjectScVal(1, ProjectStatusEnum.Approved));
+
+      const result = await service.findAll(1, 20);
+
+      const project = result.data[0];
+      expect(project.name).toBe('Amazon_Reforestation');
+      expect(project.status).toBe(ProjectStatusEnum.Approved);
+      expect(project.methodology).toBe('VM0003');
+      expect(project.country).toBe('BRA');
+      expect(project.ownerAddress).toBe(mockOwnerAddress);
+      // The list endpoint must not hit IPFS for the on-chain fields.
+      expect(ipfsService.getContent).not.toHaveBeenCalled();
+    });
   });
 
   describe('findOne', () => {
@@ -214,6 +236,21 @@ describe('ProjectsService', () => {
 
       expect(result.id).toBe(1);
       expect(mockRedis.setEx).toHaveBeenCalledWith('project:1', 300, expect.any(String));
+    });
+
+    it('decodes on-chain fields in the correct index order for a single project', async () => {
+      mockRedis.get.mockResolvedValueOnce(null);
+      contractService.simulateCall.mockResolvedValue(
+        mockProjectScVal(1, ProjectStatusEnum.Pending),
+      );
+
+      const result = await service.findOne(1);
+
+      expect(result.name).toBe('Amazon_Reforestation');
+      expect(result.status).toBe(ProjectStatusEnum.Pending);
+      expect(result.methodology).toBe('VM0003');
+      expect(result.country).toBe('BRA');
+      expect(result.ownerAddress).toBe(mockOwnerAddress);
     });
   });
 

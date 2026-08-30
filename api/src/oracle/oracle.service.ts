@@ -2,7 +2,6 @@ import {
   Injectable,
   BadRequestException,
   ConflictException,
-  ForbiddenException,
   HttpException,
   HttpStatus,
   Logger,
@@ -13,11 +12,12 @@ import { toBytes32 } from '../stellar/bytes32';
 import { IpfsService } from '../projects/ipfs.service';
 import { NonceService } from '../common/services/nonce.service';
 import { SubmitReportDto } from './dto/submit-report.dto';
-import { ChallengeDto } from './dto/challenge.dto';
+import { ChallengeDto, PrepareChallengeDto } from './dto/challenge.dto';
 import { RegisterProviderDto } from './dto/register-provider.dto';
 import {
   ReportResponse,
   ChallengeResponse,
+  ChallengePrepareResponse,
   ProviderResponse,
   ProviderStatsWithHistory,
   ProviderHealthStatus,
@@ -157,41 +157,67 @@ export class OracleService implements OnModuleDestroy {
     );
   }
 
-  async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: string): Promise<ChallengeResponse> {
+  /**
+   * First step of the pre-signed-transaction challenge flow: builds and
+   * returns an UNSIGNED `challenge_report` transaction for the challenger's
+   * own wallet to sign. The API never holds or signs with a challenger's
+   * key — see ContractService.prepareTransaction().
+   */
+  async prepareChallenge(
+    reportId: number,
+    dto: PrepareChallengeDto,
+    challengerAddress: string,
+  ): Promise<ChallengePrepareResponse> {
     if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(dto.counterEvidenceHash)) {
       throw new BadRequestException(
         'counterEvidenceHash must be a valid 46-character CIDv0 beginning with Qm',
       );
     }
 
-    let investorSecret: string;
     try {
-      investorSecret = this.getInvestorSecret();
       Address.fromString(challengerAddress);
     } catch {
       throw new BadRequestException('A valid challenger wallet address is required');
-    }
-    const signerAddress = this.stellarService
-      .getKeypairFromSecret(investorSecret)
-      .publicKey();
-    if (challengerAddress !== signerAddress) {
-      throw new ForbiddenException(
-        'Challenge signing is temporarily limited to the configured investor wallet',
-      );
     }
 
     await this.enforceChallengeRateLimit(challengerAddress);
     const nonce = await this.nonceService.next(ORACLE_CONSUMER(), challengerAddress);
 
     try {
-      await this.contractService.invokeContractMethod(
-        ORACLE_CONSUMER(), 'challenge_report', investorSecret,
+      return await this.contractService.prepareTransaction(
+        ORACLE_CONSUMER(), 'challenge_report', challengerAddress,
         [
           Address.fromString(challengerAddress).toScVal(),
           nativeToScVal(BigInt(reportId), { type: 'u64' }),
           toBytes32(dto.counterEvidenceHash),
         ],
         nonce,
+      );
+    } catch (error) {
+      throw this.mapChallengeError(error, reportId);
+    }
+  }
+
+  /**
+   * Second step: submits the transaction envelope the challenger's wallet
+   * signed from prepareChallenge(). ContractService.submitSignedTransaction()
+   * verifies the envelope's source account, contract address and method
+   * before submitting it, so this never signs or builds anything itself.
+   */
+  async challengeReport(
+    reportId: number,
+    dto: ChallengeDto,
+    challengerAddress: string,
+  ): Promise<ChallengeResponse> {
+    if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(dto.counterEvidenceHash)) {
+      throw new BadRequestException(
+        'counterEvidenceHash must be a valid 46-character CIDv0 beginning with Qm',
+      );
+    }
+
+    try {
+      await this.contractService.submitSignedTransaction(
+        dto.signedTxXdr, ORACLE_CONSUMER(), 'challenge_report', challengerAddress,
       );
     } catch (error) {
       throw this.mapChallengeError(error, reportId);
@@ -490,12 +516,6 @@ export class OracleService implements OnModuleDestroy {
 
   private getAdminSecret(): string {
     return process.env.ADMIN_SECRET_KEY || '';
-  }
-
-  private getInvestorSecret(): string {
-    const secret = process.env.INVESTOR_SECRET_KEY;
-    if (!secret) throw new Error('INVESTOR_SECRET_KEY is not configured');
-    return secret;
   }
 
   private async enforceChallengeRateLimit(challengerAddress: string): Promise<void> {

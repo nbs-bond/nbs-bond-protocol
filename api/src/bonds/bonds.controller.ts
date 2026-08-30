@@ -4,10 +4,10 @@ import {
 } from '@nestjs/common';
 import { BondsService } from './bonds.service';
 import { CreateBondDto } from './dto/create-bond.dto';
-import { SubscribeDto } from './dto/subscribe.dto';
+import { SubscribeDto, PrepareSubscribeDto } from './dto/subscribe.dto';
 import { DistributeCouponDto } from './dto/distribute-coupon.dto';
-import { ClaimCreditsDto } from './dto/claim-credits.dto';
-import { TransferBondDto } from './dto/transfer-bond.dto';
+import { ClaimCreditsDto, PrepareClaimDto } from './dto/claim-credits.dto';
+import { TransferBondDto, PrepareTransferDto } from './dto/transfer-bond.dto';
 import { SweepUndistributedDto } from './dto/sweep-undistributed.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
 import { PeriodsQueryDto } from './dto/periods-query.dto';
@@ -17,6 +17,8 @@ import { AuthenticatedRequest } from '../common/interfaces/authenticated-request
 import {
   BondResponse,
   SubscriptionResponse,
+  ClaimPrepareResponse,
+  PrepareTransactionResponse,
   HolderListResponse,
   CouponDistributionResponse,
   ClaimCreditsResponse,
@@ -48,6 +50,26 @@ export class BondsController {
     return this.bondsService.findOne(id);
   }
 
+  /**
+   * Step 1 of the pre-signed-transaction subscribe flow: returns an unsigned
+   * transaction XDR for the investor's own wallet to sign. The API never
+   * builds and signs a subscribe transaction on the investor's behalf — see
+   * BondsService.prepareSubscribe().
+   */
+  @Post(':id/subscribe/prepare')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async prepareSubscribe(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: PrepareSubscribeDto,
+  ): Promise<PrepareTransactionResponse> {
+    return this.bondsService.prepareSubscribe(id, dto);
+  }
+
+  /**
+   * Step 2: submits the transaction envelope the investor's wallet signed
+   * from POST :id/subscribe/prepare.
+   */
   @Post(':id/subscribe')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
@@ -82,6 +104,27 @@ export class BondsController {
    * `sub` claim), never from an unverified request field: `investorAddress`
    * in the body is optional and, when present, must match the session address
    * or the request is rejected with 403.
+   */
+  /**
+   * Step 1 of the pre-signed-transaction claim flow: returns an unsigned
+   * transaction XDR for the claimant's own wallet to sign, or a `credits: 0`
+   * no-op response (with `xdr`/`nonce: null`) when nothing is accrued — see
+   * BondsService.prepareClaim().
+   */
+  @Post(':id/claim/prepare')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async prepareClaim(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: PrepareClaimDto,
+    @Req() req: AuthenticatedRequest,
+  ): Promise<ClaimPrepareResponse> {
+    return this.bondsService.prepareClaim(id, dto, req.user.walletAddress);
+  }
+
+  /**
+   * Step 2: submits the transaction envelope the claimant's wallet signed
+   * from POST :id/claim/prepare.
    */
   @Post(':id/claim')
   @UseGuards(JwtAuthGuard)
@@ -137,6 +180,24 @@ export class BondsController {
     return this.bondsService.sweepUndistributed(id, dto?.destination);
   }
 
+  /**
+   * Step 1 of the pre-signed-transaction transfer flow: returns an unsigned
+   * transaction XDR for the sending wallet to sign.
+   */
+  @Post(':id/transfer/prepare')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async prepareTransfer(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: PrepareTransferDto,
+  ): Promise<PrepareTransactionResponse> {
+    return this.bondsService.prepareTransfer(id, dto);
+  }
+
+  /**
+   * Step 2: submits the transaction envelope the sending wallet signed from
+   * POST :id/transfer/prepare.
+   */
   @Post(':id/transfer')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)

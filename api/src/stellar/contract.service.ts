@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, HttpException, HttpStatus, Logger, OnM
 import {
   rpc,
   TransactionBuilder,
+  Transaction,
   Keypair,
   nativeToScVal,
   scValToNative,
@@ -29,6 +30,11 @@ export interface ContractCallResult {
   result: xdr.ScVal;
   transactionHash?: string;
   successful: boolean;
+}
+
+export interface PreparedTransaction {
+  xdr: string;
+  nonce: number;
 }
 
 @Injectable()
@@ -159,7 +165,7 @@ export class ContractService implements OnModuleDestroy {
       const hash = response.hash;
 
       // Track the confirmation promise so onModuleDestroy() can wait for it.
-      const confirmationPromise = this.pollTransactionConfirmation(hash, contractAddress, keypair, method);
+      const confirmationPromise = this.pollTransactionConfirmation(hash, contractAddress, keypair.publicKey(), method);
       this.inFlightTransactions.add(confirmationPromise);
       confirmationPromise
         .catch(() => {}) // prevent unhandled-rejection detection; error re-thrown via await below
@@ -188,6 +194,222 @@ export class ContractService implements OnModuleDestroy {
   }
 
   /**
+   * Builds an UNSIGNED Soroban contract-invocation transaction and returns it
+   * as base64 XDR, without signing or submitting it.
+   *
+   * This is the first half of the pre-signed-transaction flow that replaced
+   * server-side custody of investor keys: the caller (typically a request
+   * handler acting on behalf of an authenticated wallet owner) reserves a
+   * nonce via NonceService.next() *before* calling this method, passes it in
+   * as `nonce`, and the resulting XDR is handed back to that wallet owner to
+   * sign externally (e.g. with Freighter) and POST back to
+   * submitSignedTransaction(). The nonce is appended as the final contract
+   * call argument, mirroring invokeContractMethod()/sendTransaction().
+   *
+   * `sourceAddress` is a public key (G...), not a secret — nothing here ever
+   * touches a private key, since the transaction is never signed server-side.
+   */
+  async prepareTransaction(
+    contractAddress: string,
+    method: string,
+    sourceAddress: string,
+    args: unknown[],
+    nonce: number,
+  ): Promise<PreparedTransaction> {
+    try {
+      if (this.shuttingDown) {
+        throw new HttpException(
+          'Service is shutting down — transaction preparation refused',
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
+
+      const encodedArgs = args.map((arg) =>
+        arg instanceof xdr.ScVal ? arg : nativeToScVal(arg),
+      );
+      const nonceScVal = nativeToScVal(BigInt(nonce), { type: 'u64' });
+      const allArgs = [...encodedArgs, nonceScVal];
+
+      const contract = new Contract(contractAddress);
+      const horizonAccount = await this.stellarService.getAccount(sourceAddress);
+      const account = new Account(sourceAddress, horizonAccount.sequence);
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.stellarService.getNetworkPassphrase(),
+      })
+        .addOperation(contract.call(method, ...allArgs))
+        .setTimeout(30)
+        .build();
+
+      const simulation = await this.sorobanRpc.simulateTransaction(transaction);
+
+      if (rpc.Api.isSimulationError(simulation)) {
+        throw new BadRequestException(
+          `Transaction simulation failed: ${this.describeSimulationError(simulation.error, simulation.events)}`,
+        );
+      }
+
+      const preparedTransaction = await this.sorobanRpc.prepareTransaction(transaction);
+
+      return { xdr: preparedTransaction.toXDR(), nonce };
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof HttpException) {
+        throw error;
+      }
+      throw new BadRequestException(
+        `Failed to prepare contract transaction: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Submits an already-signed transaction envelope (base64 XDR) produced by
+   * prepareTransaction() and signed externally by the wallet owner.
+   *
+   * The envelope is untrusted client input, so before submitting it this
+   * validates (defense in depth):
+   *   - it decodes to a plain Transaction, not a FeeBumpTransaction
+   *   - its source account matches `expectedSourceAddress`
+   *   - it contains exactly one operation
+   *   - that operation is an invokeHostFunction call
+   *   - the invoked contract address and function name match `contractAddress`
+   *     and `method`, so a signed envelope prepared for a different call
+   *     cannot be replayed against this contract/method pair
+   *
+   * Any mismatch throws BadRequestException rather than silently submitting
+   * an envelope that does not match what the caller expected. On a valid
+   * match the transaction is submitted as-is (it is already signed) and the
+   * same submit+poll+nonce-rollback path used by sendTransaction() is reused.
+   */
+  async submitSignedTransaction(
+    signedXdr: string,
+    contractAddress: string,
+    method: string,
+    expectedSourceAddress: string,
+  ): Promise<ContractCallResult> {
+    if (this.shuttingDown) {
+      throw new HttpException(
+        'Service is shutting down — transaction submission refused',
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    const transaction = this.decodeSignedTransaction(
+      signedXdr,
+      contractAddress,
+      method,
+      expectedSourceAddress,
+    );
+
+    try {
+      const response = await this.sorobanRpc.sendTransaction(transaction);
+
+      if (response.status === 'ERROR') {
+        const errorMessage = this.decodeContractError(contractAddress, method);
+        throw new BadRequestException(errorMessage);
+      }
+
+      const hash = response.hash;
+
+      const confirmationPromise = this.pollTransactionConfirmation(
+        hash, contractAddress, expectedSourceAddress, method,
+      );
+      this.inFlightTransactions.add(confirmationPromise);
+      confirmationPromise.then(
+        () => this.inFlightTransactions.delete(confirmationPromise),
+        () => this.inFlightTransactions.delete(confirmationPromise),
+      );
+
+      const retval = await confirmationPromise;
+
+      return {
+        result: retval,
+        transactionHash: hash,
+        successful: true,
+      };
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof HttpException) {
+        throw error;
+      }
+      throw new BadRequestException(
+        `Failed to submit signed contract transaction: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Parses and validates a signed envelope for submitSignedTransaction().
+   * Split out from submitSignedTransaction() so validation failures are
+   * always synchronous BadRequestExceptions, never wrapped by the generic
+   * submission try/catch.
+   */
+  private decodeSignedTransaction(
+    signedXdr: string,
+    contractAddress: string,
+    method: string,
+    expectedSourceAddress: string,
+  ): Transaction {
+    let parsed: ReturnType<typeof TransactionBuilder.fromXDR>;
+    try {
+      parsed = TransactionBuilder.fromXDR(signedXdr, this.stellarService.getNetworkPassphrase());
+    } catch (error) {
+      throw new BadRequestException(
+        `Malformed signed transaction XDR: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+
+    if (!(parsed instanceof Transaction)) {
+      throw new BadRequestException(
+        'Fee-bump transactions are not supported for this operation',
+      );
+    }
+
+    if (parsed.source !== expectedSourceAddress) {
+      throw new BadRequestException(
+        'Signed transaction source account does not match the expected signer address',
+      );
+    }
+
+    if (parsed.operations.length !== 1) {
+      throw new BadRequestException(
+        'Signed transaction must contain exactly one operation',
+      );
+    }
+
+    const operation = parsed.operations[0];
+    if (operation.type !== 'invokeHostFunction') {
+      throw new BadRequestException(
+        'Signed transaction must be a contract invocation',
+      );
+    }
+
+    const hostFunction = operation.func;
+    if (hostFunction.switch().name !== 'hostFunctionTypeInvokeContract') {
+      throw new BadRequestException(
+        'Signed transaction must invoke a contract function',
+      );
+    }
+
+    const invokeArgs = hostFunction.invokeContract();
+    const calledContract = Address.fromScAddress(invokeArgs.contractAddress()).toString();
+    const calledMethod = invokeArgs.functionName().toString();
+
+    if (calledContract !== contractAddress) {
+      throw new BadRequestException(
+        'Signed transaction targets an unexpected contract address',
+      );
+    }
+    if (calledMethod !== method) {
+      throw new BadRequestException(
+        'Signed transaction targets an unexpected contract method',
+      );
+    }
+
+    return parsed;
+  }
+
+  /**
    * Polls getTransaction with exponential backoff until the transaction
    * is confirmed (SUCCESS or FAILED) or the timeout expires.
    *
@@ -198,10 +420,9 @@ export class ContractService implements OnModuleDestroy {
   private async pollTransactionConfirmation(
     hash: string,
     contractAddress: string,
-    keypair: Keypair,
+    address: string,
     method: string,
   ): Promise<xdr.ScVal> {
-    const address = keypair.publicKey();
     const deadline = Date.now() + TX_CONFIRM_TIMEOUT_MS;
     let interval = POLL_INITIAL_INTERVAL_MS;
 

@@ -117,6 +117,35 @@ where
     extend_ttl(env, key);
 }
 
+/// Read the auto-incrementing `RetirementCount`.
+///
+/// The counter used to live in instance storage, which shares the instance
+/// entry's TTL and can be archived independently of the persistent retirement
+/// records — after archival the counter reset to 0 and the next retirement
+/// overwrote an existing `Retirement(id)` certificate. It now lives in
+/// persistent storage, but deployments upgraded from the old layout may still
+/// have the value only in instance storage. We read persistent first, fall back
+/// to instance, and migrate the legacy value into persistent so the two can
+/// never diverge again. Soroban executes one transaction at a time, so this
+/// migrate-on-read is atomic with respect to concurrent calls.
+fn get_retirement_count(env: &Env) -> u64 {
+    if let Some(count) = env.storage().persistent().get(&DataKey::RetirementCount) {
+        return count;
+    }
+    let legacy: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::RetirementCount)
+        .unwrap_or(0);
+    write(env, &DataKey::RetirementCount, &legacy);
+    legacy
+}
+
+/// Persist the next `RetirementCount` value (persistent storage + TTL bump).
+fn set_retirement_count(env: &Env, value: u64) {
+    write(env, &DataKey::RetirementCount, &value);
+}
+
 /// Calendar year a unix timestamp falls in (proleptic Gregorian, UTC).
 ///
 /// Howard Hinnant's `civil_from_days`, reduced to the year component. Used to
@@ -319,15 +348,9 @@ impl CreditRetirement {
         let already_retired: i128 = read(&env, &retired_key).unwrap_or(0);
         write(&env, &retired_key, &(already_retired + amount));
 
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RetirementCount)
-            .unwrap_or(0);
+        let count = get_retirement_count(&env);
         let retirement_id = count + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::RetirementCount, &retirement_id);
+        set_retirement_count(&env, retirement_id);
 
         let now = env.ledger().timestamp();
         let record = RetirementRecord {
@@ -442,6 +465,14 @@ impl CreditRetirement {
             &env,
             &DataKey::BondHolderRetirements(record.bond_id, record.holder),
         );
+        // Keep the persistent counter alive alongside the records it indexes.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::RetirementCount)
+        {
+            extend_ttl(&env, &DataKey::RetirementCount);
+        }
         Ok(())
     }
 
@@ -454,10 +485,7 @@ impl CreditRetirement {
     }
 
     pub fn total_retirements(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::RetirementCount)
-            .unwrap_or(0)
+        get_retirement_count(&env)
     }
 }
 
@@ -1369,5 +1397,125 @@ mod test {
         assert_eq!(id, 1);
         let record = s.client.get_retirement_record(&id);
         assert_eq!(record.credit_type, CreditType::Carbon);
+    }
+
+    /// Regression (issue #259): the retirement counter must live in persistent
+    /// storage, not instance storage. If instance storage is archived while the
+    /// persistent `Retirement(id)` records survive, a counter kept in instance
+    /// storage would reset to 0 and the next retirement would overwrite an
+    /// existing certificate. Here we retire several times, drop the instance
+    /// counter, and confirm the next id is N+1 — not 1 — and the original
+    /// certificate is untouched.
+    #[test]
+    fn test_retirement_count_survives_instance_archival() {
+        let s = setup();
+
+        let id1 = s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &(s.accrued / 3),
+            &CreditType::Carbon,
+            &make_certificate_hash(&s._env, 1),
+            &0,
+        );
+        let id2 = s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &(s.accrued / 3),
+            &CreditType::Carbon,
+            &make_certificate_hash(&s._env, 2),
+            &1,
+        );
+        let id3 = s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &(s.accrued / 3),
+            &CreditType::Carbon,
+            &make_certificate_hash(&s._env, 3),
+            &2,
+        );
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+        assert_eq!(s.client.total_retirements(), 3);
+
+        // Simulate instance-storage archival: the counter's instance entry is
+        // lost. The persistent retirement records (and the now-persistent
+        // counter) must survive.
+        s._env.as_contract(&s.contract_id, || {
+            s._env.storage().instance().remove(&DataKey::RetirementCount);
+        });
+
+        let hash = make_certificate_hash(&s._env, 9);
+        let next_id = s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &(s.accrued - 3 * (s.accrued / 3)),
+            &CreditType::Carbon,
+            &hash,
+            &3,
+        );
+        assert_eq!(next_id, 4);
+        assert_eq!(s.client.total_retirements(), 4);
+
+        // The original certificate is intact — not overwritten by id=4.
+        let first = s.client.get_retirement_record(&1);
+        assert_eq!(first.holder, s.holder);
+        assert_eq!(first.amount, s.accrued / 3);
+        assert_eq!(first.certificate_ipfs_hash, make_certificate_hash(&s._env, 1));
+    }
+
+    /// Regression (issue #259): deployments upgraded from the old layout may
+    /// still hold the counter only in instance storage. The first read must
+    /// fall back to instance and migrate that value into persistent storage,
+    /// so the new id continues from N rather than resetting.
+    #[test]
+    fn test_retirement_count_migrates_from_legacy_instance() {
+        let s = setup();
+
+        // Seed a legacy state: 2 retirements worth of counter, only in instance.
+        s._env.as_contract(&s.contract_id, || {
+            s._env
+                .storage()
+                .instance()
+                .set(&DataKey::RetirementCount, &2u64);
+            assert!(!s
+                ._env
+                .storage()
+                .persistent()
+                .has(&DataKey::RetirementCount));
+        });
+
+        let hash = make_certificate_hash(&s._env, 1);
+        let id = s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &s.project_id,
+            &0u32,
+            &s.accrued,
+            &CreditType::Carbon,
+            &hash,
+            &0,
+        );
+        assert_eq!(id, 3);
+        assert_eq!(s.client.total_retirements(), 3);
+
+        // The fallback value was migrated into persistent storage.
+        let persisted: u64 = s._env.as_contract(&s.contract_id, || {
+            s._env
+                .storage()
+                .persistent()
+                .get(&DataKey::RetirementCount)
+                .unwrap()
+        });
+        assert_eq!(persisted, 3);
     }
 }

@@ -3,7 +3,6 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
-  InternalServerErrorException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { xdr, scValToNative, nativeToScVal, Address, Keypair } from '@stellar/stellar-sdk';
@@ -611,54 +610,6 @@ describe('BondsService', () => {
     });
   });
 
-  describe('transfer', () => {
-    const investorStub = () => ({
-      getKeypairFromSecret: jest.fn().mockReturnValue({
-        publicKey: () =>
-          'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-      }),
-    });
-
-    const buildModule = async (contractService: any) => {
-      const moduleRef = await Test.createTestingModule({
-        providers: [
-          BondsService,
-          { provide: ContractService, useValue: contractService },
-          { provide: StellarService, useValue: investorStub() },
-          {
-            provide: NonceService,
-            useValue: { next: jest.fn().mockResolvedValue(0) },
-          },
-          { provide: KycService, useValue: kycServiceMock },
-        ],
-      }).compile();
-      return moduleRef.get(BondsService);
-    };
-
-    const dto: any = {
-      fromAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-      toAddress: 'GBO6AXD5GLGDR45HENK4RZMFXOTZIJYL3NWGNGWXYI3RTFNIYK32YGJQ',
-      amount: 600,
-    };
-
-    it('maps an InsufficientBalance (code 16) to a clear 400', async () => {
-      const contractService = {
-        invokeContractMethod: jest.fn().mockRejectedValue(
-          new BadRequestException(
-            'Contract error on TEST.transfer (contract error code 16)',
-          ),
-        ),
-      };
-
-      const svc = await buildModule(contractService);
-
-      await expect(svc.transfer(7, dto)).rejects.toMatchObject({
-        status: 400,
-        message: expect.stringContaining('Insufficient balance on bond #7'),
-      });
-    });
-  });
-
   describe('findAll', () => {
     const configScVal = () =>
       xdr.ScVal.scvVec([
@@ -1057,7 +1008,7 @@ describe('BondsService', () => {
 
       const svc = moduleRef.get(BondsService);
       await expect(
-        svc.subscribe(1, { investorAddress: 'GABC', amount: 100 }),
+        svc.subscribe(1, { investorAddress: 'GABC', amount: 100, signedTxXdr: 'signed-xdr' }),
       ).rejects.toMatchObject({
         status: 403,
         message: 'KYC verification required before subscribing to a bond',
@@ -1088,7 +1039,7 @@ describe('BondsService', () => {
 
       const svc = moduleRef.get(BondsService);
       await expect(
-        svc.subscribe(1, { investorAddress: 'GABC', amount: 100 }),
+        svc.subscribe(1, { investorAddress: 'GABC', amount: 100, signedTxXdr: 'signed-xdr' }),
       ).rejects.toMatchObject({
         status: 403,
         message: 'KYC status is stale; fresh verification is required before subscribing',
@@ -1249,15 +1200,14 @@ describe('BondsService', () => {
   });
 });
 
-describe('BondsService.claimCredits', () => {
-  const INVESTOR_SECRET = Keypair.random();
-  const INVESTOR = INVESTOR_SECRET.publicKey();
+describe('BondsService.prepareClaim / claimCredits (pre-signed flow)', () => {
+  const INVESTOR = Keypair.random().publicKey();
   const OTHER_HOLDER = Keypair.random().publicKey();
 
   const buildClaimService = async (opts: {
     accrued: number;
     claimed?: number;
-    invokeError?: Error;
+    submitError?: Error;
   }) => {
     const simulateCall = jest.fn(({ method }: { method: string }) => {
       if (method === 'accrued_credits') {
@@ -1268,8 +1218,13 @@ describe('BondsService.claimCredits', () => {
       return Promise.resolve(nativeToScVal(BigInt(0), { type: 'i128' }));
     });
 
-    const invokeContractMethod = opts.invokeError
-      ? jest.fn().mockRejectedValue(opts.invokeError)
+    const prepareTransaction = jest.fn().mockResolvedValue({
+      xdr: 'unsigned-claim-xdr',
+      nonce: 4,
+    });
+
+    const submitSignedTransaction = opts.submitError
+      ? jest.fn().mockRejectedValue(opts.submitError)
       : jest.fn().mockResolvedValue({
           result: nativeToScVal(BigInt(opts.claimed ?? opts.accrued), {
             type: 'i128',
@@ -1283,15 +1238,11 @@ describe('BondsService.claimCredits', () => {
     const moduleRef = await Test.createTestingModule({
       providers: [
         BondsService,
-        { provide: ContractService, useValue: { simulateCall, invokeContractMethod } },
         {
-          provide: StellarService,
-          useValue: {
-            getKeypairFromSecret: jest
-              .fn()
-              .mockImplementation((secret: string) => Keypair.fromSecret(secret)),
-          },
+          provide: ContractService,
+          useValue: { simulateCall, prepareTransaction, submitSignedTransaction },
         },
+        { provide: StellarService, useValue: {} },
         { provide: NonceService, useValue: { next } },
         { provide: KycService, useValue: kycServiceMock },
       ],
@@ -1300,46 +1251,74 @@ describe('BondsService.claimCredits', () => {
     return {
       svc: moduleRef.get(BondsService) as BondsService,
       simulateCall,
-      invokeContractMethod,
+      prepareTransaction,
+      submitSignedTransaction,
       next,
     };
   };
 
-  beforeEach(() => {
-    process.env.INVESTOR_SECRET_KEY = INVESTOR_SECRET.secret();
+  it('prepareClaim returns an unsigned XDR and the reserved nonce when credits are accrued', async () => {
+    const { svc, prepareTransaction, next } = await buildClaimService({ accrued: 250 });
+
+    await expect(svc.prepareClaim(3, {}, INVESTOR)).resolves.toEqual({
+      bondId: 3,
+      investorAddress: INVESTOR,
+      credits: 250,
+      xdr: 'unsigned-claim-xdr',
+      nonce: 4,
+    });
+
+    expect(next).toHaveBeenCalledWith(process.env.COUPON_ENGINE_ADDRESS || '', INVESTOR);
+    const [contract, method, sourceAddress, args, nonce] = prepareTransaction.mock.calls[0];
+    expect(contract).toBe(process.env.COUPON_ENGINE_ADDRESS || '');
+    expect(method).toBe('claim_credits');
+    expect(sourceAddress).toBe(INVESTOR);
+    expect(scValToNative(args[0])).toBe(INVESTOR);
+    expect(Number(scValToNative(args[1]))).toBe(3);
+    expect(nonce).toBe(4);
   });
 
-  afterAll(() => {
-    delete process.env.INVESTOR_SECRET_KEY;
+  it('prepareClaim short-circuits without reserving a nonce when nothing is accrued', async () => {
+    const { svc, prepareTransaction, next } = await buildClaimService({ accrued: 0 });
+
+    await expect(svc.prepareClaim(5, {}, INVESTOR)).resolves.toEqual({
+      bondId: 5,
+      investorAddress: INVESTOR,
+      credits: 0,
+      xdr: null,
+      nonce: null,
+    });
+    expect(prepareTransaction).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
   });
 
-  it('claims for the authenticated session address and reports the on-chain amount', async () => {
-    const { svc, invokeContractMethod } = await buildClaimService({
+  it('claimCredits submits the signed envelope and reports the on-chain amount', async () => {
+    const { svc, submitSignedTransaction } = await buildClaimService({
       accrued: 250,
       claimed: 250,
     });
 
-    await expect(svc.claimCredits(3, {}, INVESTOR)).resolves.toEqual({
+    await expect(
+      svc.claimCredits(3, { signedTxXdr: 'signed-xdr' }, INVESTOR),
+    ).resolves.toEqual({
       bondId: 3,
       investorAddress: INVESTOR,
       credits: 250,
       transactionHash: 'tx-hash',
     });
 
-    const [contract, method, secret, args, nonce] =
-      invokeContractMethod.mock.calls[0];
-    expect(method).toBe('claim_credits');
-    expect(contract).toBe(process.env.COUPON_ENGINE_ADDRESS || '');
-    expect(secret).toBe(INVESTOR_SECRET.secret());
-    expect(scValToNative(args[0])).toBe(INVESTOR);
-    expect(Number(scValToNative(args[1]))).toBe(3);
-    expect(nonce).toBe(4);
+    expect(submitSignedTransaction).toHaveBeenCalledWith(
+      'signed-xdr',
+      process.env.COUPON_ENGINE_ADDRESS || '',
+      'claim_credits',
+      INVESTOR,
+    );
   });
 
-  it('returns the amount the contract actually zeroed, not the pre-read balance', async () => {
+  it('claimCredits returns the amount the contract actually zeroed, not the pre-read balance', async () => {
     const { svc } = await buildClaimService({ accrued: 250, claimed: 180 });
 
-    const response = await svc.claimCredits(3, {}, INVESTOR);
+    const response = await svc.claimCredits(3, { signedTxXdr: 'signed-xdr' }, INVESTOR);
 
     expect(response.credits).toBe(180);
   });
@@ -1348,83 +1327,290 @@ describe('BondsService.claimCredits', () => {
     const { svc } = await buildClaimService({ accrued: 10 });
 
     await expect(
-      svc.claimCredits(1, { investorAddress: INVESTOR }, INVESTOR),
+      svc.claimCredits(1, { investorAddress: INVESTOR, signedTxXdr: 'signed-xdr' }, INVESTOR),
     ).resolves.toMatchObject({ investorAddress: INVESTOR });
   });
 
   it('rejects a body address that is not the authenticated wallet with 403', async () => {
-    const { svc, invokeContractMethod } = await buildClaimService({ accrued: 10 });
+    const { svc, submitSignedTransaction } = await buildClaimService({ accrued: 10 });
 
     await expect(
-      svc.claimCredits(1, { investorAddress: OTHER_HOLDER }, INVESTOR),
+      svc.claimCredits(1, { investorAddress: OTHER_HOLDER, signedTxXdr: 'signed-xdr' }, INVESTOR),
     ).rejects.toBeInstanceOf(ForbiddenException);
-    expect(invokeContractMethod).not.toHaveBeenCalled();
+    expect(submitSignedTransaction).not.toHaveBeenCalled();
   });
 
   it('rejects a session that carries no valid Stellar address with 401', async () => {
     const { svc } = await buildClaimService({ accrued: 10 });
 
-    await expect(svc.claimCredits(1, {}, 'not-an-address')).rejects.toBeInstanceOf(
-      UnauthorizedException,
-    );
+    await expect(
+      svc.claimCredits(1, { signedTxXdr: 'signed-xdr' }, 'not-an-address'),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
   });
 
-  it('rejects a caller the API holds no signing key for with 403', async () => {
-    const { svc, invokeContractMethod } = await buildClaimService({ accrued: 10 });
+  it('rejects prepareClaim for a body address that is not the authenticated wallet with 403', async () => {
+    const { svc, prepareTransaction } = await buildClaimService({ accrued: 10 });
 
-    await expect(svc.claimCredits(1, {}, OTHER_HOLDER)).rejects.toBeInstanceOf(
-      ForbiddenException,
-    );
-    expect(invokeContractMethod).not.toHaveBeenCalled();
-  });
-
-  it('fails with 500 when no investor signing key is configured', async () => {
-    delete process.env.INVESTOR_SECRET_KEY;
-    const { svc } = await buildClaimService({ accrued: 10 });
-
-    await expect(svc.claimCredits(1, {}, INVESTOR)).rejects.toBeInstanceOf(
-      InternalServerErrorException,
-    );
-  });
-
-  it('short-circuits without submitting a transaction when nothing is accrued', async () => {
-    const { svc, invokeContractMethod, next } = await buildClaimService({
-      accrued: 0,
-    });
-
-    await expect(svc.claimCredits(5, {}, INVESTOR)).resolves.toEqual({
-      bondId: 5,
-      investorAddress: INVESTOR,
-      credits: 0,
-      transactionHash: '',
-    });
-    expect(invokeContractMethod).not.toHaveBeenCalled();
-    expect(next).not.toHaveBeenCalled();
+    await expect(
+      svc.prepareClaim(1, { investorAddress: OTHER_HOLDER }, INVESTOR),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prepareTransaction).not.toHaveBeenCalled();
   });
 
   it('maps an on-chain accounting mismatch to 409 Conflict', async () => {
     const { svc } = await buildClaimService({
       accrued: 100,
-      invokeError: new BadRequestException(
+      submitError: new BadRequestException(
         'Transaction simulation failed: host error (contract error code 13)',
       ),
     });
 
-    await expect(svc.claimCredits(2, {}, INVESTOR)).rejects.toBeInstanceOf(
-      ConflictException,
-    );
+    await expect(
+      svc.claimCredits(2, { signedTxXdr: 'signed-xdr' }, INVESTOR),
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 
   it('maps an unknown bond to 400', async () => {
     const { svc } = await buildClaimService({
       accrued: 100,
-      invokeError: new BadRequestException(
+      submitError: new BadRequestException(
         'Transaction simulation failed: host error (contract error code 4)',
       ),
     });
 
-    await expect(svc.claimCredits(99, {}, INVESTOR)).rejects.toThrow(
-      'Bond #99 does not exist',
+    await expect(
+      svc.claimCredits(99, { signedTxXdr: 'signed-xdr' }, INVESTOR),
+    ).rejects.toThrow('Bond #99 does not exist');
+  });
+
+  it('never reads process.env.INVESTOR_SECRET_KEY (env var fully removed)', async () => {
+    expect(process.env.INVESTOR_SECRET_KEY).toBeUndefined();
+    const { svc } = await buildClaimService({ accrued: 10, claimed: 10 });
+
+    // Works correctly with the env var absent — this would have thrown
+    // InternalServerErrorException under the old shared-secret design.
+    await expect(
+      svc.claimCredits(1, { signedTxXdr: 'signed-xdr' }, INVESTOR),
+    ).resolves.toMatchObject({ credits: 10 });
+  });
+});
+
+describe('BondsService.prepareSubscribe / subscribe (pre-signed flow)', () => {
+  const INVESTOR = Keypair.random().publicKey();
+
+  const buildSubscribeService = async (opts: {
+    kycEligible?: boolean;
+    submitError?: Error;
+  } = {}) => {
+    const prepareTransaction = jest.fn().mockResolvedValue({
+      xdr: 'unsigned-subscribe-xdr',
+      nonce: 2,
+    });
+    const submitSignedTransaction = opts.submitError
+      ? jest.fn().mockRejectedValue(opts.submitError)
+      : jest.fn().mockResolvedValue({
+          transactionHash: 'subscribe-tx-hash',
+          successful: true,
+          result: xdr.ScVal.scvVoid(),
+        });
+    const next = jest.fn().mockResolvedValue(2);
+    const kycService = { isEligible: jest.fn().mockResolvedValue(opts.kycEligible ?? true) };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        BondsService,
+        { provide: ContractService, useValue: { prepareTransaction, submitSignedTransaction } },
+        { provide: StellarService, useValue: {} },
+        { provide: NonceService, useValue: { next } },
+        { provide: KycService, useValue: kycService },
+      ],
+    }).compile();
+
+    return {
+      svc: moduleRef.get(BondsService) as BondsService,
+      prepareTransaction,
+      submitSignedTransaction,
+      next,
+      kycService,
+    };
+  };
+
+  it('prepareSubscribe reserves a nonce and returns the unsigned XDR', async () => {
+    const { svc, prepareTransaction, next } = await buildSubscribeService();
+
+    await expect(
+      svc.prepareSubscribe(1, { investorAddress: INVESTOR, amount: 100 }),
+    ).resolves.toEqual({ xdr: 'unsigned-subscribe-xdr', nonce: 2 });
+
+    expect(next).toHaveBeenCalledWith(process.env.BOND_ISSUER_ADDRESS || '', INVESTOR);
+    const [contract, method, sourceAddress, args, nonce] = prepareTransaction.mock.calls[0];
+    expect(contract).toBe(process.env.BOND_ISSUER_ADDRESS || '');
+    expect(method).toBe('subscribe');
+    expect(sourceAddress).toBe(INVESTOR);
+    expect(scValToNative(args[0])).toBe(INVESTOR);
+    expect(Number(scValToNative(args[2]))).toBe(100);
+    expect(nonce).toBe(2);
+  });
+
+  it('prepareSubscribe rejects when KYC is not eligible, without reserving a nonce', async () => {
+    const { svc, next } = await buildSubscribeService({ kycEligible: false });
+
+    await expect(
+      svc.prepareSubscribe(1, { investorAddress: INVESTOR, amount: 100 }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('subscribe submits the signed envelope with the investor as expected source', async () => {
+    const { svc, submitSignedTransaction } = await buildSubscribeService();
+
+    await expect(
+      svc.subscribe(1, { investorAddress: INVESTOR, amount: 100, signedTxXdr: 'signed-xdr' }),
+    ).resolves.toEqual({
+      bondId: 1,
+      investorAddress: INVESTOR,
+      amount: 100,
+      transactionHash: 'subscribe-tx-hash',
+    });
+
+    expect(submitSignedTransaction).toHaveBeenCalledWith(
+      'signed-xdr',
+      process.env.BOND_ISSUER_ADDRESS || '',
+      'subscribe',
+      INVESTOR,
     );
+  });
+
+  it('subscribe rejects when KYC is not eligible, without submitting', async () => {
+    const { svc, submitSignedTransaction } = await buildSubscribeService({ kycEligible: false });
+
+    await expect(
+      svc.subscribe(1, { investorAddress: INVESTOR, amount: 100, signedTxXdr: 'signed-xdr' }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(submitSignedTransaction).not.toHaveBeenCalled();
+  });
+
+  it('never reads process.env.INVESTOR_SECRET_KEY (env var fully removed)', async () => {
+    expect(process.env.INVESTOR_SECRET_KEY).toBeUndefined();
+    const { svc } = await buildSubscribeService();
+
+    await expect(
+      svc.subscribe(1, { investorAddress: INVESTOR, amount: 100, signedTxXdr: 'signed-xdr' }),
+    ).resolves.toMatchObject({ transactionHash: 'subscribe-tx-hash' });
+  });
+});
+
+describe('BondsService.prepareTransfer / transfer (pre-signed flow)', () => {
+  const FROM = Keypair.random().publicKey();
+  const TO = Keypair.random().publicKey();
+
+  const buildTransferService = async (opts: { submitError?: Error } = {}) => {
+    const prepareTransaction = jest.fn().mockResolvedValue({
+      xdr: 'unsigned-transfer-xdr',
+      nonce: 9,
+    });
+    const submitSignedTransaction = opts.submitError
+      ? jest.fn().mockRejectedValue(opts.submitError)
+      : jest.fn().mockResolvedValue({
+          transactionHash: 'transfer-tx-hash',
+          successful: true,
+          result: xdr.ScVal.scvVoid(),
+        });
+    const next = jest.fn().mockResolvedValue(9);
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        BondsService,
+        { provide: ContractService, useValue: { prepareTransaction, submitSignedTransaction } },
+        { provide: StellarService, useValue: {} },
+        { provide: NonceService, useValue: { next } },
+        { provide: KycService, useValue: kycServiceMock },
+      ],
+    }).compile();
+
+    return {
+      svc: moduleRef.get(BondsService) as BondsService,
+      prepareTransaction,
+      submitSignedTransaction,
+      next,
+    };
+  };
+
+  it('prepareTransfer reserves a nonce scoped to fromAddress and returns the unsigned XDR', async () => {
+    const { svc, prepareTransaction, next } = await buildTransferService();
+
+    await expect(
+      svc.prepareTransfer(1, { fromAddress: FROM, toAddress: TO, amount: 50 }),
+    ).resolves.toEqual({ xdr: 'unsigned-transfer-xdr', nonce: 9 });
+
+    expect(next).toHaveBeenCalledWith(process.env.BOND_ISSUER_ADDRESS || '', FROM);
+    const [contract, method, sourceAddress, args, nonce] = prepareTransaction.mock.calls[0];
+    expect(contract).toBe(process.env.BOND_ISSUER_ADDRESS || '');
+    expect(method).toBe('transfer');
+    expect(sourceAddress).toBe(FROM);
+    expect(scValToNative(args[0])).toBe(FROM);
+    expect(scValToNative(args[1])).toBe(TO);
+    expect(Number(scValToNative(args[3]))).toBe(50);
+    expect(nonce).toBe(9);
+  });
+
+  it('transfer submits the signed envelope with fromAddress as the expected source', async () => {
+    const { svc, submitSignedTransaction } = await buildTransferService();
+
+    await expect(
+      svc.transfer(1, { fromAddress: FROM, toAddress: TO, amount: 50, signedTxXdr: 'signed-xdr' }),
+    ).resolves.toEqual({
+      bondId: 1,
+      fromAddress: FROM,
+      toAddress: TO,
+      amount: 50,
+      transactionHash: 'transfer-tx-hash',
+    });
+
+    expect(submitSignedTransaction).toHaveBeenCalledWith(
+      'signed-xdr',
+      process.env.BOND_ISSUER_ADDRESS || '',
+      'transfer',
+      FROM,
+    );
+  });
+
+  it('never reads process.env.INVESTOR_SECRET_KEY (env var fully removed)', async () => {
+    expect(process.env.INVESTOR_SECRET_KEY).toBeUndefined();
+    const { svc } = await buildTransferService();
+
+    await expect(
+      svc.transfer(1, { fromAddress: FROM, toAddress: TO, amount: 50, signedTxXdr: 'signed-xdr' }),
+    ).resolves.toMatchObject({ transactionHash: 'transfer-tx-hash' });
+  });
+
+  it('maps an InsufficientBalance (code 16) simulation failure at prepare time to a clear 400', async () => {
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        BondsService,
+        {
+          provide: ContractService,
+          useValue: {
+            prepareTransaction: jest.fn().mockRejectedValue(
+              new BadRequestException(
+                'Transaction simulation failed: Error(Contract, #16) (contract error code 16)',
+              ),
+            ),
+            submitSignedTransaction: jest.fn(),
+          },
+        },
+        { provide: StellarService, useValue: {} },
+        { provide: NonceService, useValue: { next: jest.fn().mockResolvedValue(9) } },
+        { provide: KycService, useValue: kycServiceMock },
+      ],
+    }).compile();
+    const svc = moduleRef.get(BondsService) as BondsService;
+
+    await expect(
+      svc.prepareTransfer(7, { fromAddress: FROM, toAddress: TO, amount: 50 }),
+    ).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining('Insufficient balance on bond #7'),
+    });
   });
 });

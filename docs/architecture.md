@@ -154,14 +154,17 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | POST | /bonds | Issue a new bond tranche |
 | GET | /bonds | List active bond tranches |
 | GET | /bonds/:id | Get bond details |
-| POST | /bonds/:id/subscribe | Subscribe to bond |
+| POST | /bonds/:id/subscribe/prepare | Build an unsigned subscribe transaction for the investor's wallet to sign |
+| POST | /bonds/:id/subscribe | Submit a wallet-signed subscribe transaction |
 | GET | /bonds/:id/holders | List token holders |
 | POST | /bonds/:id/coupon | Trigger coupon distribution (by report_id) |
-| POST | /bonds/:id/claim | Claim accrued credits (JWT; claims for the session wallet only) |
+| POST | /bonds/:id/claim/prepare | Build an unsigned claim transaction for the caller's wallet to sign (JWT; session wallet only) |
+| POST | /bonds/:id/claim | Submit a wallet-signed claim transaction (JWT; claims for the session wallet only) |
 | GET | /bonds/:id/undistributed | Get undistributed coupon dust total |
 | GET | /bonds/:id/periods | Coupon period history (paginated, optional `?include_report=true`) |
 | POST | /bonds/:id/sweep-undistributed | Admin: sweep undistributed coupon dust to `destination` (defaults to admin) |
-| POST | /bonds/:id/transfer | Transfer bond tokens to another address |
+| POST | /bonds/:id/transfer/prepare | Build an unsigned transfer transaction for the sending wallet to sign |
+| POST | /bonds/:id/transfer | Submit a wallet-signed transfer transaction |
 | POST | /projects | Register project |
 | GET | /projects | List projects |
 | GET | /projects/:id | Get project details |
@@ -172,28 +175,36 @@ CreditRetirement ──► BondIssuer (verify holding, validate the caller's pro
 | GET | /marketplace/prices | Current prices |
 | POST | /oracle/reports | Submit oracle report |
 | GET | /oracle/reports/:projectId | Get project oracle history |
-| POST | /oracle/challenge/:reportId | Challenge a report |
+| POST | /oracle/challenge/:reportId/prepare | Build an unsigned challenge transaction for the challenger's wallet to sign |
+| POST | /oracle/challenge/:reportId | Submit a wallet-signed challenge transaction |
 | GET | /oracle/stats/:providerAddress | Provider stats + slash/challenge history |
 | GET | /oracle/monitoring/staleness | Per-project/provider staleness metric |
 
-### POST /bonds/:id/claim
+### POST /bonds/:id/claim/prepare + POST /bonds/:id/claim
 
 Claims the caller's accrued coupon credits on `CouponEngine` and zeroes the
-holder's `AccruedCredits` balance for the bond.
+holder's `AccruedCredits` balance for the bond. This is a two-step,
+pre-signed-transaction flow (see "Pre-signed investor transactions" below):
 
 - **Identity.** The claiming address is the `sub` claim of the JWT. The
   optional `investorAddress` body field is only cross-checked against it: a
   mismatch returns **403** (an authorisation failure), a malformed address
   returns **400**.
-- **Signing.** The API signs with `INVESTOR_SECRET_KEY`, so it can only claim
-  for that wallet; any other authenticated caller gets **403**. Accepting a
-  wallet-signed XDR is the intended replacement for this server-side custody.
+- **Prepare.** `POST /bonds/:id/claim/prepare` reads the accrued total and
+  returns `credits: 0` with `xdr`/`nonce: null` if nothing is accrued —
+  otherwise it reserves a nonce and returns an unsigned `claim_credits`
+  transaction as base64 XDR for the caller's own wallet to sign. This avoids
+  consuming a nonce and a transaction fee on a no-op claim.
+- **Signing.** The caller's own wallet signs the XDR locally. The API never
+  holds or signs with an investor's key — see "Pre-signed investor
+  transactions" below for why this replaced a single shared
+  `INVESTOR_SECRET_KEY`.
+- **Submit.** `POST /bonds/:id/claim` with `signedTxXdr` submits the signed
+  envelope after verifying its source account, contract address, and method
+  match what was prepared.
 - **Amount.** `credits` is the value `claim_credits` returned — the balance it
   actually zeroed — so partial retirements and concurrent accruals are always
   reflected. Nothing is served from cache.
-- **No-op claims.** When nothing is accrued the endpoint returns
-  `credits: 0` with an empty `transactionHash` instead of submitting a
-  transaction that would consume a nonce and a fee for no effect.
 
 ```json
 { "bondId": 1, "investorAddress": "G...", "credits": 500, "transactionHash": "..." }

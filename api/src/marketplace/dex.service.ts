@@ -136,8 +136,7 @@ export class DexService implements OnModuleDestroy {
 
   async listBondTokens(dto: ListBondDto, sellerAddress: string): Promise<OrderResponse> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), sellerAddress);
 
     const { result } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'list_bond_tokens', adminSecret,
@@ -170,8 +169,7 @@ export class DexService implements OnModuleDestroy {
     }
 
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), buyerAddress);
 
     try {
       // Contract signature (contracts/dex-router/src/lib.rs execute_purchase):
@@ -192,7 +190,7 @@ export class DexService implements OnModuleDestroy {
       // bookkeeping were rolled back with the frame — re-sync the nonce mirror
       // from the chain so the buyer can simply retry the purchase instead of
       // hitting InvalidNonce on the next attempt.
-      await this.nonceService.sync(DEX_ROUTER(), adminPublicKey).catch(() => undefined);
+      await this.nonceService.sync(DEX_ROUTER(), buyerAddress).catch(() => undefined);
       throw this.mapDexError(error);
     }
 
@@ -202,8 +200,7 @@ export class DexService implements OnModuleDestroy {
 
   async cancelOrder(orderId: number, callerAddress: string): Promise<void> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
 
     await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'cancel_listing', adminSecret,
@@ -291,8 +288,7 @@ export class DexService implements OnModuleDestroy {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
 
     // Contract signature (contracts/dex-router/src/lib.rs deposit_quote):
     // (caller, quote_asset: Symbol, amount: i128, nonce).
@@ -316,8 +312,7 @@ export class DexService implements OnModuleDestroy {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
 
     // Contract signature (contracts/dex-router/src/lib.rs withdraw_quote):
     // (caller, quote_asset: Symbol, amount: i128, nonce).

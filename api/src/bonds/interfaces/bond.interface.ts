@@ -37,6 +37,19 @@ export interface SubscriptionResponse {
   transactionHash: string;
 }
 
+/**
+ * Returned by the `/prepare` step of the pre-signed-transaction flow (see
+ * subscribe/claim/transfer). `xdr` is an UNSIGNED base64 transaction envelope
+ * the caller's wallet must sign and post back to the corresponding submit
+ * endpoint; `nonce` is the contract-level nonce reserved for that submission
+ * and is echoed back only for observability/debugging — the caller does not
+ * need to resubmit it separately.
+ */
+export interface PrepareTransactionResponse {
+  xdr: string;
+  nonce: number;
+}
+
 export interface HolderListResponse {
   bondId: number;
   holders: Array<{ address: string; balance: number }>;
@@ -57,6 +70,23 @@ export interface ClaimCreditsResponse {
   investorAddress: string;
   credits: number;
   transactionHash: string;
+}
+
+/**
+ * Returned by POST /bonds/:id/claim/prepare.
+ *
+ * `credits` is the accrued total observed at prepare time. When it is 0
+ * there is nothing to claim: `xdr`/`nonce` are `null` and no nonce was
+ * reserved, so the caller should not proceed to POST /bonds/:id/claim —
+ * this mirrors the original single-step endpoint's no-op short-circuit,
+ * which avoided burning a nonce and a transaction fee on an empty claim.
+ */
+export interface ClaimPrepareResponse {
+  bondId: number;
+  investorAddress: string;
+  credits: number;
+  xdr: string | null;
+  nonce: number | null;
 }
 
 export interface TransferResponse {

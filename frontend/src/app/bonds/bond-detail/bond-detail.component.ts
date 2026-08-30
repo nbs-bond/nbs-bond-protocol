@@ -119,47 +119,15 @@ export function getResult<T>(state: ActionState<T>): T | undefined {
             </div>
 
             <div class="coupon-section">
-              <h3 class="section-title">Coupon History</h3>
-              @if (periodsLoading()) {
-                <div class="status-notice">Loading period history...</div>
-              } @else if (periodsError()) {
-                <div class="error-msg">{{ periodsError() }}</div>
-              } @else if (periods().length === 0) {
-                <div class="status-notice">No distributed periods yet.</div>
-              } @else {
-                <ul class="coupon-list">
-                  @for (period of periods(); track period.periodIndex) {
-                    <li class="coupon-item period-row">
-                      <button class="period-toggle" (click)="togglePeriod(period)">
-                        <span class="coupon-index">Period {{ period.periodIndex + 1 }}</span>
-                        <span>{{ period.endTime * 1000 | date }}</span>
-                        <span>{{ period.totalCreditsEarned | number }} credits</span>
-                        <span>{{ expandedPeriod() === period.periodIndex ? '−' : '+' }}</span>
-                      </button>
-                      @if (expandedPeriod() === period.periodIndex) {
-                        <div class="period-report">
-                          @if (reportLoading()) {
-                            <span class="status-notice">Loading oracle report...</span>
-                          } @else if (reportError()) {
-                            <span class="error-msg">{{ reportError() }}</span>
-                          } @else if (periodReport(); as report) {
-                            <span><strong>Report:</strong> {{ report.status }}</span>
-                            <span>Carbon sequestered: {{ report.carbonSequestered | number }}</span>
-                            <span>Methodology: {{ report.methodology }}</span>
-                          } @else {
-                            <span class="status-notice">No oracle report attached.</span>
-                          }
-                        </div>
-                      }
-                    </li>
-                  }
-                </ul>
-                @if (periodTotalPages() > 1) {
-                  <div class="pagination">
-                    <button class="btn btn-outline" [disabled]="periodPage() <= 1" (click)="previousPeriodPage()">Previous</button>
-                    <span class="page-info">Page {{ periodPage() }} of {{ periodTotalPages() }}</span>
-                    <button class="btn btn-outline" [disabled]="periodPage() >= periodTotalPages()" (click)="nextPeriodPage()">Next</button>
-                  </div>
+              <h3 class="section-title">
+                Coupon Schedule ({{ b.couponSchedule.length }} payments)
+              </h3>
+              <ul class="coupon-list">
+                @for (ts of b.couponSchedule; track ts; let i = $index) {
+                  <li class="coupon-item">
+                    <span class="coupon-index">Period {{ i + 1 }}</span>
+                    <span class="coupon-date">{{ ts * 1000 | date }}</span>
+                  </li>
                 }
               }
             </div>

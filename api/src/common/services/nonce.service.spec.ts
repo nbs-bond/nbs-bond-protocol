@@ -47,7 +47,7 @@ jest.mock('@stellar/stellar-sdk', () => {
 // ─── Imports (after mocks) ───────────────────────────────────────────────────
 
 import { NonceService } from './nonce.service';
-import { nativeToScVal } from '@stellar/stellar-sdk';
+import { nativeToScVal, Keypair } from '@stellar/stellar-sdk';
 import { InternalServerErrorException } from '@nestjs/common';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -409,6 +409,121 @@ describe('NonceService', () => {
       jest.useRealTimers();
 
       expect(caughtError).toBeInstanceOf(InternalServerErrorException);
+    });
+  });
+
+  // ── Concurrent subscriptions from DIFFERENT investor addresses ─────────────
+  //
+  // This is the scenario #116 ("Fix Nonce Collisions by Removing Shared
+  // INVESTOR_SECRET_KEY") actually fixes: 10 different real investors, each
+  // signing with their own wallet, subscribing at the same moment. Before the
+  // fix, every investor operation was signed with one shared
+  // INVESTOR_SECRET_KEY, so all 10 requests shared one on-chain sequence
+  // number/nonce regardless of what NonceService did. Now that each investor
+  // submits their own pre-signed transaction, NonceService.next() must hand
+  // out correctly-scoped, non-colliding nonces per (contract, address) pair
+  // under real concurrency.
+  //
+  // A hand-rolled in-memory fake Redis is used here (rather than sequencing
+  // dozens of mockResolvedValueOnce() calls by hand, as the two-caller case
+  // above does) because 10 independent addresses each drive their own
+  // EXISTS → SET(NX lock) → sync() → INCR+EXPIRE sequence, and the ordering
+  // between them is exactly what this test must NOT assume.
+  describe('next() — 10 concurrent subscriptions from different investor addresses', () => {
+    function createFakeRedis() {
+      const store = new Map<string, string>();
+
+      return {
+        async connect(): Promise<void> {},
+        async exists(key: string): Promise<number> {
+          return store.has(key) ? 1 : 0;
+        },
+        async set(
+          key: string,
+          value: string,
+          opts?: { NX?: boolean; EX?: number; PX?: number },
+        ): Promise<'OK' | null> {
+          if (opts?.NX && store.has(key)) {
+            return null;
+          }
+          store.set(key, value);
+          return 'OK';
+        },
+        async eval(
+          script: string,
+          params: { keys: string[]; arguments: string[] },
+        ): Promise<number> {
+          const [key] = params.keys;
+          if (script.includes('INCR')) {
+            const next = Number(store.get(key) ?? '0') + 1;
+            store.set(key, String(next));
+            return next;
+          }
+          if (script.includes('DECR')) {
+            const next = Number(store.get(key) ?? '0') - 1;
+            store.set(key, String(next));
+            return next;
+          }
+          if (script.includes('GET') && script.includes('DEL')) {
+            // Lock release: check-and-delete.
+            const token = params.arguments[0];
+            if (store.get(key) === token) {
+              store.delete(key);
+              return 1;
+            }
+            return 0;
+          }
+          throw new Error(`unexpected Lua script in fake redis: ${script}`);
+        },
+      };
+    }
+
+    it('allocates distinct, correctly-incrementing nonces per address with no collisions', async () => {
+      const { createClient } = jest.requireMock('@redis/client') as {
+        createClient: jest.Mock;
+      };
+      const fakeRedis = createFakeRedis();
+      createClient.mockReturnValueOnce(fakeRedis);
+
+      // Fresh NonceService instance bound to the fake redis above (the
+      // module-level redisMock used by every other test in this file is
+      // fully hand-mocked and shared, so a real per-test instance is used
+      // here instead).
+      const concurrentService = new NonceService();
+
+      // 10 distinct investor addresses — each represents a different real
+      // user's own wallet, which is the actual fix for #116. Real Keypairs
+      // are used (not synthetic strings) because sync() round-trips each
+      // address through Address.fromString().
+      const investors = Array.from({ length: 10 }, () => Keypair.random().publicKey());
+
+      // Every address is brand-new on-chain (nonce 0), matching the seed
+      // scenario used elsewhere in this file for a first-ever transaction.
+      getContractDataMock.mockRejectedValue(new Error('entry not found'));
+
+      // Fire all 10 "first subscribe" calls simultaneously.
+      const firstRoundNonces = await Promise.all(
+        investors.map((address) => concurrentService.next(CONTRACT, address)),
+      );
+
+      // Every investor's first nonce must be 0 (their own first-ever
+      // transaction against this contract) — no cross-investor collision.
+      expect(firstRoundNonces).toEqual(new Array(10).fill(0));
+
+      // Fire a second round concurrently to confirm nonces keep incrementing
+      // correctly per address rather than colliding or resetting.
+      const secondRoundNonces = await Promise.all(
+        investors.map((address) => concurrentService.next(CONTRACT, address)),
+      );
+      expect(secondRoundNonces).toEqual(new Array(10).fill(1));
+
+      // All 20 allocated (address, nonce) pairs must be unique — the direct
+      // definition of "no nonce collisions".
+      const allocated = investors.flatMap((address, i) => [
+        `${address}:${firstRoundNonces[i]}`,
+        `${address}:${secondRoundNonces[i]}`,
+      ]);
+      expect(new Set(allocated).size).toBe(allocated.length);
     });
   });
 

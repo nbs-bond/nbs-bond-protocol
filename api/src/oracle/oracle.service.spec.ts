@@ -2,7 +2,6 @@ import { Test } from '@nestjs/testing';
 import {
   BadRequestException,
   ConflictException,
-  ForbiddenException,
   HttpStatus,
 } from '@nestjs/common';
 import { OracleService } from './oracle.service';
@@ -16,7 +15,6 @@ import {
   nativeToScVal,
   scValToNative,
   Address,
-  Keypair,
 } from '@stellar/stellar-sdk';
 
 jest.mock('@redis/client', () => {
@@ -67,7 +65,11 @@ function providerStructScVal(
 
 describe('OracleService', () => {
   let service: OracleService;
-  const contractService = { invokeContractMethod: jest.fn() };
+  const contractService = {
+    invokeContractMethod: jest.fn(),
+    prepareTransaction: jest.fn(),
+    submitSignedTransaction: jest.fn(),
+  };
   const nonceService = { next: jest.fn() };
   const investorAddress = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
   const stellarService = {
@@ -92,83 +94,105 @@ describe('OracleService', () => {
   });
 
   beforeEach(() => {
-    process.env.INVESTOR_SECRET_KEY = 'test-investor-secret';
     contractService.invokeContractMethod.mockReset().mockResolvedValue({});
+    contractService.prepareTransaction.mockReset().mockResolvedValue({
+      xdr: 'unsigned-challenge-xdr',
+      nonce: 0,
+    });
+    contractService.submitSignedTransaction.mockReset().mockResolvedValue({
+      result: undefined,
+      transactionHash: 'challenge-tx-hash',
+      successful: true,
+    });
     nonceService.next.mockReset().mockResolvedValue(0);
     (service as any).localChallengeAttempts.clear();
   });
 
-  describe('challengeReport', () => {
+  describe('prepareChallenge / challengeReport (pre-signed flow)', () => {
     const dto = {
       counterEvidenceHash: 'QmYwAPJzv5CZsnAzt8auVZRnGi2C8Qp9G2YB3hM9oWZpDa',
       reason: 'Independent evidence conflicts with this report',
     };
 
-    it('signs with the configured investor key, never the admin key', async () => {
-      process.env.ADMIN_SECRET_KEY = 'admin-secret-must-not-be-used';
-      try {
-        await service.challengeReport(7, dto, investorAddress);
+    it('prepareChallenge never reads a signing secret and returns the unsigned XDR', async () => {
+      expect(process.env.INVESTOR_SECRET_KEY).toBeUndefined();
 
-        expect(contractService.invokeContractMethod).toHaveBeenCalledWith(
-          expect.any(String),
-          'challenge_report',
-          'test-investor-secret',
-          expect.any(Array),
-          0,
-        );
-      } finally {
-        delete process.env.ADMIN_SECRET_KEY;
-      }
+      await expect(service.prepareChallenge(7, dto, investorAddress)).resolves.toEqual({
+        xdr: 'unsigned-challenge-xdr',
+        nonce: 0,
+      });
+
+      const [contract, method, sourceAddress, args, nonce] =
+        contractService.prepareTransaction.mock.calls[0];
+      expect(method).toBe('challenge_report');
+      expect(sourceAddress).toBe(investorAddress);
+      expect(contract).toEqual(expect.any(String));
+      expect(args).toEqual(expect.any(Array));
+      expect(nonce).toBe(0);
     });
 
-    it('rejects counter-evidence that is not CIDv0', async () => {
-      await expect(service.challengeReport(7, {
+    it('challengeReport submits the signed envelope for the challenger address', async () => {
+      await service.challengeReport(7, { ...dto, signedTxXdr: 'signed-xdr' }, investorAddress);
+
+      expect(contractService.submitSignedTransaction).toHaveBeenCalledWith(
+        'signed-xdr',
+        expect.any(String),
+        'challenge_report',
+        investorAddress,
+      );
+    });
+
+    it('prepareChallenge rejects counter-evidence that is not CIDv0', async () => {
+      await expect(service.prepareChallenge(7, {
         ...dto,
         counterEvidenceHash: 'not-a-cid',
       }, investorAddress)).rejects.toBeInstanceOf(BadRequestException);
-      expect(contractService.invokeContractMethod).not.toHaveBeenCalled();
+      expect(contractService.prepareTransaction).not.toHaveBeenCalled();
     });
 
-    it('rejects a JWT wallet that differs from the configured signer', async () => {
-      const otherAddress = Keypair.random().publicKey();
-      await expect(service.challengeReport(7, dto, otherAddress))
-        .rejects.toBeInstanceOf(ForbiddenException);
+    it('challengeReport rejects counter-evidence that is not CIDv0', async () => {
+      await expect(service.challengeReport(7, {
+        ...dto,
+        counterEvidenceHash: 'not-a-cid',
+        signedTxXdr: 'signed-xdr',
+      }, investorAddress)).rejects.toBeInstanceOf(BadRequestException);
+      expect(contractService.submitSignedTransaction).not.toHaveBeenCalled();
     });
 
-    it('allows at most three challenges per wallet in 24 hours', async () => {
-      await service.challengeReport(1, dto, investorAddress);
-      await service.challengeReport(2, dto, investorAddress);
-      await service.challengeReport(3, dto, investorAddress);
+    it('allows at most three prepareChallenge calls per wallet in 24 hours', async () => {
+      await service.prepareChallenge(1, dto, investorAddress);
+      await service.prepareChallenge(2, dto, investorAddress);
+      await service.prepareChallenge(3, dto, investorAddress);
 
-      await expect(service.challengeReport(4, dto, investorAddress))
+      await expect(service.prepareChallenge(4, dto, investorAddress))
         .rejects.toMatchObject({ status: HttpStatus.TOO_MANY_REQUESTS });
-      expect(contractService.invokeContractMethod).toHaveBeenCalledTimes(3);
+      expect(contractService.prepareTransaction).toHaveBeenCalledTimes(3);
     });
 
     it('maps a ChallengeAlreadyExists contract error (code 20) to a ConflictException', async () => {
-      contractService.invokeContractMethod.mockReset().mockRejectedValue(
+      contractService.prepareTransaction.mockReset().mockRejectedValue(
         new BadRequestException(
-          'Contract simulation failed: Error(Contract, #20) (contract error code 20)',
+          'Transaction simulation failed: Error(Contract, #20) (contract error code 20)',
         ),
       );
 
       await expect(
-        service.challengeReport(7, dto, investorAddress),
+        service.prepareChallenge(7, dto, investorAddress),
       ).rejects.toBeInstanceOf(ConflictException);
       await expect(
-        service.challengeReport(8, dto, investorAddress),
+        service.prepareChallenge(8, dto, investorAddress),
       ).rejects.toThrow('already has a challenge on file');
     });
 
     it('propagates other contract failures from challenge_report unchanged', async () => {
-      contractService.invokeContractMethod.mockReset().mockRejectedValue(
+      contractService.prepareTransaction.mockReset().mockRejectedValue(
         new BadRequestException(
-          'Contract simulation failed: Error(Contract, #6) (contract error code 6)',
+          'Transaction simulation failed: Error(Contract, #6) (contract error code 6)',
         ),
       );
 
       await expect(
-        service.challengeReport(9, dto, investorAddress),
+        service.prepareChallenge(9, dto, investorAddress),
       ).rejects.toMatchObject({
         status: 400,
         message: expect.stringContaining('contract error code 6'),

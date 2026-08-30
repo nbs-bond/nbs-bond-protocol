@@ -6,7 +6,17 @@
  * and NonceService are all mocked — no network calls are made.
  */
 
-import { xdr, nativeToScVal, scValToNative, Keypair } from '@stellar/stellar-sdk';
+import {
+  xdr,
+  nativeToScVal,
+  scValToNative,
+  Keypair,
+  TransactionBuilder,
+  Account,
+  Contract,
+  Address,
+  BASE_FEE,
+} from '@stellar/stellar-sdk';
 
 // ─── Stellar SDK mock ────────────────────────────────────────────────────────
 
@@ -89,6 +99,37 @@ function buildFailedTxResponse() {
 
 function buildNotFoundResponse() {
   return { status: 'NOT_FOUND' as const };
+}
+
+const PASSPHRASE = 'Test SDF Network ; September 2015';
+
+/**
+ * Builds a real, signed Transaction envelope (base64 XDR) invoking
+ * `method` on `contractId` from `sourceKeypair`, for feeding into
+ * submitSignedTransaction()'s decoding/validation logic. Unlike the rest of
+ * this file, TransactionBuilder/Account/Contract are NOT mocked — only
+ * rpc.Server is — so this exercises the real XDR encode/decode path.
+ */
+function buildSignedXdr(opts: {
+  sourceKeypair: Keypair;
+  contractId: string;
+  method: string;
+  args?: xdr.ScVal[];
+  operationCount?: number;
+}): string {
+  const account = new Account(opts.sourceKeypair.publicKey(), '100');
+  const contract = new Contract(opts.contractId);
+  const builder = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: PASSPHRASE,
+  });
+  const operationCount = opts.operationCount ?? 1;
+  for (let i = 0; i < operationCount; i++) {
+    builder.addOperation(contract.call(opts.method, ...(opts.args ?? [])));
+  }
+  const transaction = builder.setTimeout(30).build();
+  transaction.sign(opts.sourceKeypair);
+  return transaction.toXDR();
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -432,6 +473,245 @@ describe('ContractService', () => {
 
       expect(result.successful).toBe(true);
       expect(prepareTransactionMock).toHaveBeenCalled();
+    });
+  });
+
+  // ── prepareTransaction ─────────────────────────────────────────────────────
+
+  describe('prepareTransaction', () => {
+    it('returns an unsigned XDR and echoes back the reserved nonce, without signing', async () => {
+      const arg = nativeToScVal(BigInt(1), { type: 'u64' });
+
+      const result = await service.prepareTransaction(
+        CONTRACT, METHOD, PUBLIC, [arg], 7,
+      );
+
+      expect(result.nonce).toBe(7);
+      expect(typeof result.xdr).toBe('string');
+      expect(result.xdr.length).toBeGreaterThan(0);
+
+      // The returned envelope must be unsigned: decoding it should show no
+      // signatures, proving prepareTransaction() never calls .sign().
+      const { TransactionBuilder: RealBuilder } = jest.requireActual('@stellar/stellar-sdk');
+      const decoded = RealBuilder.fromXDR(result.xdr, PASSPHRASE);
+      expect(decoded.signatures.length).toBe(0);
+
+      expect(stellarServiceMock.getAccount).toHaveBeenCalledWith(PUBLIC);
+      expect(prepareTransactionMock).toHaveBeenCalled();
+    });
+
+    it('appends the nonce as the final contract-call argument', async () => {
+      const arg = nativeToScVal(BigInt(1), { type: 'u64' });
+
+      const result = await service.prepareTransaction(
+        CONTRACT, METHOD, PUBLIC, [arg], 42,
+      );
+
+      const { TransactionBuilder: RealBuilder } = jest.requireActual('@stellar/stellar-sdk');
+      const decoded = RealBuilder.fromXDR(result.xdr, PASSPHRASE);
+      const invokeArgs = decoded.operations[0].func.invokeContract();
+      const scArgs = invokeArgs.args();
+      const lastArg = scArgs[scArgs.length - 1];
+      expect(scValToNative(lastArg)).toBe(BigInt(42));
+      expect(Address.fromScAddress(invokeArgs.contractAddress()).toString()).toBe(CONTRACT);
+    });
+
+    it('throws BadRequestException on simulation failure before preparing', async () => {
+      simulateTransactionMock.mockResolvedValue({
+        id: 'sim-fail',
+        error: 'Error(Contract, #3)',
+        events: [],
+      });
+
+      await expect(
+        service.prepareTransaction(CONTRACT, METHOD, PUBLIC, [], 0),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('simulation failed'),
+      });
+
+      expect(prepareTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses to prepare new transactions once shutting down', async () => {
+      (service as any).shuttingDown = true;
+
+      await expect(
+        service.prepareTransaction(CONTRACT, METHOD, PUBLIC, [], 0),
+      ).rejects.toMatchObject({ status: 503 });
+
+      (service as any).shuttingDown = false;
+    });
+  });
+
+  // ── submitSignedTransaction ────────────────────────────────────────────────
+
+  describe('submitSignedTransaction', () => {
+    const signerKeypair = Keypair.random();
+    const signerAddress = signerKeypair.publicKey();
+
+    it('submits a matching signed envelope and returns the confirmed result', async () => {
+      const signedXdr = buildSignedXdr({
+        sourceKeypair: signerKeypair,
+        contractId: CONTRACT,
+        method: METHOD,
+      });
+
+      getTransactionMock.mockResolvedValueOnce(buildSuccessTxResponse());
+      sorobanSendTransactionMock.mockResolvedValue(buildSubmittedResponse('tx-hash-signed'));
+
+      const promise = service.submitSignedTransaction(
+        signedXdr, CONTRACT, METHOD, signerAddress,
+      );
+
+      await jest.advanceTimersByTimeAsync(2_000);
+      const result = await promise;
+
+      expect(result.successful).toBe(true);
+      expect(result.transactionHash).toBe('tx-hash-signed');
+      // No signing happens server-side for this path.
+      expect(prepareTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the envelope source account does not match the expected signer', async () => {
+      const otherKeypair = Keypair.random();
+      const signedXdr = buildSignedXdr({
+        sourceKeypair: signerKeypair,
+        contractId: CONTRACT,
+        method: METHOD,
+      });
+
+      await expect(
+        service.submitSignedTransaction(signedXdr, CONTRACT, METHOD, otherKeypair.publicKey()),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('does not match'),
+      });
+      expect(sorobanSendTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the envelope targets a different contract address', async () => {
+      const otherContract = 'CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526';
+      const signedXdr = buildSignedXdr({
+        sourceKeypair: signerKeypair,
+        contractId: otherContract,
+        method: METHOD,
+      });
+
+      await expect(
+        service.submitSignedTransaction(signedXdr, CONTRACT, METHOD, signerAddress),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('unexpected contract address'),
+      });
+      expect(sorobanSendTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the envelope targets a different method', async () => {
+      const signedXdr = buildSignedXdr({
+        sourceKeypair: signerKeypair,
+        contractId: CONTRACT,
+        method: 'some_other_method',
+      });
+
+      await expect(
+        service.submitSignedTransaction(signedXdr, CONTRACT, METHOD, signerAddress),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('unexpected contract method'),
+      });
+      expect(sorobanSendTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects an envelope with more than one operation', async () => {
+      const signedXdr = buildSignedXdr({
+        sourceKeypair: signerKeypair,
+        contractId: CONTRACT,
+        method: METHOD,
+        operationCount: 2,
+      });
+
+      await expect(
+        service.submitSignedTransaction(signedXdr, CONTRACT, METHOD, signerAddress),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('exactly one operation'),
+      });
+      expect(sorobanSendTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a fee-bump transaction envelope', async () => {
+      const account = new Account(signerAddress, '100');
+      const contract = new Contract(CONTRACT);
+      const inner = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: PASSPHRASE,
+      })
+        .addOperation(contract.call(METHOD))
+        .setTimeout(30)
+        .build();
+      inner.sign(signerKeypair);
+
+      const feeSource = Keypair.random();
+      const feeBump = TransactionBuilder.buildFeeBumpTransaction(
+        feeSource, BASE_FEE, inner, PASSPHRASE,
+      );
+      feeBump.sign(feeSource);
+
+      await expect(
+        service.submitSignedTransaction(feeBump.toXDR(), CONTRACT, METHOD, signerAddress),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('Fee-bump'),
+      });
+      expect(sorobanSendTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed XDR', async () => {
+      await expect(
+        service.submitSignedTransaction('not-valid-xdr', CONTRACT, METHOD, signerAddress),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('Malformed'),
+      });
+      expect(sorobanSendTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses to submit new transactions once shutting down', async () => {
+      const signedXdr = buildSignedXdr({
+        sourceKeypair: signerKeypair,
+        contractId: CONTRACT,
+        method: METHOD,
+      });
+      (service as any).shuttingDown = true;
+
+      await expect(
+        service.submitSignedTransaction(signedXdr, CONTRACT, METHOD, signerAddress),
+      ).rejects.toMatchObject({ status: 503 });
+
+      (service as any).shuttingDown = false;
+      expect(sorobanSendTransactionMock).not.toHaveBeenCalled();
+    });
+
+    it('rolls back the nonce for the expected source address on a FAILED confirmation', async () => {
+      const signedXdr = buildSignedXdr({
+        sourceKeypair: signerKeypair,
+        contractId: CONTRACT,
+        method: METHOD,
+      });
+
+      getTransactionMock.mockResolvedValueOnce(buildFailedTxResponse());
+      sorobanSendTransactionMock.mockResolvedValue(buildSubmittedResponse('tx-hash-failed'));
+
+      const promise = service.submitSignedTransaction(
+        signedXdr, CONTRACT, METHOD, signerAddress,
+      ).catch((err) => err);
+
+      await jest.advanceTimersByTimeAsync(2_000);
+      const caughtError = await promise;
+
+      expect(caughtError).toMatchObject({ status: 400 });
+      expect(nonceServiceMock.rollback).toHaveBeenCalledWith(CONTRACT, signerAddress);
     });
   });
 });

@@ -5,7 +5,7 @@ import {
 import { OracleService } from './oracle.service';
 import { OracleMonitoringService } from './oracle.monitoring.service';
 import { SubmitReportDto } from './dto/submit-report.dto';
-import { ChallengeDto } from './dto/challenge.dto';
+import { ChallengeDto, PrepareChallengeDto } from './dto/challenge.dto';
 import { RegisterProviderDto } from './dto/register-provider.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
@@ -13,6 +13,7 @@ import { ProviderGuard } from '../common/guards/provider.guard';
 import {
   ReportResponse,
   ChallengeResponse,
+  ChallengePrepareResponse,
   ProviderResponse,
   ProviderStatsWithHistory,
   OracleStalenessReport,
@@ -43,6 +44,26 @@ export class OracleController {
     return this.oracleService.getProjectReports(projectId);
   }
 
+  /**
+   * Step 1 of the pre-signed-transaction challenge flow: returns an unsigned
+   * transaction XDR for the challenger's own wallet to sign — see
+   * OracleService.prepareChallenge().
+   */
+  @Post('challenge/:reportId/prepare')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  async prepareChallenge(
+    @Param('reportId', ParseIntPipe) reportId: number,
+    @Body() dto: PrepareChallengeDto,
+    @Req() req: AuthenticatedRequest,
+  ): Promise<ChallengePrepareResponse> {
+    return this.oracleService.prepareChallenge(reportId, dto, req.user.walletAddress);
+  }
+
+  /**
+   * Step 2: submits the transaction envelope the challenger's wallet signed
+   * from POST challenge/:reportId/prepare.
+   */
   @Post('challenge/:reportId')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtAuthGuard)

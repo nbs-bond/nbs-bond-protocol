@@ -9,17 +9,21 @@
  *   Uses an in-process NestJS app with a probe controller. No network calls,
  *   no signing keys required. Always runs.
  *
- * "Bond subscription — signing (e2e)"
- *   Exercises endpoints that sign and submit Stellar transactions. Requires
- *   ADMIN_SECRET_KEY and INVESTOR_SECRET_KEY to be valid Stellar secret seeds.
- *   Wrapped in `describeWithAdminKey` / `describeWithInvestorKey` so the suite
- *   is automatically skipped (with a human-readable message) when keys are
- *   absent or are the placeholder "S..." values from .env.example.
+ * "Bond issuance — admin signing (e2e)" / "Bond subscription — investor
+ * pre-signed flow (e2e)"
+ *   Exercise endpoints that sign and submit Stellar transactions. Both are
+ *   wrapped in `describeWithAdminKey`, since ADMIN_SECRET_KEY is the only
+ *   remaining pre-configured signer key an investor flow depends on (to
+ *   issue/set up the bond being subscribed to). Investor identity itself is
+ *   no longer a pre-configured server-held key — see the #116 note in
+ *   ./testenv: a real investor-flow test generates its own throwaway
+ *   Keypair, funds it via Friendbot, and signs the XDR returned by the
+ *   `/prepare` endpoint locally, exactly as a wallet like Freighter would.
  *
  * Skip registration timing
  * ------------------------
  * `describe.skip` must be called synchronously at module scope during Jest's
- * test-collection phase. That is why the signing suite uses `describeWith*`
+ * test-collection phase. That is why the signing suites use `describeWith*`
  * wrappers from ./testenv rather than `test.skip` inside `beforeAll`.
  * Registering a test inside `beforeAll` raises "Cannot add a test after tests
  * have started running" in Jest's circus runner.
@@ -32,8 +36,8 @@
  *
  * To enable signing suites:
  *   1. Copy .env.example to api/.env
- *   2. Replace ADMIN_SECRET_KEY and INVESTOR_SECRET_KEY with real testnet keys
- *   3. Fund both accounts via https://friendbot.stellar.org/?addr=<PUBLIC_KEY>
+ *   2. Replace ADMIN_SECRET_KEY with a real testnet key
+ *   3. Fund it via https://friendbot.stellar.org/?addr=<PUBLIC_KEY>
  *   4. Deploy contracts: ./scripts/deploy-testnet.sh
  *   5. Run: cd api && npm run test:e2e
  */
@@ -50,10 +54,7 @@ import * as request from 'supertest';
 import { CreateBondDto } from '../src/bonds/dto/create-bond.dto';
 import { SubscribeDto } from '../src/bonds/dto/subscribe.dto';
 import { CreditTypeEnum } from '../src/bonds/interfaces/bond.interface';
-import {
-  describeWithAdminKey,
-  describeWithInvestorKey,
-} from './testenv';
+import { describeWithAdminKey } from './testenv';
 
 // ---------------------------------------------------------------------------
 // Probe controller — used only by the validation suite
@@ -156,11 +157,11 @@ describe('API validation (e2e)', () => {
   describe('subscribe', () => {
     const validSubscribe = {
       amount: 100,
-      nonce: 0,
       investorAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+      signedTxXdr: 'AAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
     };
 
-    it('accepts a valid Stellar address', () => {
+    it('accepts a valid Stellar address and a signed envelope', () => {
       return request(app.getHttpServer())
         .post('/bonds/1/subscribe')
         .send(validSubscribe)
@@ -174,13 +175,13 @@ describe('API validation (e2e)', () => {
         .expect(400);
     });
 
-    it('accepts a payload without a client nonce (server-managed)', () => {
+    it('rejects a payload missing the pre-signed transaction envelope', () => {
       const missing: Partial<SubscribeDto> = { ...validSubscribe };
-      delete missing.nonce;
+      delete missing.signedTxXdr;
       return request(app.getHttpServer())
         .post('/bonds/1/subscribe')
         .send(missing)
-        .expect(201);
+        .expect(400);
     });
   });
 });
@@ -208,16 +209,27 @@ describeWithAdminKey('Bond issuance — admin signing (e2e)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Suite 3: Investor signing flows
+// Suite 3: Investor pre-signed-transaction flows (#116)
 //
-// Skips automatically when INVESTOR_SECRET_KEY is absent or invalid.
+// Gated on describeWithAdminKey (not a dedicated investor key — there is no
+// longer a server-held investor key to gate on). A real test in this suite
+// generates its own throwaway investor Keypair, funds it via Friendbot,
+// calls POST /bonds/:id/subscribe/prepare to get an unsigned XDR, signs it
+// locally with the throwaway Keypair (standing in for a wallet like
+// Freighter, which is out of scope per #116), and POSTs the signed envelope
+// to POST /bonds/:id/subscribe. See test/bonds-claim.e2e-spec.ts for a
+// CI-runnable version of this same prepare→sign→submit pattern against a
+// mocked ContractService.
 // ---------------------------------------------------------------------------
 
-describeWithInvestorKey('Bond subscription — investor signing (e2e)', () => {
-  // Add tests here that call POST /bonds/:id/subscribe, POST /bonds/:id/claim,
-  // POST /marketplace/buy, etc.
+describeWithAdminKey('Bond subscription — investor pre-signed flow (e2e)', () => {
+  // Add tests here that drive the full prepare → sign → submit cycle for
+  // POST /bonds/:id/subscribe, POST /bonds/:id/claim, POST /bonds/:id/transfer
+  // against a live testnet deployment (bond creation via ADMIN_SECRET_KEY,
+  // then a throwaway investor Keypair signs its own subscribe/claim/transfer
+  // transactions — never a pre-configured investor secret).
 
-  it('placeholder — replace with real investor signing tests', () => {
+  it('placeholder — replace with a real prepare/sign/submit test using a throwaway investor Keypair', () => {
     expect(true).toBe(true);
   });
 });

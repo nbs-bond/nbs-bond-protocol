@@ -7,9 +7,12 @@ describe('BondsController guards', () => {
 
   it.each([
     ['create', [JwtAuthGuard, AdminGuard]],
+    ['prepareSubscribe', [JwtAuthGuard]],
     ['subscribe', [JwtAuthGuard]],
     ['distributeCoupon', [JwtAuthGuard, AdminGuard]],
+    ['prepareClaim', [JwtAuthGuard]],
     ['claimCredits', [JwtAuthGuard]],
+    ['prepareTransfer', [JwtAuthGuard]],
     ['transfer', [JwtAuthGuard]],
     ['mature', [JwtAuthGuard, AdminGuard]],
   ] as const)('guards %s with the required guards', (handler, expected) => {
@@ -95,14 +98,40 @@ describe('BondsController guards', () => {
     const service = { claimCredits: jest.fn().mockResolvedValue(claimed) };
     const controller = new BondsController(service as any);
     const req = { user: { walletAddress: 'GINVESTOR' } } as any;
+    const dto = { signedTxXdr: 'signed-xdr' };
 
-    await expect(controller.claimCredits(4, {}, req)).resolves.toBe(claimed);
-    expect(service.claimCredits).toHaveBeenCalledWith(4, {}, 'GINVESTOR');
+    await expect(controller.claimCredits(4, dto, req)).resolves.toBe(claimed);
+    expect(service.claimCredits).toHaveBeenCalledWith(4, dto, 'GINVESTOR');
+  });
+
+  it('passes the authenticated wallet address to the prepareClaim service call', async () => {
+    const prepared = { bondId: 4, investorAddress: 'GINVESTOR', credits: 10, xdr: 'xdr', nonce: 1 };
+    const service = { prepareClaim: jest.fn().mockResolvedValue(prepared) };
+    const controller = new BondsController(service as any);
+    const req = { user: { walletAddress: 'GINVESTOR' } } as any;
+
+    await expect(controller.prepareClaim(4, {}, req)).resolves.toBe(prepared);
+    expect(service.prepareClaim).toHaveBeenCalledWith(4, {}, 'GINVESTOR');
   });
 
   it('routes the claim handler under the /bonds/:id/claim path', () => {
     const path = Reflect.getMetadata('path', BondsController.prototype.claimCredits);
     expect(path).toBe(':id/claim');
+  });
+
+  it('routes the claim prepare handler under the /bonds/:id/claim/prepare path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.prepareClaim);
+    expect(path).toBe(':id/claim/prepare');
+  });
+
+  it('routes the subscribe prepare handler under the /bonds/:id/subscribe/prepare path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.prepareSubscribe);
+    expect(path).toBe(':id/subscribe/prepare');
+  });
+
+  it('routes the transfer prepare handler under the /bonds/:id/transfer/prepare path', () => {
+    const path = Reflect.getMetadata('path', BondsController.prototype.prepareTransfer);
+    expect(path).toBe(':id/transfer/prepare');
   });
 
   it('routes the periods handler under the /bonds/:id/periods path', () => {

@@ -3,7 +3,6 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
-  InternalServerErrorException,
   UnauthorizedException,
   Logger,
   OnModuleDestroy,
@@ -17,16 +16,18 @@ import { toBytes32 } from '../stellar/bytes32';
 import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { createClient, RedisClientType } from '@redis/client';
 import { CreateBondDto } from './dto/create-bond.dto';
-import { SubscribeDto } from './dto/subscribe.dto';
+import { SubscribeDto, PrepareSubscribeDto } from './dto/subscribe.dto';
 import { DistributeCouponDto } from './dto/distribute-coupon.dto';
-import { ClaimCreditsDto } from './dto/claim-credits.dto';
-import { TransferBondDto } from './dto/transfer-bond.dto';
+import { ClaimCreditsDto, PrepareClaimDto } from './dto/claim-credits.dto';
+import { TransferBondDto, PrepareTransferDto } from './dto/transfer-bond.dto';
 import {
   BondResponse,
   SubscriptionResponse,
   HolderListResponse,
   CouponDistributionResponse,
   ClaimCreditsResponse,
+  ClaimPrepareResponse,
+  PrepareTransactionResponse,
   TransferResponse,
   UndistributedTotalResponse,
   AccruedCreditsByType,
@@ -172,10 +173,18 @@ export class BondsService implements OnModuleDestroy {
     return bond;
   }
 
-  async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
-    // Gate subscription on KYC: the cached status check makes this resilient
-    // to KYC provider outages (see KycService) instead of a synchronous live
-    // call on every request.
+  /**
+   * First step of the pre-signed-transaction subscribe flow: builds and
+   * returns an UNSIGNED `subscribe` transaction (with a reserved nonce baked
+   * in) for the investor's own wallet to sign. The API never holds or signs
+   * with an investor's key — see ContractService.prepareTransaction() and
+   * the module-level docs on why the previously shared INVESTOR_SECRET_KEY
+   * caused nonce collisions between concurrent investors.
+   */
+  async prepareSubscribe(
+    id: number,
+    dto: PrepareSubscribeDto,
+  ): Promise<PrepareTransactionResponse> {
     const eligible = await this.kycService.isEligible(
       dto.investorAddress,
       KycStatus.VERIFIED,
@@ -186,16 +195,41 @@ export class BondsService implements OnModuleDestroy {
       );
     }
 
-    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
-    const { transactionHash } = await this.contractService.invokeContractMethod(
-      BOND_ISSUER(), 'subscribe', investorSecret,
+    return this.contractService.prepareTransaction(
+      BOND_ISSUER(), 'subscribe', dto.investorAddress,
       [
         Address.fromString(dto.investorAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
       ],
       nonce,
+    );
+  }
+
+  /**
+   * Second step: submits the transaction envelope the investor's wallet
+   * signed from prepareSubscribe(). ContractService.submitSignedTransaction()
+   * verifies the envelope's source account, contract address and method
+   * before submitting it, so this never signs or builds anything itself.
+   */
+  async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+    // Gate subscription on KYC: the cached status check makes this resilient
+    // to KYC provider outages (see KycService) instead of a synchronous live
+    // call on every request. Re-checked here (in addition to prepare) as
+    // defense in depth against KYC status changing between the two steps.
+    const eligible = await this.kycService.isEligible(
+      dto.investorAddress,
+      KycStatus.VERIFIED,
+    );
+    if (!eligible) {
+      throw new ForbiddenException(
+        'KYC verification required before subscribing to a bond',
+      );
+    }
+
+    const { transactionHash } = await this.contractService.submitSignedTransaction(
+      dto.signedTxXdr, BOND_ISSUER(), 'subscribe', dto.investorAddress,
     );
 
     await this.redis.del(`bond:${id}`);
@@ -355,18 +389,66 @@ export class BondsService implements OnModuleDestroy {
   }
 
   /**
-   * Claims a bondholder's accrued coupon credits on CouponEngine.
+   * First step of the pre-signed-transaction claim flow.
    *
    * `sessionAddress` comes from the authenticated JWT (`sub`), which is the
    * only trusted source of the claimant's identity; `dto.investorAddress` is
    * optional and merely cross-checked against it (403 on mismatch) so the
    * frontend can keep sending the wallet address it already has.
    *
-   * The claimed amount is whatever CouponEngine.claim_credits returns for
-   * this call — the balance it just zeroed — so partial retirements or
-   * concurrent accruals are always reflected; no cached figure is used.
-   * When nothing is accrued the endpoint short-circuits with `credits: 0`
-   * rather than burning a nonce and a transaction fee on a no-op claim.
+   * When nothing is accrued this short-circuits with `credits: 0` and
+   * `xdr`/`nonce: null` — no nonce is reserved and no transaction is built,
+   * so the caller should not proceed to claimCredits(). This preserves the
+   * original single-step endpoint's no-op optimisation (no wasted nonce or
+   * fee on an empty claim) even though the flow is now two calls.
+   */
+  async prepareClaim(
+    id: number,
+    dto: PrepareClaimDto,
+    sessionAddress: string,
+  ): Promise<ClaimPrepareResponse> {
+    const investorAddress = this.resolveCallerAddress(
+      sessionAddress,
+      dto.investorAddress,
+      'investorAddress',
+    );
+
+    const accrued = await this.readAccruedTotal(id, investorAddress);
+    if (accrued <= 0) {
+      return {
+        bondId: id,
+        investorAddress,
+        credits: 0,
+        xdr: null,
+        nonce: null,
+      };
+    }
+
+    const nonce = await this.nonceService.next(COUPON_ENGINE(), investorAddress);
+    const { xdr: preparedXdr } = await this.contractService.prepareTransaction(
+      COUPON_ENGINE(), 'claim_credits', investorAddress,
+      [
+        Address.fromString(investorAddress).toScVal(),
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+      ],
+      nonce,
+    );
+
+    return {
+      bondId: id,
+      investorAddress,
+      credits: accrued,
+      xdr: preparedXdr,
+      nonce,
+    };
+  }
+
+  /**
+   * Second step: submits the wallet-signed transaction envelope from
+   * prepareClaim(). The claimed amount reported back is whatever
+   * CouponEngine.claim_credits actually returned for this call — the balance
+   * it just zeroed on-chain — so partial retirements or concurrent accruals
+   * are always reflected; no cached figure is used.
    */
   async claimCredits(
     id: number,
@@ -378,33 +460,12 @@ export class BondsService implements OnModuleDestroy {
       dto.investorAddress,
       'investorAddress',
     );
-    const investorSecret = this.getSigningSecretFor(
-      investorAddress,
-      'Claiming',
-    );
-
-    const accrued = await this.readAccruedTotal(id, investorAddress);
-    if (accrued <= 0) {
-      return {
-        bondId: id,
-        investorAddress,
-        credits: 0,
-        transactionHash: '',
-      };
-    }
-
-    const nonce = await this.nonceService.next(COUPON_ENGINE(), investorAddress);
 
     let result: xdr.ScVal;
     let transactionHash: string | undefined;
     try {
-      ({ result, transactionHash } = await this.contractService.invokeContractMethod(
-        COUPON_ENGINE(), 'claim_credits', investorSecret,
-        [
-          Address.fromString(investorAddress).toScVal(),
-          nativeToScVal(BigInt(id), { type: 'u64' }),
-        ],
-        nonce,
+      ({ result, transactionHash } = await this.contractService.submitSignedTransaction(
+        dto.signedTxXdr, COUPON_ENGINE(), 'claim_credits', investorAddress,
       ));
     } catch (error) {
       throw this.mapClaimError(error, id);
@@ -460,40 +521,6 @@ export class BondsService implements OnModuleDestroy {
     return sessionAddress;
   }
 
-  /**
-   * Returns the secret key the API signs investor transactions with, after
-   * checking it actually belongs to `address`.
-   *
-   * The API holds a single investor key (INVESTOR_SECRET_KEY), so it can only
-   * sign for that one wallet. Any other authenticated caller gets a 403 rather
-   * than a confusing on-chain auth failure. Accepting a pre-signed XDR from
-   * the wallet is the intended replacement for this server-side custody.
-   */
-  private getSigningSecretFor(address: string, action: string): string {
-    const secret = process.env.INVESTOR_SECRET_KEY || '';
-    if (!secret) {
-      throw new InternalServerErrorException(
-        'Investor signing key is not configured on this deployment',
-      );
-    }
-
-    let signerAddress: string;
-    try {
-      signerAddress = this.stellarService.getKeypairFromSecret(secret).publicKey();
-    } catch {
-      throw new InternalServerErrorException(
-        'Investor signing key is not a valid Stellar secret key',
-      );
-    }
-
-    if (signerAddress !== address) {
-      throw new ForbiddenException(
-        `${action} is temporarily limited to the configured investor wallet`,
-      );
-    }
-    return secret;
-  }
-
   private mapClaimError(error: unknown, bondId: number): Error {
     const code = this.extractContractErrorCode(error);
 
@@ -519,14 +546,21 @@ export class BondsService implements OnModuleDestroy {
     return match ? Number(match[1]) : undefined;
   }
 
-  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
-    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
+  /**
+   * First step of the pre-signed-transaction transfer flow: builds and
+   * returns an UNSIGNED `transfer` transaction for `fromAddress`'s own
+   * wallet to sign. The API never holds or signs with an investor's key —
+   * see ContractService.prepareTransaction().
+   */
+  async prepareTransfer(
+    id: number,
+    dto: PrepareTransferDto,
+  ): Promise<PrepareTransactionResponse> {
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
 
-    let transactionHash: string | undefined;
     try {
-      ({ transactionHash } = await this.contractService.invokeContractMethod(
-        BOND_ISSUER(), 'transfer', investorSecret,
+      return await this.contractService.prepareTransaction(
+        BOND_ISSUER(), 'transfer', dto.fromAddress,
         [
           Address.fromString(dto.fromAddress).toScVal(),
           Address.fromString(dto.toAddress).toScVal(),
@@ -534,6 +568,23 @@ export class BondsService implements OnModuleDestroy {
           nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
         ],
         nonce,
+      );
+    } catch (error) {
+      throw this.mapBondError(error, id);
+    }
+  }
+
+  /**
+   * Second step: submits the transaction envelope `fromAddress`'s wallet
+   * signed from prepareTransfer(). ContractService.submitSignedTransaction()
+   * verifies the envelope's source account, contract address and method
+   * before submitting it, so this never signs or builds anything itself.
+   */
+  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
+    let transactionHash: string | undefined;
+    try {
+      ({ transactionHash } = await this.contractService.submitSignedTransaction(
+        dto.signedTxXdr, BOND_ISSUER(), 'transfer', dto.fromAddress,
       ));
     } catch (error) {
       throw this.mapBondError(error, id);
