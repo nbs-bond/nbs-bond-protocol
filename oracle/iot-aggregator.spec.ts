@@ -3,11 +3,13 @@ import {
   aggregateSensorReadings,
   validateIotReading,
   meanSoilCarbonDeltaPpm,
+  kgCo2ePerHaPerPpm,
   IotSchemaError,
   IotNoValidReadingsError,
   IotNoSoilCarbonDeltaError,
   IotAdapterError,
-  KG_CO2E_PER_HA_PER_PPM,
+  DEFAULT_BULK_DENSITY_T_PER_M3,
+  DEFAULT_SAMPLING_DEPTH_M,
 } from './iot-aggregator';
 import { MockHttpClient } from './test-helpers';
 
@@ -52,10 +54,16 @@ const READINGS = [
   },
 ];
 
+// bulk_density_t_per_m3 / sampling_depth_m carry the same values the old
+// hardcoded constants used (1.4 t/m3, 0.3 m), so existing assertions below
+// reproduce the same carbon_sequestered output as before the refactor —
+// this is the explicit-fixture-value requirement from #59.
 const PROJECT = {
   project_id: 'VCS-1234',
   device_ids: ['NBS-SOIL-001', 'NBS-SOIL-002'],
   area_ha: 1250,
+  bulk_density_t_per_m3: DEFAULT_BULK_DENSITY_T_PER_M3,
+  sampling_depth_m: DEFAULT_SAMPLING_DEPTH_M,
 };
 
 const PERIOD = { periodStart: '2025-01-01', periodEnd: '2025-03-31' };
@@ -66,7 +74,7 @@ describe('validateIotReading', () => {
   });
 
   it('rejects out-of-range metrics', () => {
-    const bad = { ...READINGS[0], metrics: { ...READINGS[0].metrics, soil_moisture: 150 } };
+    const bad = { ...READINGS[0], metrics: { ...READINGS[0].metrics, soil_moisture: 150 }};
     expect(validateIotReading(bad as any)).toBe(false);
   });
 });
@@ -79,6 +87,22 @@ describe('aggregateSensorReadings', () => {
     expect(aggregate.avgSoilMoisture).toBeCloseTo((32.5 + 31.9 + 30.2) / 3);
     expect(aggregate.avgSoilCarbonPpm).toBeCloseTo((4200 + 4350 + 4050) / 3);
     expect(aggregate.avgWaterTableCm).toBeCloseTo((185 + 172 + 190) / 3);
+  });
+});
+
+describe('kgCo2ePerHaPerPpm', () => {
+  it('matches the previously hardcoded 15.4 constant for the default soil parameters', () => {
+    expect(kgCo2ePerHaPerPpm(DEFAULT_BULK_DENSITY_T_PER_M3, DEFAULT_SAMPLING_DEPTH_M)).toBeCloseTo(15.4);
+  });
+
+  it('produces a materially different (lower) factor for low-bulk-density soils like peat', () => {
+    // Regression test for #59: peat can be as low as 0.1 t/m3. Using the
+    // old hardcoded 1.4 t/m3 for a peat project would have overstated
+    // carbon by roughly this ratio.
+    const peatFactor = kgCo2ePerHaPerPpm(0.1, DEFAULT_SAMPLING_DEPTH_M);
+    const mineralFactor = kgCo2ePerHaPerPpm(DEFAULT_BULK_DENSITY_T_PER_M3, DEFAULT_SAMPLING_DEPTH_M);
+    expect(peatFactor).toBeCloseTo(1.1);
+    expect(mineralFactor / peatFactor).toBeCloseTo(14, 0);
   });
 });
 
@@ -95,8 +119,20 @@ describe('aggregateIotProject', () => {
     expect(report.evidence.sensor_sample_count).toBe(3);
     expect(report.evidence.sensor_device_count).toBe(2);
     expect(report.evidence.soil_carbon_delta_ppm).toBe(150);
+    expect(report.evidence.bulk_density_t_per_m3).toBe(DEFAULT_BULK_DENSITY_T_PER_M3);
+    expect(report.evidence.sampling_depth_m).toBe(DEFAULT_SAMPLING_DEPTH_M);
     expect(report.carbon_sequestered).toBeCloseTo(
-      150 * PROJECT.area_ha * KG_CO2E_PER_HA_PER_PPM,
+      150 * PROJECT.area_ha * kgCo2ePerHaPerPpm(PROJECT.bulk_density_t_per_m3, PROJECT.sampling_depth_m),
+    );
+  });
+
+  it('produces a proportionally different carbon_sequestered for a peat-soil project with the same readings', async () => {
+    const peatProject = { ...PROJECT, bulk_density_t_per_m3: 0.1 };
+    const http = new MockHttpClient([{ status: 200, data: { readings: READINGS } }]);
+    const report = await aggregateIotProject(peatProject, PERIOD, { baseUrl: BASE_URL, http });
+
+    expect(report.carbon_sequestered).toBeCloseTo(
+      150 * peatProject.area_ha * kgCo2ePerHaPerPpm(0.1, DEFAULT_SAMPLING_DEPTH_M),
     );
   });
 
@@ -162,6 +198,14 @@ describe('aggregateIotProject', () => {
         PERIOD,
         { baseUrl: BASE_URL, http },
       ),
+    ).rejects.toThrow();
+  });
+
+  it('rejects a project configuration missing bulk_density_t_per_m3 or sampling_depth_m', async () => {
+    const http = new MockHttpClient([{ status: 200, data: { readings: READINGS } }]);
+    const { bulk_density_t_per_m3, ...withoutBulkDensity } = PROJECT;
+    await expect(
+      aggregateIotProject(withoutBulkDensity as any, PERIOD, { baseUrl: BASE_URL, http }),
     ).rejects.toThrow();
   });
 });

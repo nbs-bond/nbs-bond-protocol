@@ -530,7 +530,7 @@ describe('DexService', () => {
       await service.buyBondTokens(dto, SELLER).catch(() => undefined);
       expect(nonceSyncMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
     });
 
@@ -668,7 +668,7 @@ describe('DexService', () => {
       jest.clearAllMocks();
     });
 
-    it('listBondTokens allocates nonce for admin signer, not seller', async () => {
+    it('listBondTokens allocates nonce for seller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({
         result: nativeToScVal(BigInt(1), { type: 'u64' }),
         transactionHash: 'txhash',
@@ -687,15 +687,15 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('buyBondTokens allocates nonce for admin signer, not buyer', async () => {
+    it('buyBondTokens allocates nonce for buyer, not admin signer', async () => {
       jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
       jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
         address: SELLER,
@@ -713,30 +713,30 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('cancelOrder allocates nonce for admin signer, not caller', async () => {
+    it('cancelOrder allocates nonce for caller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({ transactionHash: 'txhash' });
 
       await service.cancelOrder(1, SELLER);
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('depositQuote allocates nonce for admin signer, not caller', async () => {
+    it('depositQuote allocates nonce for caller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({
         transactionHash: 'abc123',
         successful: true,
@@ -747,15 +747,15 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('withdrawQuote allocates nonce for admin signer, not caller', async () => {
+    it('withdrawQuote allocates nonce for caller, not admin signer', async () => {
       invokeContractMethodMock.mockResolvedValue({
         transactionHash: 'def456',
         successful: true,
@@ -766,15 +766,15 @@ describe('DexService', () => {
 
       expect(nonceNextMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
       expect(nonceNextMock).not.toHaveBeenCalledWith(
         expect.any(String),
-        SELLER,
+        ADMIN_PUBLIC_KEY,
       );
     });
 
-    it('buyBondTokens re-syncs nonce for admin signer on failure', async () => {
+    it('buyBondTokens re-syncs nonce for buyer on failure', async () => {
       jest.spyOn(service, 'getOrder').mockResolvedValue(STUB_ORDER);
       jest.spyOn(service, 'getQuoteBalance').mockResolvedValue({
         address: SELLER,
@@ -790,7 +790,7 @@ describe('DexService', () => {
 
       expect(nonceSyncMock).toHaveBeenCalledWith(
         expect.any(String),
-        ADMIN_PUBLIC_KEY,
+        SELLER,
       );
     });
   });
@@ -1042,6 +1042,226 @@ describe('DexService', () => {
       await service.listBondTokens(dto, SELLER);
 
       expect(invalidateSpy).toHaveBeenCalledWith(11);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // listOrders — bounded scan, error classification, filter correctness
+  // ---------------------------------------------------------------------------
+
+  describe('listOrders', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      (redisMock.__store as Map<string, string>).clear();
+    });
+
+    /**
+     * Build a simulateCall mock that serves `count` orders (IDs 1..count) and
+     * then throws an OrderNotFound error on the next ID, mimicking the real
+     * contract's end-of-list signal.
+     * NOTE: use setupOrderSequenceViaDecode in most tests — this helper is kept
+     * only for reference and is not called directly.
+     */
+    function setupOrderSequence(count: number): void {
+      // This helper is superseded by setupOrderSequenceViaDecode.
+      // Kept only to avoid removing a function referenced in comments.
+      setupOrderSequenceViaDecode(count);
+    }
+
+    /**
+     * Simpler helper: spy on decodeOrder to skip ScVal encoding entirely,
+     * so tests can focus purely on listOrders control-flow behaviour.
+     *
+     * simulateCall returns a real (but dummy) ScVal so scValToNative() does not
+     * throw. decodeOrder is fully mocked and ignores its input; the order ID is
+     * tracked via the closure variable `nextId` that increments in lock-step
+     * with the simulateCall mock.
+     */
+    function setupOrderSequenceViaDecode(
+      count: number,
+      overridePerOrder?: (id: number) => Partial<OrderResponse>,
+    ): void {
+      let nextId = 0;
+
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const id = Number(scValToNative(args[0]));
+        if (id > count) {
+          throw new Error(`Error(Contract, #4) OrderNotFound`);
+        }
+        nextId = id;
+        // Return a real ScVal so scValToNative() in the service doesn't throw.
+        // decodeOrder is mocked below so its actual value is irrelevant.
+        return nativeToScVal(0, { type: 'u32' });
+      });
+
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => {
+        const id = nextId;
+        const base: OrderResponse = {
+          id,
+          seller: SELLER,
+          bondId: 1,
+          amount: 100,
+          pricePerToken: 10,
+          quoteAsset: 'USDC',
+          status: OrderStatus.Open,
+          createdAt: new Date(1700000000 * 1000).toISOString(),
+        };
+        return overridePerOrder ? { ...base, ...overridePerOrder(id) } : base;
+      });
+    }
+
+    it('returns at most `limit` orders even when many more exist', async () => {
+      setupOrderSequenceViaDecode(200);
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(20);
+      // Only 20 RPCs should have been issued (plus one more that hit the limit
+      // loop exit) — certainly not 200.
+      expect(simulateCallMock).toHaveBeenCalledTimes(20);
+      expect(result.meta.hasMore).toBe(true);
+    });
+
+    it('issues exactly `limit` simulateCall RPCs for a full page (no over-fetch)', async () => {
+      setupOrderSequenceViaDecode(500);
+
+      await service.listOrders(undefined, undefined, 1, 10);
+
+      expect(simulateCallMock).toHaveBeenCalledTimes(10);
+    });
+
+    it('sets hasMore=false when fewer than limit orders exist', async () => {
+      setupOrderSequenceViaDecode(3);
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(3);
+      expect(result.meta.hasMore).toBe(false);
+    });
+
+    it('throws instead of silently truncating on a non-OrderNotFound error mid-scan', async () => {
+      // Orders 1-5 succeed; order 6 throws a transient network error (not code 4).
+      let callCount = 0;
+      simulateCallMock.mockImplementation(async () => {
+        callCount++;
+        if (callCount === 6) {
+          throw new Error('network timeout contacting horizon');
+        }
+        // Return a real ScVal so scValToNative() doesn't throw; decodeOrder is mocked.
+        return nativeToScVal(callCount, { type: 'u32' });
+      });
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => ({
+        ...STUB_ORDER,
+        id: callCount,
+      }));
+
+      await expect(service.listOrders(undefined, undefined, 1, 20))
+        .rejects
+        .toThrow('network timeout contacting horizon');
+    });
+
+    it('treats an OrderNotFound error mid-list as end-of-list (ID gap / normal end)', async () => {
+      // Simulate 4 orders then an OrderNotFound — should return exactly 4, no throw.
+      setupOrderSequenceViaDecode(4);
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(4);
+      expect(result.meta.hasMore).toBe(false);
+      // No unhandled rejection
+    });
+
+    it('filters by bondId without counting non-matching orders against limit', async () => {
+      // 40 orders: odd IDs have bondId=1, even IDs have bondId=2
+      let nextId = 0;
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const id = Number(scValToNative(args[0]));
+        if (id > 40) throw new Error('Error(Contract, #4) OrderNotFound');
+        nextId = id;
+        return nativeToScVal(0, { type: 'u32' });
+      });
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => {
+        const id = nextId;
+        return {
+          ...STUB_ORDER,
+          id,
+          bondId: id % 2 === 0 ? 2 : 1,
+        } as OrderResponse;
+      });
+
+      const result = await service.listOrders(2, undefined, 1, 5);
+
+      // Only even IDs (bondId=2) should appear
+      expect(result.data).toHaveLength(5);
+      result.data.forEach((o) => expect(o.bondId).toBe(2));
+    });
+
+    it('filters by status correctly', async () => {
+      const statuses = [OrderStatus.Open, OrderStatus.Filled, OrderStatus.Open, OrderStatus.Cancelled, OrderStatus.Open];
+      let nextId = 0;
+      simulateCallMock.mockImplementation(async ({ args }: { args: any[] }) => {
+        const id = Number(scValToNative(args[0]));
+        if (id > statuses.length) throw new Error('Error(Contract, #4) OrderNotFound');
+        nextId = id;
+        return nativeToScVal(0, { type: 'u32' });
+      });
+      jest.spyOn(service as any, 'decodeOrder').mockImplementation(() => {
+        const id = nextId;
+        return { ...STUB_ORDER, id, status: statuses[id - 1] } as OrderResponse;
+      });
+
+      const result = await service.listOrders(undefined, OrderStatus.Open, 1, 20);
+
+      expect(result.data).toHaveLength(3);
+      result.data.forEach((o) => expect(o.status).toBe(OrderStatus.Open));
+    });
+
+    it('returns an empty page when no orders match the filter', async () => {
+      setupOrderSequenceViaDecode(5);
+
+      const result = await service.listOrders(999, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(0);
+      expect(result.meta.hasMore).toBe(false);
+    });
+
+    it('serves subsequent pages by skipping earlier matches', async () => {
+      setupOrderSequenceViaDecode(10);
+
+      const page1 = await service.listOrders(undefined, undefined, 1, 3);
+      // Clear cache between calls so page2 isn't served from cache
+      (redisMock.__store as Map<string, string>).clear();
+      const page2 = await service.listOrders(undefined, undefined, 2, 3);
+
+      expect(page1.data.map((o) => o.id)).toEqual([1, 2, 3]);
+      expect(page2.data.map((o) => o.id)).toEqual([4, 5, 6]);
+    });
+
+    it('returns the cached result without issuing any simulateCall RPCs', async () => {
+      setupOrderSequenceViaDecode(5);
+
+      // Warm the cache
+      await service.listOrders(undefined, undefined, 1, 20);
+      const firstCallCount = simulateCallMock.mock.calls.length;
+      jest.clearAllMocks();
+
+      // Second call should hit cache
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(simulateCallMock).not.toHaveBeenCalled();
+      expect(result.data).toHaveLength(firstCallCount < 5 ? firstCallCount : 5);
+    });
+
+    it('handles an empty order book (first ID throws OrderNotFound)', async () => {
+      simulateCallMock.mockRejectedValue(
+        new Error('Error(Contract, #4) OrderNotFound'),
+      );
+
+      const result = await service.listOrders(undefined, undefined, 1, 20);
+
+      expect(result.data).toHaveLength(0);
+      expect(result.meta.hasMore).toBe(false);
+      expect(simulateCallMock).toHaveBeenCalledTimes(1);
     });
   });
 

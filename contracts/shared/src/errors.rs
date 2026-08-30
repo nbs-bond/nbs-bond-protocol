@@ -77,6 +77,28 @@ pub enum OracleError {
     /// `ProviderAlreadyExists` (= 5), which is reserved for
     /// `register_provider`'s duplicate-provider check.
     ChallengeAlreadyExists = 20,
+    /// `accept_admin_transfer` or `cancel_admin_transfer` was called with no
+    /// admin transfer currently proposed.
+    NoPendingAdminChange = 21,
+    /// `accept_admin_transfer` was called before the proposal's timelock
+    /// elapsed.
+    TimelockNotElapsed = 22,
+    /// `challenge_report` was called by an address whose deposited challenge
+    /// bond balance is below the required `CHALLENGE_BOND`. Challenges must
+    /// be economically backed so they cannot be used for costless griefing
+    /// (issue #186).
+    InsufficientChallengeBond = 23,
+    /// A verifier tried to vote on a challenged report they had already voted
+    /// on (a verifier gets exactly one vote, whichever way it was cast).
+    AlreadyVoted = 24,
+    /// `expire_stale_challenge` was called before the challenge timeout had
+    /// elapsed; challenges may only be expired once resolution has stalled
+    /// past `CHALLENGE_TIMEOUT_SECONDS`.
+    ChallengeNotStale = 25,
+    /// A report period starts before the end of the most recently submitted
+    /// period for the same project. Reports must be chronological so the
+    /// bounded overlap index cannot permit overlaps with evicted history.
+    BackdatedReportPeriod = 26,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +132,12 @@ pub enum RegistryError {
     ProjectNotApproved = 8,
     ProjectInactive = 9,
     CannotSuspend = 10,
+    /// `accept_admin_transfer` or `cancel_admin_transfer` was called with no
+    /// admin transfer currently proposed.
+    NoPendingAdminChange = 11,
+    /// `accept_admin_transfer` was called before the proposal's timelock
+    /// elapsed.
+    TimelockNotElapsed = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]

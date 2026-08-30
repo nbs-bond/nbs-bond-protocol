@@ -61,55 +61,82 @@ export class DexService implements OnModuleDestroy {
     status?: string,
     page = 1,
     limit = 20,
-  ): Promise<PaginatedResponse<OrderResponse>> {
+  ): Promise<PaginatedResponse<OrderResponse> & { meta: { hasMore?: boolean } }> {
     const cacheKey = `orders:${bondId || 'all'}:${status || 'all'}:${page}:${limit}`;
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);
 
+    // Skip the first (page-1)*limit matching orders, then collect `limit` more.
+    const skipCount = (page - 1) * limit;
+    let skipped = 0;
     const orders: OrderResponse[] = [];
     let index = 1;
 
-    while (true) {
+    while (orders.length < limit) {
+      let order: OrderResponse;
       try {
         const orderScVal = await this.contractService.simulateCall({
           contractAddress: DEX_ROUTER(),
           method: 'get_order',
           args: [nativeToScVal(BigInt(index), { type: 'u64' })],
         });
-        const order = this.decodeOrder(scValToNative(orderScVal) as any[]);
-
-        if (bondId && order.bondId !== bondId) {
-          index++;
-          continue;
+        order = this.decodeOrder(scValToNative(orderScVal) as any[]);
+      } catch (err) {
+        // OrderNotFound (code 4) is the legitimate end-of-list signal.
+        // Any other error is a real fault — surface it instead of silently
+        // truncating the listing.
+        if (this.isOrderNotFound(err)) {
+          break;
         }
-        if (status && order.status !== status) {
-          index++;
-          continue;
-        }
-
-        orders.push(order);
-        index++;
-      } catch {
-        break;
+        throw err;
       }
+
+      index++;
+
+      // Apply filters — unmatched orders don't count against the page quota.
+      if (bondId !== undefined && order.bondId !== bondId) continue;
+      if (status !== undefined && order.status !== status) continue;
+
+      // Skip orders belonging to earlier pages.
+      if (skipped < skipCount) {
+        skipped++;
+        continue;
+      }
+
+      orders.push(order);
     }
 
-    const start = (page - 1) * limit;
-    const paged = orders.slice(start, start + limit);
+    // hasMore is true when we filled the page and there may be more orders
+    // beyond index-1. We cannot know the exact total without get_order_count
+    // (#119), so we surface hasMore rather than a potentially-wrong total.
+    const hasMore = orders.length === limit;
 
     const result = {
-      data: paged,
-      meta: { page, limit, total: orders.length, totalPages: Math.ceil(orders.length / limit) || 1 },
+      data: orders,
+      meta: {
+        page,
+        limit,
+        total: orders.length,
+        totalPages: 1,
+        hasMore,
+      },
     };
 
     await this.redis.setEx(cacheKey, 30, JSON.stringify(result));
     return result;
   }
 
+  /** Returns true when the thrown error is an on-chain OrderNotFound (code 4). */
+  private isOrderNotFound(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+    const match = message.match(/#(\d+)/) ?? message.match(/Error\(-(\d+)/);
+    const code = match ? Number(match[1]) : undefined;
+    return code === DEX_ERROR_CODE.OrderNotFound;
+  }
+
   async listBondTokens(dto: ListBondDto, sellerAddress: string): Promise<OrderResponse> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), sellerAddress);
 
     const { result } = await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'list_bond_tokens', adminSecret,
@@ -142,8 +169,7 @@ export class DexService implements OnModuleDestroy {
     }
 
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), buyerAddress);
 
     try {
       // Contract signature (contracts/dex-router/src/lib.rs execute_purchase):
@@ -164,7 +190,7 @@ export class DexService implements OnModuleDestroy {
       // bookkeeping were rolled back with the frame — re-sync the nonce mirror
       // from the chain so the buyer can simply retry the purchase instead of
       // hitting InvalidNonce on the next attempt.
-      await this.nonceService.sync(DEX_ROUTER(), adminPublicKey).catch(() => undefined);
+      await this.nonceService.sync(DEX_ROUTER(), buyerAddress).catch(() => undefined);
       throw this.mapDexError(error);
     }
 
@@ -174,8 +200,7 @@ export class DexService implements OnModuleDestroy {
 
   async cancelOrder(orderId: number, callerAddress: string): Promise<void> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
 
     await this.contractService.invokeContractMethod(
       DEX_ROUTER(), 'cancel_listing', adminSecret,
@@ -263,8 +288,7 @@ export class DexService implements OnModuleDestroy {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
 
     // Contract signature (contracts/dex-router/src/lib.rs deposit_quote):
     // (caller, quote_asset: Symbol, amount: i128, nonce).
@@ -288,8 +312,7 @@ export class DexService implements OnModuleDestroy {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const adminPublicKey = this.getAdminPublicKey();
-    const nonce = await this.nonceService.next(DEX_ROUTER(), adminPublicKey);
+    const nonce = await this.nonceService.next(DEX_ROUTER(), callerAddress);
 
     // Contract signature (contracts/dex-router/src/lib.rs withdraw_quote):
     // (caller, quote_asset: Symbol, amount: i128, nonce).

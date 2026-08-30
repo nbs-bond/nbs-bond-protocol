@@ -61,6 +61,8 @@ import {
 } from './satellite-processor';
 import {
   aggregateIotProject,
+  DEFAULT_BULK_DENSITY_T_PER_M3,
+  DEFAULT_SAMPLING_DEPTH_M,
 } from './iot-aggregator';
 import {
   aggregateBlueCarbonProject,
@@ -79,11 +81,12 @@ async function runVerra(): Promise<void> {
 
 async function runSatellite(): Promise<void> {
   const report = await ingestSatelliteMeasurement(
-    {
+   {
       project_id: 'VCS-1234',
       bbox: [-76.5, -6.2, -76.2, -5.9],
       area_ha: 1250,
       baseline_ndvi: 0.28,
+      ndvi_carbon_factor_t_per_ha: 3.67, // TODO: confirm against IPCC table for this project's biome
     },
     { periodStart: '2025-01-01', periodEnd: '2025-03-31' },
     { baseUrl: FILE_URL, http: new FileHttpClient() },
@@ -97,6 +100,13 @@ async function runIot(): Promise<void> {
       project_id: 'VCS-1234',
       device_ids: ['NBS-SOIL-001', 'NBS-SOIL-002'],
       area_ha: 1250,
+      // This is the fixture-driven demo runner, not a real project
+      // registration flow, so falling back to the suggested defaults here
+      // is fine — a real caller (API/UI) must supply measured values; see
+      // IotProjectConfigSchema in schemas.ts, which has no default and
+      // will reject a config that omits either field.
+      bulk_density_t_per_m3: DEFAULT_BULK_DENSITY_T_PER_M3,
+      sampling_depth_m: DEFAULT_SAMPLING_DEPTH_M,
     },
     { periodStart: '2025-01-01', periodEnd: '2025-03-31' },
     { baseUrl: FILE_URL, http: new FileHttpClient() },

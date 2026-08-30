@@ -465,6 +465,43 @@ describe('OracleService', () => {
     });
   });
 
+  describe('hasReportForPeriod', () => {
+    it('returns true when a non-rejected report covers the period for the provider', async () => {
+      const service = buildService({});
+      (service as any).getProjectReports = jest.fn().mockResolvedValue([
+        { providerAddress: PROVIDER_ADDRESS, periodStart: 1000, periodEnd: 2000, status: ReportStatus.Verified },
+        { providerAddress: PROVIDER_ADDRESS, periodStart: 1000, periodEnd: 2000, status: ReportStatus.Pending },
+      ]);
+
+      await expect(
+        service.hasReportForPeriod('1', PROVIDER_ADDRESS, 1000, 2000),
+      ).resolves.toBe(true);
+    });
+
+    it('returns false when only rejected reports cover the period', async () => {
+      const service = buildService({});
+      (service as any).getProjectReports = jest.fn().mockResolvedValue([
+        { providerAddress: PROVIDER_ADDRESS, periodStart: 1000, periodEnd: 2000, status: ReportStatus.Rejected },
+      ]);
+
+      await expect(
+        service.hasReportForPeriod('1', PROVIDER_ADDRESS, 1000, 2000),
+      ).resolves.toBe(false);
+    });
+
+    it('returns false when no report matches the provider or period', async () => {
+      const service = buildService({});
+      (service as any).getProjectReports = jest.fn().mockResolvedValue([
+        { providerAddress: 'OTHER', periodStart: 1000, periodEnd: 2000, status: ReportStatus.Verified },
+        { providerAddress: PROVIDER_ADDRESS, periodStart: 9000, periodEnd: 9900, status: ReportStatus.Verified },
+      ]);
+
+      await expect(
+        service.hasReportForPeriod('1', PROVIDER_ADDRESS, 1000, 2000),
+      ).resolves.toBe(false);
+    });
+  });
+
   describe('submitReport', () => {
     const dto = {
       projectId: 'a1b2'.padEnd(64, '0'),

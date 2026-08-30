@@ -122,7 +122,7 @@ export function getResult<T>(state: ActionState<T>): T | undefined {
                 @for (ts of b.couponSchedule; track ts; let i = $index) {
                   <li class="coupon-item">
                     <span class="coupon-index">Period {{ i + 1 }}</span>
-                    <span class="coupon-date">{{ ts | date }}</span>
+                    <span class="coupon-date">{{ ts * 1000 | date }}</span>
                   </li>
                 }
               </ul>

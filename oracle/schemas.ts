@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import {z} from 'zod';
 
 /**
  * Shared schemas for the oracle adapters.
@@ -22,7 +22,7 @@ export const METHODOLOGY = {
   BLUE_CARBON: 'BLUE-CARBON',
 } as const;
 
-// ─────────────────────────── Verra registry ───────────────────────────
+// ─────────────────────────────── Verra registry ───────────────────────────────
 
 export const VerraProjectSchema = z.object({
   project_id: z.string().min(1),
@@ -49,7 +49,7 @@ export const VerraReportListSchema = z.object({
   reports: z.array(VerraMonitoringReportSchema),
 });
 
-// ─────────────────────────── Satellite imagery ─────────────────────────
+// ─────────────────────────────── Satellite imagery ───────────────────────────────
 
 export const SatelliteSceneSchema = z.object({
   scene_id: z.string().min(1),
@@ -65,15 +65,40 @@ export const SatelliteSceneListSchema = z.object({
   scenes: z.array(SatelliteSceneSchema),
 });
 
+// ─────────────────────────────────── Project Config ───────────────────────────────────
+
 export const SatelliteProjectConfigSchema = z.object({
   project_id: z.string().min(1),
   bbox: z.tuple([z.number(), z.number(), z.number(), z.number()]),
   area_ha: z.number().positive(),
   baseline_ndvi: z.number().min(-1).max(1),
+  /**
+   * Biomass/carbon conversion factor (tonnes of carbon per hectare per unit
+   * NDVI change) used to translate an observed NDVI change into carbon
+   * sequestered.
+   *
+   * This is a simplified IPCC Tier 1 scalar standing in for a full Tier 1
+   * lookup by forest type / ecozone / canopy-cover fraction — see IPCC 2006
+   * Guidelines for National Greenhouse Gas Inventories, Vol. 4 (AFOLU),
+   * Ch. 4, Table 4.7 "Biomass conversion and expansion factors" and the
+   * associated continental/ecozone default tables. Biomass density varies
+   * enormously by biome (tropical moist forest vs boreal vs savanna), so
+   * this value MUST be chosen per project from the appropriate IPCC table
+   * (or a project-specific allometric study) by the project developer or
+   * verifier.
+   *
+   * Deliberately has NO default, mirroring `bulk_density_t_per_m3` on
+   * `IotProjectConfigSchema` below: silently defaulting a global factor
+   * would risk materially mis-stating sequestered carbon for a financial
+   * instrument. Omitting it must fail schema validation, not fall back to
+   * a guess.
+   */
+  ndvi_carbon_factor_t_per_ha: z.number().positive(),
 });
+
 export type SatelliteProjectConfig = z.infer<typeof SatelliteProjectConfigSchema>;
 
-// ─────────────────────────────── IoT sensors ──────────────────────────
+// ─────────────────────────────────── IoT sensors ───────────────────────────────────
 
 export const IoTSensorMetricsSchema = z.object({
   soil_moisture: z.number().min(0).max(100).nullable(),
@@ -102,10 +127,26 @@ export const IotProjectConfigSchema = z.object({
   project_id: z.string().min(1),
   device_ids: z.array(z.string().min(1)).min(1),
   area_ha: z.number().positive(),
+  /**
+   * Measured soil bulk density (tonnes per cubic metre) for this
+   * project's plots. Deliberately has NO default: soil type varies
+   * enormously (e.g. peat can be as low as 0.1 t/m3 vs ~1.4 t/m3 for
+   * typical mineral soil), and silently defaulting would risk materially
+   * mis-stating sequestered carbon for a financial instrument. A UI may
+   * pre-fill a form with `DEFAULT_BULK_DENSITY_T_PER_M3` (from
+   * `iot-aggregator.ts`) as a starting suggestion, but the project
+   * developer must explicitly confirm or override the measured value.
+   */
+  bulk_density_t_per_m3: z.number().positive(),
+  /**
+   * Measured sampling depth (metres) for the soil carbon readings.
+   * Same rationale as `bulk_density_t_per_m3` — no default.
+   */
+  sampling_depth_m: z.number().positive(),
 });
 export type IotProjectConfig = z.infer<typeof IotProjectConfigSchema>;
 
-// ─────────────────────────── Blue carbon ──────────────────────────
+// ─────────────────────────────────── Bluecarbon ───────────────────────────────────
 
 /** Per-plot survey of a blue carbon ecosystem (mangrove/seagrass/saltmarsh). */
 export const BlueCarbonSurveySchema = z.object({
@@ -133,7 +174,7 @@ export const BlueCarbonProjectConfigSchema = z.object({
 });
 export type BlueCarbonProjectConfig = z.infer<typeof BlueCarbonProjectConfigSchema>;
 
-// ──────────────────────────────── Output ──────────────────────────────
+// ─────────────────────────────────────── Output ───────────────────────────────────────
 
 /**
  * Canonical oracle report. Field names deliberately match the on-chain

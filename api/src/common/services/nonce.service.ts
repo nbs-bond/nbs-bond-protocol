@@ -12,6 +12,17 @@ import {
 const NONCE_KEY_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 /**
+ * Redis set of every `${contractAddress}:${address}` pair that has ever
+ * requested a nonce. Consumed by NonceReconcilerService so the background
+ * cron knows which on-chain nonces to re-sync, and self-heals drift even
+ * when the per-pair nonce key itself still exists with a stale value.
+ *
+ * Intentionally TTL-less: this is the durable registry of pairs that must
+ * be reconciled, not a cache.
+ */
+export const KNOWN_PAIRS_KEY = 'nonce:known-pairs';
+
+/**
  * How long the sync() lock is held, in milliseconds.
  *
  * This only needs to cover the duration of a single getContractData() RPC
@@ -90,6 +101,7 @@ export class NonceService implements OnModuleDestroy {
    */
   async sync(contractAddress: string, address: string): Promise<number> {
     const key = `nonce:${contractAddress}:${address}`;
+    await this.trackPair(contractAddress, address);
     let onChainNonce = 0;
 
     try {
@@ -180,6 +192,11 @@ export class NonceService implements OnModuleDestroy {
   async next(contractAddress: string, address: string): Promise<number> {
     const key = `nonce:${contractAddress}:${address}`;
 
+    // Record this pair in the known-pairs registry so the background
+    // reconciliation cron (NonceReconcilerService) can re-sync it from the
+    // chain every cycle. Tracking failures must never block nonce allocation.
+    await this.trackPair(contractAddress, address);
+
     // If the key is absent (first call ever, or expired after 30 days of
     // inactivity), sync the real on-chain value before incrementing.
     // DO NOT skip this check and fall through to INCR — a missing key
@@ -212,6 +229,58 @@ export class NonceService implements OnModuleDestroy {
       );
       return await this.sync(contractAddress, address);
     }
+  }
+
+  /**
+   * Register a (contractAddress, address) pair in the known-pairs registry
+   * used by the reconciliation cron.
+   *
+   * Errors are swallowed with a debug log: SADD is bookkeeping for a
+   * background job and must never fail (or slow down) a live nonce
+   * allocation. If the registry is unavailable, next() and sync() still
+   * behave correctly — the per-call missing-key sync path is unaffected.
+   */
+  private async trackPair(
+    contractAddress: string,
+    address: string,
+  ): Promise<void> {
+    try {
+      await this.redis.sAdd(KNOWN_PAIRS_KEY, `${contractAddress}:${address}`);
+    } catch (error) {
+      this.logger.debug(
+        `trackPair(): could not record ${contractAddress}:${address} in ` +
+          `${KNOWN_PAIRS_KEY}: ${error?.message ?? error}`,
+      );
+    }
+  }
+
+  /**
+   * Return every (contractAddress, address) pair that has ever requested a
+   * nonce, for the background reconciliation cron (NonceReconcilerService).
+   *
+   * Members are stored as `${contractAddress}:${address}`. Contract and
+   * Stellar addresses never contain a colon, so splitting on the first ':'
+   * is unambiguous. Malformed members are skipped with a debug log.
+   */
+  async listKnownPairs(): Promise<
+    Array<{ contractAddress: string; address: string }>
+  > {
+    const members = await this.redis.sMembers(KNOWN_PAIRS_KEY);
+    const pairs: Array<{ contractAddress: string; address: string }> = [];
+    for (const member of members) {
+      const separator = member.indexOf(':');
+      if (separator <= 0 || separator === member.length - 1) {
+        this.logger.debug(
+          `listKnownPairs(): skipping malformed member "${member}"`,
+        );
+        continue;
+      }
+      pairs.push({
+        contractAddress: member.slice(0, separator),
+        address: member.slice(separator + 1),
+      });
+    }
+    return pairs;
   }
 
   /**
@@ -304,16 +373,24 @@ export class NonceService implements OnModuleDestroy {
       this.heldLocks.set(lockKey, lockToken);
 
       // We hold the lock — run sync() and then release.
+      let syncFailed = false;
+      let syncError: unknown;
       try {
         await this.sync(contractAddress, address);
-      } catch (syncError) {
-        // Log and continue; the INCR below will operate on whatever state
-        // sync() managed to write (or on a pre-existing key if another
-        // racing caller already seeded it).
-        this.logger.warn(
-          `next(): sync() failed for ${address}; proceeding with INCR from 0. ` +
-            `This may produce an InvalidNonce error if the address has prior transactions. ` +
-            `Error: ${syncError?.message ?? syncError}`,
+      } catch (err) {
+        // sync() threw a transport / RPC error — we must NOT continue to
+        // INCR because the nonce key was never seeded with the real on-chain
+        // value. Doing so would let Redis INCR treat the absent key as 0 and
+        // emit nonce 0, corrupting the mirror for up to 30 days.
+        //
+        // Record the failure so we can rethrow after the lock is released
+        // (the finally block must always run to release the lock).
+        syncFailed = true;
+        syncError = err;
+        this.logger.error(
+          `syncWithLock(): sync() failed for ${address} on ${contractAddress}; ` +
+            `aborting nonce allocation to prevent mirror corruption. ` +
+            `Error: ${(err as Error)?.message ?? err}`,
         );
       } finally {
         // Release the lock only if we still own it. Using a Lua script makes
@@ -336,6 +413,15 @@ export class NonceService implements OnModuleDestroy {
           });
         // Deregister the lock regardless of whether the DEL succeeded.
         this.heldLocks.delete(lockKey);
+      }
+
+      // Rethrow AFTER the lock has been released (the finally block above
+      // runs before this line). If sync() failed with a transport error we
+      // must not fall through to the INCR+EXPIRE step — the nonce key was
+      // never seeded, so INCR would silently start from 0 and corrupt the
+      // mirror for every subsequent call until the 30-day TTL expires.
+      if (syncFailed) {
+        throw syncError;
       }
     } else {
       // Another request holds the lock and is currently running sync().
@@ -411,13 +497,9 @@ export class NonceService implements OnModuleDestroy {
 
     // Close the Redis connection gracefully.
     try {
-      if (this.redis.isReady) {
+      if (this.redis.isOpen) {
         await this.redis.quit();
         this.logger.log('NonceService: Redis connection closed gracefully');
-      } else if (this.redis.isOpen) {
-        // The connection never reached the ready state (e.g. Redis was
-        // unavailable on startup); quit() would hang waiting for a reply.
-        this.redis.disconnect();
       }
     } catch (error) {
       this.logger.warn(

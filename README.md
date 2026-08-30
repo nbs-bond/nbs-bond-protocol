@@ -385,7 +385,7 @@ pub fn distribute_coupon(
 ) -> CouponResult { ... }
 
 // Admin sweeps integer-division remainder that holders could not be allocated
-pub fn sweep_undistributed(env: Env, caller: Address, bond_id: BondId, nonce: u64) -> i128 { ... }
+pub fn sweep_undistributed(env: Env, caller: Address, bond_id: BondId, destination: Address, nonce: u64) -> SweepReceipt { ... }
 
 // Query accrued credits for a bondholder
 pub fn accrued_credits(

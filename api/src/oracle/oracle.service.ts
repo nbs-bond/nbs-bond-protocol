@@ -137,6 +137,27 @@ export class OracleService implements OnModuleDestroy {
   }
 
   /**
+   * Whether a non-rejected report already exists for this provider and exact
+   * period. Used by the scheduler to skip duplicate on-chain submissions so a
+   * re-run within the same period never creates a second report.
+   */
+  async hasReportForPeriod(
+    projectId: string,
+    providerAddress: string,
+    periodStart: number,
+    periodEnd: number,
+  ): Promise<boolean> {
+    const reports = await this.getProjectReports(projectId);
+    return reports.some(
+      (report) =>
+        report.providerAddress === providerAddress &&
+        report.periodStart === periodStart &&
+        report.periodEnd === periodEnd &&
+        report.status !== ReportStatus.Rejected,
+    );
+  }
+
+  /**
    * First step of the pre-signed-transaction challenge flow: builds and
    * returns an UNSIGNED `challenge_report` transaction for the challenger's
    * own wallet to sign. The API never holds or signs with a challenger's

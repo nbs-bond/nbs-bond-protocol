@@ -46,7 +46,15 @@ describe('BondDetailComponent', () => {
       of({ bondId: 1, undistributedTotal: 7 }),
     );
     apiService.sweepUndistributed.and.returnValue(
-      of({ bondId: 1, swept: 7, transactionHash: '0xabc' }),
+      of({
+        bondId: 1,
+        destination: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        amount: 7,
+        carbonAmount: 7,
+        biodiversityAmount: 0,
+        swept: 7,
+        transactionHash: '0xabc',
+      }),
     );
     apiService.getAccruedCredits.and.returnValue(
       of({
@@ -237,6 +245,27 @@ describe('BondDetailComponent', () => {
     const claimBtn = claimSection?.querySelector('.claim-btn') as HTMLButtonElement;
     expect(claimBtn.disabled).toBe(true);
     expect(claimSection?.textContent).toContain('No credits accrued yet');
+    discardPeriodicTasks();
+  }));
+
+  it('renders coupon schedule dates from unix seconds (not 1970)', fakeAsync(() => {
+    // Realistic on-chain unix-second timestamps. Interpreted as seconds (the
+    // bug) they anchor to 1970; correctly multiplied by 1000 (ms) they resolve
+    // to the intended calendar years.
+    apiService.getBond.and.returnValue(
+      of({ ...bond, couponSchedule: [1_700_000_000, 1_800_000_000] }),
+    );
+    createFixture();
+
+    const couponDates = Array.from(
+      fixture.nativeElement.querySelectorAll('.coupon-date'),
+    ) as HTMLElement[];
+    expect(couponDates.length).toBe(2);
+
+    const text = couponDates.map((e) => e.textContent).join(' ');
+    expect(text).not.toContain('1970');
+    expect(text).toContain('2023');
+    expect(text).toContain('2027');
     discardPeriodicTasks();
   }));
 });
