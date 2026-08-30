@@ -498,54 +498,6 @@ describe('BondsService', () => {
     });
   });
 
-  describe('transfer', () => {
-    const investorStub = () => ({
-      getKeypairFromSecret: jest.fn().mockReturnValue({
-        publicKey: () =>
-          'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-      }),
-    });
-
-    const buildModule = async (contractService: any) => {
-      const moduleRef = await Test.createTestingModule({
-        providers: [
-          BondsService,
-          { provide: ContractService, useValue: contractService },
-          { provide: StellarService, useValue: investorStub() },
-          {
-            provide: NonceService,
-            useValue: { next: jest.fn().mockResolvedValue(0) },
-          },
-          { provide: KycService, useValue: kycServiceMock },
-        ],
-      }).compile();
-      return moduleRef.get(BondsService);
-    };
-
-    const dto: any = {
-      fromAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-      toAddress: 'GBO6AXD5GLGDR45HENK4RZMFXOTZIJYL3NWGNGWXYI3RTFNIYK32YGJQ',
-      amount: 600,
-    };
-
-    it('maps an InsufficientBalance (code 16) to a clear 400', async () => {
-      const contractService = {
-        invokeContractMethod: jest.fn().mockRejectedValue(
-          new BadRequestException(
-            'Contract error on TEST.transfer (contract error code 16)',
-          ),
-        ),
-      };
-
-      const svc = await buildModule(contractService);
-
-      await expect(svc.transfer(7, dto)).rejects.toMatchObject({
-        status: 400,
-        message: expect.stringContaining('Insufficient balance on bond #7'),
-      });
-    });
-  });
-
   describe('findAll', () => {
     const configScVal = () =>
       xdr.ScVal.scvVec([
@@ -1518,5 +1470,35 @@ describe('BondsService.prepareTransfer / transfer (pre-signed flow)', () => {
     await expect(
       svc.transfer(1, { fromAddress: FROM, toAddress: TO, amount: 50, signedTxXdr: 'signed-xdr' }),
     ).resolves.toMatchObject({ transactionHash: 'transfer-tx-hash' });
+  });
+
+  it('maps an InsufficientBalance (code 16) simulation failure at prepare time to a clear 400', async () => {
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        BondsService,
+        {
+          provide: ContractService,
+          useValue: {
+            prepareTransaction: jest.fn().mockRejectedValue(
+              new BadRequestException(
+                'Transaction simulation failed: Error(Contract, #16) (contract error code 16)',
+              ),
+            ),
+            submitSignedTransaction: jest.fn(),
+          },
+        },
+        { provide: StellarService, useValue: {} },
+        { provide: NonceService, useValue: { next: jest.fn().mockResolvedValue(9) } },
+        { provide: KycService, useValue: kycServiceMock },
+      ],
+    }).compile();
+    const svc = moduleRef.get(BondsService) as BondsService;
+
+    await expect(
+      svc.prepareTransfer(7, { fromAddress: FROM, toAddress: TO, amount: 50 }),
+    ).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining('Insufficient balance on bond #7'),
+    });
   });
 });

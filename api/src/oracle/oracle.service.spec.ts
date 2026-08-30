@@ -170,29 +170,29 @@ describe('OracleService', () => {
     });
 
     it('maps a ChallengeAlreadyExists contract error (code 20) to a ConflictException', async () => {
-      contractService.invokeContractMethod.mockReset().mockRejectedValue(
+      contractService.prepareTransaction.mockReset().mockRejectedValue(
         new BadRequestException(
-          'Contract simulation failed: Error(Contract, #20) (contract error code 20)',
+          'Transaction simulation failed: Error(Contract, #20) (contract error code 20)',
         ),
       );
 
       await expect(
-        service.challengeReport(7, dto, investorAddress),
+        service.prepareChallenge(7, dto, investorAddress),
       ).rejects.toBeInstanceOf(ConflictException);
       await expect(
-        service.challengeReport(8, dto, investorAddress),
+        service.prepareChallenge(8, dto, investorAddress),
       ).rejects.toThrow('already has a challenge on file');
     });
 
     it('propagates other contract failures from challenge_report unchanged', async () => {
-      contractService.invokeContractMethod.mockReset().mockRejectedValue(
+      contractService.prepareTransaction.mockReset().mockRejectedValue(
         new BadRequestException(
-          'Contract simulation failed: Error(Contract, #6) (contract error code 6)',
+          'Transaction simulation failed: Error(Contract, #6) (contract error code 6)',
         ),
       );
 
       await expect(
-        service.challengeReport(9, dto, investorAddress),
+        service.prepareChallenge(9, dto, investorAddress),
       ).rejects.toMatchObject({
         status: 400,
         message: expect.stringContaining('contract error code 6'),

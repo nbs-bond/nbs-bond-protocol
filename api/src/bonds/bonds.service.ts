@@ -549,7 +549,8 @@ export class BondsService implements OnModuleDestroy {
   /**
    * First step of the pre-signed-transaction transfer flow: builds and
    * returns an UNSIGNED `transfer` transaction for `fromAddress`'s own
-   * wallet to sign.
+   * wallet to sign. The API never holds or signs with an investor's key —
+   * see ContractService.prepareTransaction().
    */
   async prepareTransfer(
     id: number,
@@ -557,10 +558,9 @@ export class BondsService implements OnModuleDestroy {
   ): Promise<PrepareTransactionResponse> {
     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
 
-    let transactionHash: string | undefined;
     try {
-      ({ transactionHash } = await this.contractService.invokeContractMethod(
-        BOND_ISSUER(), 'transfer', investorSecret,
+      return await this.contractService.prepareTransaction(
+        BOND_ISSUER(), 'transfer', dto.fromAddress,
         [
           Address.fromString(dto.fromAddress).toScVal(),
           Address.fromString(dto.toAddress).toScVal(),
@@ -568,6 +568,23 @@ export class BondsService implements OnModuleDestroy {
           nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
         ],
         nonce,
+      );
+    } catch (error) {
+      throw this.mapBondError(error, id);
+    }
+  }
+
+  /**
+   * Second step: submits the transaction envelope `fromAddress`'s wallet
+   * signed from prepareTransfer(). ContractService.submitSignedTransaction()
+   * verifies the envelope's source account, contract address and method
+   * before submitting it, so this never signs or builds anything itself.
+   */
+  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
+    let transactionHash: string | undefined;
+    try {
+      ({ transactionHash } = await this.contractService.submitSignedTransaction(
+        dto.signedTxXdr, BOND_ISSUER(), 'transfer', dto.fromAddress,
       ));
     } catch (error) {
       throw this.mapBondError(error, id);

@@ -163,14 +163,40 @@ export class OracleService implements OnModuleDestroy {
     const nonce = await this.nonceService.next(ORACLE_CONSUMER(), challengerAddress);
 
     try {
-      await this.contractService.invokeContractMethod(
-        ORACLE_CONSUMER(), 'challenge_report', investorSecret,
+      return await this.contractService.prepareTransaction(
+        ORACLE_CONSUMER(), 'challenge_report', challengerAddress,
         [
           Address.fromString(challengerAddress).toScVal(),
           nativeToScVal(BigInt(reportId), { type: 'u64' }),
           toBytes32(dto.counterEvidenceHash),
         ],
         nonce,
+      );
+    } catch (error) {
+      throw this.mapChallengeError(error, reportId);
+    }
+  }
+
+  /**
+   * Second step: submits the transaction envelope the challenger's wallet
+   * signed from prepareChallenge(). ContractService.submitSignedTransaction()
+   * verifies the envelope's source account, contract address and method
+   * before submitting it, so this never signs or builds anything itself.
+   */
+  async challengeReport(
+    reportId: number,
+    dto: ChallengeDto,
+    challengerAddress: string,
+  ): Promise<ChallengeResponse> {
+    if (!/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(dto.counterEvidenceHash)) {
+      throw new BadRequestException(
+        'counterEvidenceHash must be a valid 46-character CIDv0 beginning with Qm',
+      );
+    }
+
+    try {
+      await this.contractService.submitSignedTransaction(
+        dto.signedTxXdr, ORACLE_CONSUMER(), 'challenge_report', challengerAddress,
       );
     } catch (error) {
       throw this.mapChallengeError(error, reportId);
