@@ -13,8 +13,8 @@ export interface ProjectResponse {
   country: string;
   metadataIpfsHash: string;
   ownerAddress: string;
-  totalAreaHa: number;
-  carbonSequestrationEstimate: number;
+  totalAreaHa: string;
+  carbonSequestrationEstimate: string;
   createdAt: string;
 }
 

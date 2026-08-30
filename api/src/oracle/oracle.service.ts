@@ -99,7 +99,7 @@ export class OracleService implements OnModuleDestroy {
       projectId: dto.projectId,
       periodStart: dto.periodStart,
       periodEnd: dto.periodEnd,
-      carbonSequestered: dto.carbonSequestered,
+      carbonSequestered: String(dto.carbonSequestered),
       methodology: dto.methodology,
       ipfsHash: ipfsResult.hash,
       providerAddress,
@@ -254,7 +254,7 @@ export class OracleService implements OnModuleDestroy {
         methodology: dto.methodology,
         name: `Oracle ${dto.providerAddress.slice(0, 6)}`,
         active: true,
-        stake: 0,
+        stake: '0',
         registeredAt: new Date().toISOString(),
       };
     } catch (error) {
@@ -338,8 +338,8 @@ export class OracleService implements OnModuleDestroy {
       reportsSubmitted: Number(this.field(stats, 'reports_submitted', 0)),
       challengesFaced: Number(this.field(stats, 'challenges_faced', 1)),
       slashes: Number(this.field(stats, 'slashes', 2)),
-      totalPenalty: Number(this.field(stats, 'total_penalty', 3)),
-      stake: Number(this.field(stats, 'stake', 4)),
+      totalPenalty: String(this.field(stats, 'total_penalty', 3)),
+      stake: String(this.field(stats, 'stake', 4)),
       active: Boolean(this.field(stats, 'active', 5)),
       slashHistory,
       challengeHistory,
@@ -371,8 +371,8 @@ export class OracleService implements OnModuleDestroy {
   private decodeSlashRecord(record: Record<string, any>): SlashRecord {
     return {
       reportId: Number(this.field(record, 'report_id', 0)),
-      penalty: Number(this.field(record, 'penalty', 1)),
-      remainingStake: Number(this.field(record, 'remaining_stake', 2)),
+      penalty: String(this.field(record, 'penalty', 1)),
+      remainingStake: String(this.field(record, 'remaining_stake', 2)),
       timestamp: new Date(Number(this.field(record, 'timestamp', 3)) * 1000).toISOString(),
       activeAfter: Boolean(this.field(record, 'active_after', 4)),
     };
@@ -428,7 +428,7 @@ export class OracleService implements OnModuleDestroy {
       projectId: Buffer.from(data[3] as Uint8Array).toString('hex'),
       periodStart: Number(data[4]),
       periodEnd: Number(data[5]),
-      carbonSequestered: Number(data[6]),
+      carbonSequestered: String(data[6]),
       methodology: data[8] as string,
       ipfsHash: Buffer.from(data[9] as Uint8Array).toString('hex'),
       status: this.reportStatusFromIndex(Number(data[10])),
@@ -456,7 +456,7 @@ export class OracleService implements OnModuleDestroy {
       providerAddress,
       methodology: String(this.field(data, 'methodology', 1)),
       name: `Oracle ${providerAddress.slice(0, 6)}`,
-      stake: Number(this.field(data, 'stake', 2)),
+      stake: String(this.field(data, 'stake', 2)),
       active: Boolean(this.field(data, 'active', 3)),
       registeredAt: new Date(Number(this.field(data, 'registered_at', 4)) * 1000).toISOString(),
     };

@@ -30,13 +30,13 @@ export class CreateProjectDto {
   @Type(() => LocationDto)
   location: LocationDto;
 
-  @IsNumber()
-  @IsPositive()
-  totalAreaHa: number;
+  @IsString()
+  @IsNotEmpty()
+  totalAreaHa: string;
 
-  @IsNumber()
-  @IsPositive()
-  carbonSequestrationEstimate: number;
+  @IsString()
+  @IsNotEmpty()
+  carbonSequestrationEstimate: string;
 
   @IsOptional()
   @IsBoolean()

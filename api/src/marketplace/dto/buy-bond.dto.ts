@@ -1,17 +1,17 @@
-import { IsNumber, IsPositive, IsOptional } from 'class-validator';
+import { IsNumber, IsPositive, IsOptional, IsString, IsNotEmpty } from 'class-validator';
 
 export class BuyBondDto {
   @IsNumber()
   @IsPositive()
   orderId: number;
 
-  @IsNumber()
-  @IsPositive()
-  amount: number;
+  @IsString()
+  @IsNotEmpty()
+  amount: string;
 
-  @IsNumber()
-  @IsPositive()
-  maxPrice: number;
+  @IsString()
+  @IsNotEmpty()
+  maxPrice: string;
 
   @IsNumber()
   @IsOptional()

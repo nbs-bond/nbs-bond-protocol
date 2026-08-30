@@ -1,17 +1,17 @@
-import { IsString, IsNumber, IsPositive, IsOptional, IsEnum, Min, Max } from 'class-validator';
+import { IsString, IsNumber, IsPositive, IsOptional, IsEnum, Min, Max, IsNotEmpty } from 'class-validator';
 
 export class ListBondDto {
   @IsNumber()
   @IsPositive()
   bondId: number;
 
-  @IsNumber()
-  @IsPositive()
-  amount: number;
+  @IsString()
+  @IsNotEmpty()
+  amount: string;
 
-  @IsNumber()
-  @IsPositive()
-  pricePerToken: number;
+  @IsString()
+  @IsNotEmpty()
+  pricePerToken: string;
 
   @IsString()
   @IsEnum(['USDC', 'XLM'])

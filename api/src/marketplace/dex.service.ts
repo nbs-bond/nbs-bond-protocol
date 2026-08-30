@@ -158,10 +158,10 @@ export class DexService implements OnModuleDestroy {
 
   async buyBondTokens(dto: BuyBondDto, buyerAddress: string): Promise<OrderResponse> {
     const order = await this.getOrder(dto.orderId);
-    const proceeds = order.pricePerToken * dto.amount;
+    const proceeds = BigInt(order.pricePerToken) * BigInt(dto.amount);
 
     const escrowed = await this.getQuoteBalance(buyerAddress, order.quoteAsset);
-    if (escrowed.balance < proceeds) {
+    if (BigInt(escrowed.balance) < proceeds) {
       throw new BadRequestException(
         `Insufficient escrowed ${order.quoteAsset}: required ${proceeds}, escrowed ${escrowed.balance}. ` +
         'Call POST /marketplace/deposit before purchasing.',
@@ -261,9 +261,9 @@ export class DexService implements OnModuleDestroy {
     const [price, total, slippageBps] = scValToNative(quoteScVal) as bigint[];
 
     return {
-      price: Number(price),
-      total: Number(total),
-      slippageBps: Number(slippageBps),
+      price: String(price),
+      total: String(total),
+      slippageBps: String(slippageBps),
     };
   }
 
@@ -279,7 +279,7 @@ export class DexService implements OnModuleDestroy {
         nativeToScVal(asset, { type: 'symbol' }),
       ],
     });
-    const balance = Number(scValToNative(balanceScVal));
+    const balance = String(scValToNative(balanceScVal));
     return { address, asset, balance };
   }
 
@@ -304,7 +304,7 @@ export class DexService implements OnModuleDestroy {
 
     const { balance } = await this.getQuoteBalance(callerAddress, dto.asset);
 
-    return { address: callerAddress, asset: dto.asset, amount: dto.amount, balance, transactionHash };
+    return { address: callerAddress, asset: dto.asset, amount: String(dto.amount), balance, transactionHash };
   }
 
   async withdrawQuote(
@@ -328,7 +328,7 @@ export class DexService implements OnModuleDestroy {
 
     const { balance } = await this.getQuoteBalance(callerAddress, dto.asset);
 
-    return { address: callerAddress, asset: dto.asset, amount: dto.amount, balance, transactionHash };
+    return { address: callerAddress, asset: dto.asset, amount: String(dto.amount), balance, transactionHash };
   }
 
   private decodeOrder(data: any[]): OrderResponse {
@@ -336,8 +336,8 @@ export class DexService implements OnModuleDestroy {
       id: Number(data[0]),
       seller: data[1] as string,
       bondId: Number(data[2]),
-      amount: Number(data[3]),
-      pricePerToken: Number(data[4]),
+      amount: String(data[3]),
+      pricePerToken: String(data[4]),
       quoteAsset: data[5] as QuoteAsset,
       status: this.orderStatusFromIndex(Number(data[6])),
       createdAt: new Date(Number(data[7]) * 1000).toISOString(),

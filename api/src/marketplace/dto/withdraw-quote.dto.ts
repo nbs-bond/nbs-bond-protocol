@@ -1,12 +1,12 @@
-import { IsEnum, IsNumber, IsPositive, IsOptional } from 'class-validator';
+import { IsEnum, IsNumber, IsPositive, IsOptional, IsString, IsNotEmpty } from 'class-validator';
 
 export class WithdrawQuoteDto {
   @IsEnum(['USDC', 'XLM'])
   asset: 'USDC' | 'XLM';
 
-  @IsNumber()
-  @IsPositive()
-  amount: number;
+  @IsString()
+  @IsNotEmpty()
+  amount: string;
 
   @IsNumber()
   @IsOptional()

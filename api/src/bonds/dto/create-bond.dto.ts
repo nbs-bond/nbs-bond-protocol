@@ -13,13 +13,13 @@ export class CreateBondDto {
   @IsNotEmpty()
   projectId: string;
 
-  @IsNumber()
-  @IsPositive()
-  faceValue: number;
+  @IsString()
+  @IsNotEmpty()
+  faceValue: string;
 
   @IsArray()
-  @IsNumber({}, { each: true })
-  couponSchedule: number[];
+  @IsString({ each: true })
+  couponSchedule: string[];
 
   @IsEnum(CreditTypeEnum)
   creditType: CreditTypeEnum;
@@ -28,7 +28,7 @@ export class CreateBondDto {
   @IsPositive()
   maturityDate: number;
 
-  @IsNumber()
-  @IsPositive()
-  totalSupply: number;
+  @IsString()
+  @IsNotEmpty()
+  totalSupply: string;
 }

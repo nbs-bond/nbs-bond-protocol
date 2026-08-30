@@ -19,13 +19,13 @@ export enum BondMaturityStatusEnum {
 export interface BondResponse {
   id: number;
   projectId: string;
-  faceValue: number;
-  couponSchedule: number[];
+  faceValue: string;
+  couponSchedule: string[];
   creditType: CreditTypeEnum;
   maturityDate: number;
   maturityStatus: BondMaturityStatusEnum;
-  totalSupply: number;
-  totalSubscribed: number;
+  totalSupply: string;
+  totalSubscribed: string;
   status: BondStatusEnum;
   createdAt: string;
 }
@@ -33,7 +33,7 @@ export interface BondResponse {
 export interface SubscriptionResponse {
   bondId: number;
   investorAddress: string;
-  amount: number;
+  amount: string;
   transactionHash: string;
 }
 
@@ -52,14 +52,14 @@ export interface PrepareTransactionResponse {
 
 export interface HolderListResponse {
   bondId: number;
-  holders: Array<{ address: string; balance: number }>;
+  holders: Array<{ address: string; balance: string }>;
   total: number;
 }
 
 export interface CouponDistributionResponse {
   bondId: number;
   periodIndex: number;
-  totalCredits: number;
+  totalCredits: string;
   holderCount: number;
   /** Total number of batches submitted for this period. */
   batchCount: number;
@@ -68,7 +68,7 @@ export interface CouponDistributionResponse {
 export interface ClaimCreditsResponse {
   bondId: number;
   investorAddress: string;
-  credits: number;
+  credits: string;
   transactionHash: string;
 }
 
@@ -93,24 +93,24 @@ export interface TransferResponse {
   bondId: number;
   fromAddress: string;
   toAddress: string;
-  amount: number;
+  amount: string;
   transactionHash: string;
 }
 
 export interface UndistributedTotalResponse {
   bondId: number;
-  undistributedTotal: number;
+  undistributedTotal: string;
 }
 
 export interface AccruedCreditsByType {
   creditType: CreditTypeEnum;
-  amount: number;
+  amount: string;
 }
 
 export interface AccruedCreditsResponse {
   bondId: number;
   holder: string;
-  total: number;
+  total: string;
   perCreditType: AccruedCreditsByType[];
 }
 
@@ -119,14 +119,14 @@ export interface SweepUndistributedResponse {
   /** Wallet that received the swept credits as AccruedCredits. */
   destination: string;
   /** Total credits credited to `destination`. */
-  amount: number;
-  carbonAmount: number;
-  biodiversityAmount: number;
+  amount: string;
+  carbonAmount: string;
+  biodiversityAmount: string;
   /**
    * Alias of `amount`, kept so existing clients that read `swept` keep
    * working after SweepReceipt replaced the bare i128 return.
    */
-  swept: number;
+  swept: string;
   transactionHash: string;
 }
 
@@ -141,7 +141,7 @@ export interface PeriodReportResponse {
   projectId: string;
   periodStart: number;
   periodEnd: number;
-  carbonSequestered: number;
+  carbonSequestered: string;
   methodology: string;
   ipfsHash: string;
   providerAddress: string;
@@ -154,10 +154,10 @@ export interface PeriodInfoResponse {
   periodIndex: number;
   startTime: number;
   endTime: number;
-  totalCreditsEarned: number;
+  totalCreditsEarned: string;
   distributed: boolean;
   reportId: number;
-  undistributed: number;
+  undistributed: string;
   report?: PeriodReportResponse;
 }
 

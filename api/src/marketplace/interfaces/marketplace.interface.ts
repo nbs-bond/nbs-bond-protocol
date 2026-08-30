@@ -12,8 +12,8 @@ export interface OrderResponse {
   id: number;
   seller: string;
   bondId: number;
-  amount: number;
-  pricePerToken: number;
+  amount: string;
+  pricePerToken: string;
   quoteAsset: QuoteAsset;
   status: OrderStatus;
   createdAt: string;
@@ -22,14 +22,14 @@ export interface OrderResponse {
 export interface QuoteBalanceResponse {
   address: string;
   asset: QuoteAsset;
-  balance: number;
+  balance: string;
 }
 
 export interface QuoteTransactionResponse {
   address: string;
   asset: QuoteAsset;
-  amount: number;
-  balance: number;
+  amount: string;
+  balance: string;
   transactionHash?: string;
 }
 
@@ -56,7 +56,7 @@ export interface SlippageResponse {
 }
 
 export interface OnChainPriceQuote {
-  price: number;
-  total: number;
-  slippageBps: number;
+  price: string;
+  total: string;
+  slippageBps: string;
 }

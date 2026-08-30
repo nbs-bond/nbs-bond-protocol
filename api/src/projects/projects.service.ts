@@ -203,8 +203,8 @@ export class ProjectsService implements OnModuleDestroy {
       country: project[6] as string,
       metadataIpfsHash,
       ownerAddress: (project[1] as any).toString?.() || '',
-      totalAreaHa: metadata.totalAreaHa || 0,
-      carbonSequestrationEstimate: metadata.carbonSequestrationEstimate || 0,
+      totalAreaHa: String(metadata.totalAreaHa || 0),
+      carbonSequestrationEstimate: String(metadata.carbonSequestrationEstimate || 0),
       createdAt: new Date().toISOString(),
     };
   }
