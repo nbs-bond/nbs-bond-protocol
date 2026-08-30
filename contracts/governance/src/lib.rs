@@ -706,6 +706,11 @@ impl Governance {
         proposal_id: u64,
         nonce: u64,
     ) -> Result<(), GovernanceError> {
+        // Execution is intentionally permissionless. Quorum and the timelock
+        // authenticate the proposal; any address may trigger the already
+        // approved call so a passed proposal cannot be blocked by signer
+        // availability. The caller nonce still prevents replay by that
+        // address without coupling execution liveness to signer membership.
         caller.require_auth();
         check_nonce(&env, &caller, nonce)?;
 
@@ -1473,7 +1478,9 @@ mod test {
         gov_client.vote_approve(&signers.get(3).unwrap(), &proposal_id, &1);
 
         env.ledger().set_timestamp(2 * DEFAULT_TIMELOCK_SECONDS);
-        gov_client.execute(&signers.get(0).unwrap(), &proposal_id, &3);
+        let executor = Address::generate(&env);
+        assert!(!gov_client.is_signer(&executor));
+        gov_client.execute(&executor, &proposal_id, &0);
 
         // Verify the proposal executed successfully and the registry reflects
         // the approved status — not relying on the accident of argument order.
