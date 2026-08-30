@@ -15,8 +15,12 @@ import { ApiService } from "../../shared/services/api.service";
 import { WalletService } from "../../auth/wallet.service";
 import { StatusBadgeComponent } from "../../shared/components/status-badge/status-badge.component";
 import { LoadingSpinnerComponent } from "../../shared/components/loading-spinner/loading-spinner.component";
-import { Bond } from "../../shared/interfaces/bond.interface";
-import { AccruedCreditsResponse } from "../../shared/interfaces/bond.interface";
+import {
+  Bond,
+  AccruedCreditsResponse,
+  PeriodInfoResponse,
+  PeriodReportResponse,
+} from "../../shared/interfaces/bond.interface";
 import { environment } from "../../../environments/environment";
 import { isValidStellarAddress } from "../../shared/validators/form-validators";
 
@@ -125,7 +129,7 @@ export function getResult<T>(state: ActionState<T>): T | undefined {
                     <span class="coupon-date">{{ ts * 1000 | date }}</span>
                   </li>
                 }
-              </ul>
+              }
             </div>
           </div>
 
@@ -457,12 +461,30 @@ export function getResult<T>(state: ActionState<T>): T | undefined {
         gap: 8px;
       }
       .coupon-item {
-        display: flex;
-        justify-content: space-between;
         padding: 8px 12px;
         background: #f9fafb;
         border-radius: 6px;
         font-size: 0.8125rem;
+      }
+      .period-toggle {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr auto;
+        gap: 8px;
+        width: 100%;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        text-align: left;
+        cursor: pointer;
+        font: inherit;
+      }
+      .period-report {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin: 10px 0 2px;
+        padding-top: 10px;
+        border-top: 1px solid #e5e7eb;
       }
       .coupon-index {
         color: #6b7280;
@@ -634,6 +656,16 @@ export class BondDetailComponent implements OnInit, OnDestroy {
   readonly undistributedError = signal("");
   readonly accrued = signal<AccruedCreditsResponse | null>(null);
   readonly accruedError = signal("");
+  readonly periods = signal<PeriodInfoResponse[]>([]);
+  readonly periodsLoading = signal(false);
+  readonly periodsError = signal("");
+  readonly periodPage = signal(1);
+  readonly periodTotalPages = signal(1);
+  readonly expandedPeriod = signal<number | null>(null);
+  readonly periodReport = signal<PeriodReportResponse | null>(null);
+  readonly reportLoading = signal(false);
+  readonly reportError = signal("");
+  private readonly periodLimit = 10;
 
   // Computed helpers for template
   readonly isSubscribing = computed(() => isLoading(this.subscribeState()));
@@ -796,6 +828,7 @@ export class BondDetailComponent implements OnInit, OnDestroy {
       next: (bond) => {
         this.bond.set(bond);
         this.loading.set(false);
+        this.loadPeriods();
       },
       error: (err) => {
         this.error.set(
@@ -804,6 +837,64 @@ export class BondDetailComponent implements OnInit, OnDestroy {
         this.loading.set(false);
       },
     });
+  }
+
+  private loadPeriods(includeReport = false): void {
+    const b = this.bond();
+    if (!b) return;
+    this.periodsLoading.set(true);
+    this.periodsError.set("");
+    this.apiService.getBondPeriods(b.id, this.periodPage(), this.periodLimit, includeReport).subscribe({
+      next: (res) => {
+        this.periods.set(res.data);
+        this.periodTotalPages.set(res.meta.totalPages || 1);
+        this.periodsLoading.set(false);
+      },
+      error: (err) => {
+        this.periodsError.set(err.error?.detail || err.message || "Failed to load period history");
+        this.periodsLoading.set(false);
+      },
+    });
+  }
+
+  togglePeriod(period: PeriodInfoResponse): void {
+    if (this.expandedPeriod() === period.periodIndex) {
+      this.expandedPeriod.set(null);
+      this.periodReport.set(null);
+      return;
+    }
+    this.expandedPeriod.set(period.periodIndex);
+    this.periodReport.set(period.report ?? null);
+    this.reportError.set("");
+    if (period.report || !period.reportId) return;
+    const b = this.bond();
+    if (!b) return;
+    this.reportLoading.set(true);
+    this.apiService.getBondPeriods(b.id, this.periodPage(), this.periodLimit, true).subscribe({
+      next: (res) => {
+        const match = res.data.find((item) => item.periodIndex === period.periodIndex);
+        this.periodReport.set(match?.report ?? null);
+        this.reportLoading.set(false);
+      },
+      error: (err) => {
+        this.reportError.set(err.error?.detail || err.message || "Failed to load oracle report");
+        this.reportLoading.set(false);
+      },
+    });
+  }
+
+  previousPeriodPage(): void {
+    if (this.periodPage() <= 1) return;
+    this.periodPage.update((page) => page - 1);
+    this.expandedPeriod.set(null);
+    this.loadPeriods();
+  }
+
+  nextPeriodPage(): void {
+    if (this.periodPage() >= this.periodTotalPages()) return;
+    this.periodPage.update((page) => page + 1);
+    this.expandedPeriod.set(null);
+    this.loadPeriods();
   }
 
   ngOnDestroy(): void {

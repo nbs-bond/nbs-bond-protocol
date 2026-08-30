@@ -10,7 +10,7 @@ import {
   UndistributedTotalResponse, AccruedCreditsResponse, SweepUndistributedResponse,
   QuoteBalanceResponse, QuoteTransactionResponse,
   QuoteAsset, DepositQuoteDto, WithdrawQuoteDto,
-  HolderListResponse,
+  HolderListResponse, PeriodListResponse,
 } from '../interfaces/bond.interface';
 
 @Injectable({ providedIn: 'root' })
@@ -70,6 +70,18 @@ export class ApiService {
       `/api/bonds/${id}/transfer`,
       { fromAddress, toAddress, amount },
       { headers: this.headers() },
+    );
+  }
+
+  getBondPeriods(
+    id: number,
+    page = 1,
+    limit = 20,
+    includeReport = false,
+  ): Observable<PeriodListResponse> {
+    return this.http.get<PeriodListResponse>(
+      `/api/bonds/${id}/periods`,
+      { params: { page, limit, includeReport }, headers: this.headers() },
     );
   }
 
