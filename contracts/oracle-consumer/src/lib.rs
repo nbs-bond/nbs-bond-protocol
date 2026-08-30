@@ -48,6 +48,7 @@ pub const MAX_PERIOD_HISTORY: u32 = 200;
 #[contracttype]
 pub enum DataKey {
     Admin,
+    Token,
     Provider(Address),
     ProviderList,
     Report(u64),
@@ -250,8 +251,9 @@ pub struct OracleConsumer;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl OracleConsumer {
-    pub fn __constructor(env: Env, admin: Address) {
+    pub fn __constructor(env: Env, admin: Address, token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Token, &token);
         env.storage()
             .instance()
             .set(&DataKey::ChallengeWindow, &CHALLENGE_WINDOW_SECONDS);
@@ -2319,7 +2321,9 @@ mod test {
         );
         registry.approve_project(&admin, &pb, &1);
 
-        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let contract_id = env.register(OracleConsumer, (admin.clone(), token.clone()));
         let client = OracleConsumerClient::new(&env, &contract_id);
         client.set_project_registry(&admin, &registry_id, &0);
 
@@ -3445,7 +3449,6 @@ mod test {
         assert_eq!(result, Err(Ok(OracleError::InvalidThreshold)));
         assert_eq!(client.get_signature_threshold(), 1);
     }
-
     #[test]
     fn test_remove_provider_adjusts_threshold() {
         let env = Env::default();
@@ -3804,6 +3807,7 @@ mod test {
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &5i128, &0);
 
         let report_id = client.submit_report(
@@ -3842,6 +3846,7 @@ mod test {
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &100_000i128, &0);
 
         let report_id = client.submit_report(
@@ -3880,6 +3885,7 @@ mod test {
         let client = OracleConsumerClient::new(&env, &contract_id);
 
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
         client.add_stake(&provider, &100_000i128, &0);
 
         let report_id = client.submit_report(
@@ -4429,6 +4435,7 @@ mod test {
                     &Symbol::new(&env, "verra_vcs"),
                     &0,
                 );
+                soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
                 client.add_stake(&provider, &stake, &0);
 
                 let report_id = client.submit_report(
@@ -4487,6 +4494,7 @@ mod test {
                 let mut stake = 0i128;
                 let mut nonce = 0u64;
                 for d in deposits {
+                    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&provider, &1_000_000_000_000);
                     client.add_stake(&provider, &d, &nonce);
                     nonce += 1;
                     stake += d;
