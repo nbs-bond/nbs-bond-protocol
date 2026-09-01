@@ -285,6 +285,134 @@ describe('BondsService', () => {
     });
   });
 
+  describe('getHolders', () => {
+    const buildService = async (opts: {
+      dbHolders: string[];
+      onChainHolders: string[];
+      balances: Record<string, number>;
+    }) => {
+      const redis = createClient() as unknown as {
+        get: jest.Mock;
+        setEx: jest.Mock;
+        sMembers: jest.Mock;
+      };
+      const cacheStore = new Map<string, string>();
+      redis.get.mockImplementation((key: string) =>
+        Promise.resolve(cacheStore.get(key) ?? null),
+      );
+      redis.setEx.mockImplementation((key: string, _ttl: number, value: string) => {
+        cacheStore.set(key, value);
+        return Promise.resolve('OK');
+      });
+      redis.sMembers.mockResolvedValue(opts.dbHolders);
+
+      const simulateCall = jest.fn(
+        ({ method, args }: { method: string; args: any[] }) => {
+          if (method === 'get_holder_count') {
+            return Promise.resolve(
+              nativeToScVal(BigInt(opts.onChainHolders.length), { type: 'u64' }),
+            );
+          }
+          if (method === 'get_holder_list_range') {
+            return Promise.resolve(
+              xdr.ScVal.scvVec(
+                opts.onChainHolders.map((a) => Address.fromString(a).toScVal()),
+              ),
+            );
+          }
+          if (method === 'get_holder_balance') {
+            const holder = scValToNative(args[1]) as string;
+            return Promise.resolve(
+              nativeToScVal(BigInt(opts.balances[holder] ?? 0), { type: 'i128' }),
+            );
+          }
+          return Promise.resolve(nativeToScVal(BigInt(0), { type: 'u64' }));
+        },
+      );
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: { simulateCall } },
+          { provide: StellarService, useValue: {} },
+          {
+            provide: NonceService,
+            useValue: { next: jest.fn().mockResolvedValue(0) },
+          },
+          { provide: KycService, useValue: kycServiceMock },
+        ],
+      }).compile();
+
+      return {
+        svc: moduleRef.get(BondsService) as BondsService,
+        simulateCall,
+        redis,
+      };
+    };
+
+    const holderListReads = (simulateCall: jest.Mock): number =>
+      simulateCall.mock.calls.filter(
+        ([options]: any[]) => options.method === 'get_holder_list_range',
+      ).length;
+
+    it('returns both the Redis set holder and an on-chain-only holder', async () => {
+      const dbHolder = Keypair.random().publicKey();
+      const onChainOnly = Keypair.random().publicKey();
+      const { svc } = await buildService({
+        dbHolders: [dbHolder],
+        onChainHolders: [dbHolder, onChainOnly],
+        balances: { [dbHolder]: 100, [onChainOnly]: 200 },
+      });
+
+      const result = await svc.getHolders(1);
+
+      expect(result.bondId).toBe(1);
+      expect(result.total).toBe(2);
+      const byAddress = (h: { address: string }) => h.address;
+      expect(result.holders.map(byAddress).sort()).toEqual(
+        [dbHolder, onChainOnly].sort(),
+      );
+      expect(
+        result.holders.find((h) => h.address === dbHolder)?.balance,
+      ).toBe(100);
+      expect(
+        result.holders.find((h) => h.address === onChainOnly)?.balance,
+      ).toBe(200);
+    });
+
+    it('filters zero-balance holders and reports the reconciled total', async () => {
+      const stale = Keypair.random().publicKey();
+      const active = Keypair.random().publicKey();
+      const { svc } = await buildService({
+        dbHolders: [stale, active],
+        onChainHolders: [],
+        balances: { [stale]: 0, [active]: 100 },
+      });
+
+      const result = await svc.getHolders(1);
+
+      expect(result.total).toBe(1);
+      expect(result.holders).toEqual([{ address: active, balance: 100 }]);
+    });
+
+    it('caches the reconciled result so repeated calls skip the on-chain read', async () => {
+      const dbHolder = Keypair.random().publicKey();
+      const onChainOnly = Keypair.random().publicKey();
+      const { svc, simulateCall } = await buildService({
+        dbHolders: [dbHolder],
+        onChainHolders: [dbHolder, onChainOnly],
+        balances: { [dbHolder]: 100, [onChainOnly]: 200 },
+      });
+
+      const first = await svc.getHolders(1);
+      expect(holderListReads(simulateCall)).toBe(1);
+
+      const second = await svc.getHolders(1);
+      expect(holderListReads(simulateCall)).toBe(1);
+      expect(second).toEqual(first);
+    });
+  });
+
   describe('getUndistributedTotal', () => {
     it('reads get_undistributed_total from the coupon engine', async () => {
       const contractService = {

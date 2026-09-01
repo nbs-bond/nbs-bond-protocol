@@ -239,7 +239,17 @@ export class BondsService implements OnModuleDestroy {
   }
 
   async getHolders(id: number): Promise<HolderListResponse> {
-    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+    const cacheKey = `bond:${id}:holders:reconciled`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    // Reconcile the off-chain Redis set with the on-chain HolderList — the
+    // same reconciled set distributeCoupon() uses — so investors who received
+    // bond tokens via a direct on-chain transfer without going through the
+    // API are listed too, and zero-balance addresses are filtered out.
+    // The result is cached briefly because the on-chain read pages the full
+    // HolderList and is slow (~200-500 ms per page).
+    const holderAddresses = await this.resolveOnChainHolders(id);
     const holders = [];
 
     for (const address of holderAddresses) {
@@ -247,7 +257,9 @@ export class BondsService implements OnModuleDestroy {
       if (balance > 0) holders.push({ address, balance });
     }
 
-    return { bondId: id, holders, total: holders.length };
+    const result: HolderListResponse = { bondId: id, holders, total: holders.length };
+    await this.redis.setEx(cacheKey, 30, JSON.stringify(result));
+    return result;
   }
 
   /**
